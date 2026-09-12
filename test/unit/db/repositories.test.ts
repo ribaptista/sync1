@@ -4,6 +4,7 @@ import { VersionsRepository } from "../../../src/db/repositories/versions-reposi
 import { ObjectsRepository } from "../../../src/db/repositories/objects-repository.js";
 import { EntriesRepository } from "../../../src/db/repositories/entries-repository.js";
 import { CacheEntriesRepository } from "../../../src/db/repositories/cache-entries-repository.js";
+import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
 
 describe("VersionsRepository", () => {
   it("inserts and reads back versions in sequence order", () => {
@@ -299,5 +300,33 @@ describe("CacheEntriesRepository (cache.db)", () => {
     // a tombstone must never block a legitimately different case-variant
     // path from being accepted (e.g. a rename's create half)
     expect(repo.findByNormalizedPath("file.txt", "FILE.txt")).toBeUndefined();
+  });
+});
+
+describe("IgnorePoliciesRepository (state.db)", () => {
+  it("creates, lists, updates, and deletes policies", () => {
+    const db = openStateDb(":memory:");
+    const repo = new IgnorePoliciesRepository(db);
+
+    const id = repo.create("*.tmp");
+    expect(repo.list()).toEqual([{ id, glob: "*.tmp", created_at: expect.any(String) as string }]);
+    expect(repo.get(id)?.glob).toBe("*.tmp");
+
+    expect(repo.update(id, "*.bak")).toBe(true);
+    expect(repo.get(id)?.glob).toBe("*.bak");
+    expect(repo.update(999, "*.nope")).toBe(false);
+
+    expect(repo.delete(id)).toBe(true);
+    expect(repo.get(id)).toBeUndefined();
+    expect(repo.delete(id)).toBe(false);
+  });
+
+  it("listGlobs returns every glob as a plain string array", () => {
+    const db = openStateDb(":memory:");
+    const repo = new IgnorePoliciesRepository(db);
+    repo.create("*.tmp");
+    repo.create("photos/raw/*");
+
+    expect(repo.listGlobs().sort()).toEqual(["*.tmp", "photos/raw/*"]);
   });
 });

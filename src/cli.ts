@@ -10,6 +10,7 @@ import { registerMaterializeCommand } from "./commands/materialize.js";
 import { registerStubifyCommand } from "./commands/stubify.js";
 import { registerInspectCommand } from "./commands/inspect.js";
 import { registerGcCommand } from "./commands/gc.js";
+import { registerIgnoreCommand } from "./commands/ignore.js";
 
 const program = new Command();
 
@@ -30,6 +31,7 @@ registerMaterializeCommand(program);
 registerStubifyCommand(program);
 registerInspectCommand(program);
 registerGcCommand(program);
+registerIgnoreCommand(program);
 // Further commands are registered here as they're implemented, task by task.
 
 program.parseAsync(process.argv).catch((err: unknown) => {
