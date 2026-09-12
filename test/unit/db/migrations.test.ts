@@ -40,9 +40,12 @@ describe("migration runner", () => {
     runMigrations(db, STATE_MIGRATIONS_DIR);
 
     const appliedFirst = db
-      .prepare<[], { filename: string }>("SELECT filename FROM _migrations")
+      .prepare<[], { filename: string }>("SELECT filename FROM _migrations ORDER BY filename")
       .all();
-    expect(appliedFirst).toEqual([{ filename: "0001_init.sql" }]);
+    expect(appliedFirst).toEqual([
+      { filename: "0001_init.sql" },
+      { filename: "0002_add_normalized_path.sql" },
+    ]);
 
     // Running again must not error (e.g. re-executing CREATE TABLE) and must
     // not insert a duplicate _migrations row.
@@ -50,7 +53,7 @@ describe("migration runner", () => {
     const appliedSecond = db
       .prepare<[], { filename: string }>("SELECT filename FROM _migrations")
       .all();
-    expect(appliedSecond).toHaveLength(1);
+    expect(appliedSecond).toHaveLength(2);
   });
 
   it("creates the indexes named in the schema", () => {
@@ -63,6 +66,10 @@ describe("migration runner", () => {
       .all()
       .map((r) => r.name)
       .sort();
-    expect(indexes).toEqual(["idx_entries_hash", "idx_entries_state_version"]);
+    expect(indexes).toEqual([
+      "idx_entries_hash",
+      "idx_entries_normalized_path",
+      "idx_entries_state_version",
+    ]);
   });
 });

@@ -26,6 +26,7 @@
 | [storage-classes-and-archive-restore.md](architecture/storage-classes-and-archive-restore.md) | The three supported storage classes, the shared HEAD-status classification primitive, limits of testing archive timing against LocalStack.                                           |
 | [stub-files.md](architecture/stub-files.md)                                                   | The self-describing stub format, the four-state representation logic, crash-safety ordering in materialize/stubify.                                                                  |
 | [garbage-collection-scope.md](architecture/garbage-collection-scope.md)                       | Why `gc` is scoped to current-state-only, and the CAS-retry test seam.                                                                                                               |
+| [cross-platform-filesystem.md](architecture/cross-platform-filesystem.md)                     | Case-insensitive-filesystem collision detection (Windows/macOS), the two checkpoints and why others were dropped, recovery guidance, known limitations.                              |
 
 ## Conventions across all commands
 

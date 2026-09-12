@@ -11,6 +11,7 @@ import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
 import { putObjectStream } from "../s3/client.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
+import { toCollisionKey } from "../fs/case-collision.js";
 
 export interface ApplyLocalChangesResult {
   uploadedObjects: number;
@@ -69,6 +70,29 @@ export async function applyLocalChangesToCandidate(
 
   for (const row of dirtyRows) {
     const existingEntry = entriesRepo.get(row.path);
+
+    // Only a genuinely new path can newly collide -- "modified"/"deleted"
+    // target a path that already exists, so decideLocalChange's own
+    // exact-path matching already handles those (e.g. "modified locally,
+    // deleted remotely" conflicts regardless of casing). An exact-path
+    // lookup like `existingEntry` above can't see a *different*-cased
+    // entry, which is exactly the gap this check closes: without it, a
+    // local create colliding with an already-remote-committed case
+    // variant would be folded into the candidate and permanently
+    // committed. See docs/architecture/cross-platform-filesystem.md.
+    if (row.state === "created") {
+      const collision = entriesRepo.findByNormalizedPath(toCollisionKey(row.path), row.path);
+      if (collision) {
+        const reason = `case-insensitive collision with existing entry "${collision.path}" -- rename or remove one of them and sync again`;
+        conflicts.push({ path: row.path, reason });
+        logger.debug(
+          { path: row.path, collidesWith: collision.path },
+          "case-insensitive collision, skipping",
+        );
+        continue;
+      }
+    }
+
     const decision = decideLocalChange(row, existingEntry);
 
     if (decision.kind === "conflict") {
