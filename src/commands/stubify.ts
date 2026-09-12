@@ -65,7 +65,7 @@ async function runStubify(
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
-    return await stubifyGlob(root, glob, cacheRepo, logger);
+    return await stubifyGlob(root, localCacheDbPath(root), glob, cacheRepo, logger);
   } finally {
     cacheDb.close();
   }

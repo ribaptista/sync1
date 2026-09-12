@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import Database from "better-sqlite3";
 import type { Logger } from "../logger.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { hashFile } from "./hash-file.js";
@@ -31,52 +32,63 @@ export interface StubifyStats {
  */
 export async function stubifyGlob(
   root: string,
+  cacheDbPath: string,
   glob: string,
   cacheRepo: CacheEntriesRepository,
   logger: Logger,
 ): Promise<StubifyStats> {
   const stats: StubifyStats = { stubified: 0, alreadyStub: 0, skipped: [] };
-  const rows = [...cacheRepo.iterateByGlobSortedByPath(glob)];
 
-  for (const row of rows) {
-    if (row.type !== "file") continue;
-    const absolutePath = path.join(root, row.path);
-    const stubAbsolutePath = stubPathFor(absolutePath);
+  // A dedicated read-only connection for the glob scan: cacheRepo.upsert()
+  // below writes to cacheRepo's own connection while this iterates, which
+  // the same connection couldn't do at once (the "iterate() cursor busy"
+  // constraint documented in update-cache.ts).
+  const cacheReadDb = new Database(cacheDbPath, { readonly: true, fileMustExist: true });
+  const cacheReadRepo = new CacheEntriesRepository(cacheReadDb);
 
-    if (!fs.existsSync(absolutePath)) {
-      stats.alreadyStub++;
-      continue;
-    }
+  try {
+    for (const row of cacheReadRepo.iterateByGlobSortedByPath(glob)) {
+      if (row.type !== "file") continue;
+      const absolutePath = path.join(root, row.path);
+      const stubAbsolutePath = stubPathFor(absolutePath);
 
-    if (row.state !== "unchanged") {
-      stats.skipped.push({
-        path: row.path,
-        reason: "not fully committed (has pending local changes)",
-      });
-      continue;
-    }
+      if (!fs.existsSync(absolutePath)) {
+        stats.alreadyStub++;
+        continue;
+      }
 
-    let confirmedHash = row.hash;
-    const currentMtime = Math.round(fs.statSync(absolutePath).mtimeMs);
-    if (currentMtime !== row.mtime) {
-      const rehash = await hashFile(absolutePath);
-      if (rehash !== row.hash) {
+      if (row.state !== "unchanged") {
         stats.skipped.push({
           path: row.path,
-          reason: "file changed since it was last synced -- run sync first",
+          reason: "not fully committed (has pending local changes)",
         });
         continue;
       }
-      confirmedHash = rehash;
+
+      let confirmedHash = row.hash;
+      const currentMtime = Math.round(fs.statSync(absolutePath).mtimeMs);
+      if (currentMtime !== row.mtime) {
+        const rehash = await hashFile(absolutePath);
+        if (rehash !== row.hash) {
+          stats.skipped.push({
+            path: row.path,
+            reason: "file changed since it was last synced -- run sync first",
+          });
+          continue;
+        }
+        confirmedHash = rehash;
+      }
+      if (!confirmedHash) throw new Error(`cache row for "${row.path}" has no hash`);
+
+      writeStubAtomic(stubAbsolutePath, confirmedHash); // write the stub first...
+      fs.rmSync(absolutePath); // ...only then delete the real file
+
+      cacheRepo.upsert({ ...row, mtime: Math.round(fs.statSync(stubAbsolutePath).mtimeMs) });
+      stats.stubified++;
+      logger.debug({ path: row.path }, "stubified");
     }
-    if (!confirmedHash) throw new Error(`cache row for "${row.path}" has no hash`);
-
-    writeStubAtomic(stubAbsolutePath, confirmedHash); // write the stub first...
-    fs.rmSync(absolutePath); // ...only then delete the real file
-
-    cacheRepo.upsert({ ...row, mtime: Math.round(fs.statSync(stubAbsolutePath).mtimeMs) });
-    stats.stubified++;
-    logger.debug({ path: row.path }, "stubified");
+  } finally {
+    cacheReadDb.close();
   }
 
   return stats;

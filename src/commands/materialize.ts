@@ -95,6 +95,7 @@ async function runMaterialize(
     const objectsRepo = new ObjectsRepository(stateDb);
     return await materializeGlob(
       root,
+      localCacheDbPath(root),
       glob,
       cacheRepo,
       objectsRepo,
