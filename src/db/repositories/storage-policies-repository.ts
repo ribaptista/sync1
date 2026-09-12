@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
+import type { SupportedStorageClass } from "../../s3/archive-status.js";
 
-export type StorageClass = "STANDARD" | "GLACIER" | "DEEP_ARCHIVE";
+/** Reuses ensure_storage_class's own storage-class type rather than a second, driftable definition. */
+export type StorageClass = SupportedStorageClass;
 
 export interface StoragePolicyRow {
   id: number;
