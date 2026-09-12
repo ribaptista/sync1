@@ -11,8 +11,10 @@ import {
   localStateDbPath,
   localCacheDbPath,
   localVaultJsonPath,
+  localRemoteConfigPath,
   lastSyncedVersionPath,
 } from "../vault/local-dir.js";
+import { serializeRemoteConfig, type RemoteConfig } from "../vault/remote-config.js";
 import {
   remoteKey,
   normalizePrefix,
@@ -137,6 +139,10 @@ async function runAttachRemote(
   fs.writeFileSync(localStateDbPath(root), stateDbBytes);
   fs.writeFileSync(localVaultJsonPath(root), manifestObj.body);
   fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
+
+  const remoteConfig: RemoteConfig = { bucket: opts.bucket, prefix, region: opts.region };
+  if (opts.endpoint) remoteConfig.endpoint = opts.endpoint;
+  fs.writeFileSync(localRemoteConfigPath(root), serializeRemoteConfig(remoteConfig));
 
   // cache.db is created empty (migrated) now so it's ready for the first
   // update_cache/sync run; it holds no rows yet.

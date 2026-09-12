@@ -12,8 +12,10 @@ import {
   sync1Dir,
   localStateDbPath,
   localVaultJsonPath,
+  localRemoteConfigPath,
   lastSyncedVersionPath,
 } from "../vault/local-dir.js";
+import { serializeRemoteConfig, type RemoteConfig } from "../vault/remote-config.js";
 import {
   remoteKey,
   normalizePrefix,
@@ -143,6 +145,10 @@ async function runInitRemote(
 
   fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
   fs.writeFileSync(localVaultJsonPath(root), serializeManifest(manifest));
+
+  const remoteConfig: RemoteConfig = { bucket: opts.bucket, prefix, region: opts.region };
+  if (opts.endpoint) remoteConfig.endpoint = opts.endpoint;
+  fs.writeFileSync(localRemoteConfigPath(root), serializeRemoteConfig(remoteConfig));
 
   return versionStamp;
 }

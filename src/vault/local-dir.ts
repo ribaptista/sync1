@@ -19,3 +19,7 @@ export function lastSyncedVersionPath(root: string): string {
 export function localVaultJsonPath(root: string): string {
   return path.join(sync1Dir(root), "vault.json");
 }
+
+export function localRemoteConfigPath(root: string): string {
+  return path.join(sync1Dir(root), "remote.json");
+}
