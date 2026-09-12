@@ -10,6 +10,7 @@ import {
   type CacheEntryRow,
 } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
+import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { performUpdateCache, type CaseCollision } from "../fs/update-cache.js";
 import { applyLocalChangesToCandidate } from "./apply-local-changes.js";
 import { applyRemoteChangesToLocal } from "./apply-remote-changes.js";
@@ -126,6 +127,7 @@ export async function performSync(
           localCacheDbPath(root),
           cacheRepo,
           new ObjectsRepository(stateDbForScan),
+          new IgnorePoliciesRepository(stateDbForScan),
           lastSyncedVersion,
           logger,
         );

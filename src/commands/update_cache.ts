@@ -13,6 +13,7 @@ import {
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
+import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { performUpdateCache, type UpdateCacheStats } from "../fs/update-cache.js";
 
 interface UpdateCacheOptions extends OptionValues {
@@ -44,6 +45,7 @@ export function registerUpdateCacheCommand(program: Command): void {
             modified: stats.modified,
             deleted: stats.deleted,
             unchanged: stats.unchanged,
+            ignored: stats.ignored,
             case_collisions: stats.caseCollisions.map((c) => ({
               path: c.path,
               collides_with: c.collidesWith,
@@ -51,7 +53,7 @@ export function registerUpdateCacheCommand(program: Command): void {
           });
         } else {
           process.stdout.write(
-            `update_cache: ${stats.created} created, ${stats.modified} modified, ${stats.deleted} deleted, ${stats.unchanged} unchanged\n`,
+            `update_cache: ${stats.created} created, ${stats.modified} modified, ${stats.deleted} deleted, ${stats.unchanged} unchanged, ${stats.ignored} ignored\n`,
           );
           for (const c of stats.caseCollisions) {
             process.stdout.write(
@@ -87,6 +89,7 @@ async function runUpdateCache(
   // password.
   const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
   const objectsRepo = new ObjectsRepository(stateDb);
+  const ignorePoliciesRepo = new IgnorePoliciesRepository(stateDb);
 
   let bar: import("cli-progress").SingleBar | undefined;
   if (!json) {
@@ -100,6 +103,7 @@ async function runUpdateCache(
     localCacheDbPath(root),
     cacheRepo,
     objectsRepo,
+    ignorePoliciesRepo,
     lastSyncedVersion,
     logger,
     (n) => {

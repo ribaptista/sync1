@@ -5,6 +5,7 @@ import path from "node:path";
 import { openCacheDb, openStateDb } from "../../../src/db/connection.js";
 import { CacheEntriesRepository } from "../../../src/db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../../../src/db/repositories/objects-repository.js";
+import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
 import { hashFile } from "../../../src/fs/hash-file.js";
 import { performUpdateCache, UnknownStubContentError } from "../../../src/fs/update-cache.js";
 import { hashBufferHex } from "../../../src/crypto/hash.js";
@@ -26,6 +27,7 @@ let root: string;
 let cacheDbPath: string;
 let cacheDbDir: string;
 let objectsRepo: ObjectsRepository;
+let ignorePoliciesRepo: IgnorePoliciesRepository;
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-update-cache-test-"));
@@ -41,7 +43,9 @@ beforeEach(() => {
   // None of these tests exercise stub files, so this only ever needs to
   // exist -- stub-hash validation (the only thing that consults it) never
   // triggers for plain real files. See stub-specific tests for that path.
-  objectsRepo = new ObjectsRepository(openStateDb(":memory:"));
+  const stateDb = openStateDb(":memory:");
+  objectsRepo = new ObjectsRepository(stateDb);
+  ignorePoliciesRepo = new IgnorePoliciesRepository(stateDb);
 });
 
 afterEach(() => {
@@ -74,6 +78,7 @@ describe("performUpdateCache", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -83,6 +88,7 @@ describe("performUpdateCache", () => {
       deleted: 0,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
 
     const row = repo.get("a.txt");
@@ -94,7 +100,15 @@ describe("performUpdateCache", () => {
   it("does not rehash a file whose mtime hasn't changed", async () => {
     touch("a.txt", "hello", 1_700_000_000_000);
     const repo = makeRepo();
-    await performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger);
+    await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
     expect(hashFileMock).toHaveBeenCalledTimes(1);
 
     hashFileMock.mockClear();
@@ -103,6 +117,7 @@ describe("performUpdateCache", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -112,6 +127,7 @@ describe("performUpdateCache", () => {
       deleted: 0,
       unchanged: 1,
       caseCollisions: [],
+      ignored: 0,
     });
     expect(hashFileMock).not.toHaveBeenCalled();
   });
@@ -137,6 +153,7 @@ describe("performUpdateCache", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v1",
       silentLogger,
     );
@@ -146,6 +163,7 @@ describe("performUpdateCache", () => {
       deleted: 0,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
     const row = repo.get("a.txt");
     expect(row?.state).toBe("modified");
@@ -170,6 +188,7 @@ describe("performUpdateCache", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -179,6 +198,7 @@ describe("performUpdateCache", () => {
       deleted: 0,
       unchanged: 1,
       caseCollisions: [],
+      ignored: 0,
     });
     expect(repo.get("a.txt")?.state).toBe("unchanged");
     expect(repo.get("a.txt")?.mtime).toBe(1_700_000_005_000);
@@ -187,7 +207,15 @@ describe("performUpdateCache", () => {
   it("detects a deleted file and clears its hash/mtime", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
-    await performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger);
+    await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
 
     fs.rmSync(path.join(root, "a.txt"));
     const stats = await performUpdateCache(
@@ -195,6 +223,7 @@ describe("performUpdateCache", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -204,6 +233,7 @@ describe("performUpdateCache", () => {
       deleted: 1,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
     const row = repo.get("a.txt");
     expect(row?.state).toBe("deleted");
@@ -214,15 +244,32 @@ describe("performUpdateCache", () => {
   it("is idempotent for an already-deleted tombstone", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
-    await performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger);
+    await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
     fs.rmSync(path.join(root, "a.txt"));
-    await performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger);
+    await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
 
     const stats = await performUpdateCache(
       root,
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -232,15 +279,32 @@ describe("performUpdateCache", () => {
       deleted: 1,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
   });
 
   it("treats a file recreated at a previously-deleted path as a fresh creation", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
-    await performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger);
+    await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
     fs.rmSync(path.join(root, "a.txt"));
-    await performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger);
+    await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
 
     touch("a.txt", "brand new content");
     const stats = await performUpdateCache(
@@ -248,6 +312,7 @@ describe("performUpdateCache", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -257,6 +322,7 @@ describe("performUpdateCache", () => {
       deleted: 0,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
     expect(repo.get("a.txt")?.state).toBe("created");
   });
@@ -264,7 +330,15 @@ describe("performUpdateCache", () => {
   it("keeps the original baseline when a still-pending change is edited again", async () => {
     touch("a.txt", "hello", 1_700_000_000_000);
     const repo = makeRepo();
-    await performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger); // -> created, baseline v0
+    await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    ); // -> created, baseline v0
 
     // a sync would normally happen here and bump last_synced_version, but
     // suppose the user edits the file again before running sync
@@ -274,6 +348,7 @@ describe("performUpdateCache", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -283,6 +358,7 @@ describe("performUpdateCache", () => {
       deleted: 0,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
     const row = repo.get("a.txt");
     expect(row?.state).toBe("created"); // still 'created', not flipped to 'modified'
@@ -298,6 +374,7 @@ describe("performUpdateCache", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -307,9 +384,64 @@ describe("performUpdateCache", () => {
       deleted: 0,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
     expect(repo.get("photos")?.hash).toBeNull();
     expect(repo.get("photos")?.type).toBe("dir");
+  });
+});
+
+describe("performUpdateCache: ignore policies", () => {
+  it("skips a new file matching an ignore policy, without tracking it", async () => {
+    ignorePoliciesRepo.create("*.tmp");
+    touch("scratch.tmp", "throwaway");
+    const repo = makeRepo();
+
+    const stats = await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
+    expect(stats).toEqual({
+      created: 0,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+      ignored: 1,
+    });
+    expect(repo.get("scratch.tmp")).toBeUndefined();
+  });
+
+  it("still applies an unrelated new file in the same run as an ignored one", async () => {
+    ignorePoliciesRepo.create("*.tmp");
+    touch("scratch.tmp", "throwaway");
+    touch("keep.txt", "hello");
+    const repo = makeRepo();
+
+    const stats = await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
+    expect(stats).toEqual({
+      created: 1,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+      ignored: 1,
+    });
+    expect(repo.get("scratch.tmp")).toBeUndefined();
+    expect(repo.get("keep.txt")?.state).toBe("created");
   });
 });
 
@@ -325,6 +457,7 @@ describe("performUpdateCache: stub files", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -334,6 +467,7 @@ describe("performUpdateCache: stub files", () => {
       deleted: 0,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
     expect(hashFileMock).not.toHaveBeenCalled(); // never hashes the stub's own bytes
     const row = repo.get("img.jpg");
@@ -345,7 +479,15 @@ describe("performUpdateCache: stub files", () => {
     fs.writeFileSync(path.join(root, "bad.jpg.stub"), "not-a-valid-tagged-hash");
     const repo = makeRepo();
     await expect(
-      performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger),
+      performUpdateCache(
+        root,
+        cacheDbPath,
+        repo,
+        objectsRepo,
+        ignorePoliciesRepo,
+        "v0",
+        silentLogger,
+      ),
     ).rejects.toThrow(/corrupt stub/);
   });
 
@@ -354,7 +496,15 @@ describe("performUpdateCache: stub files", () => {
     writeStubAtomic(path.join(root, "img.jpg.stub"), unknownHash);
     const repo = makeRepo();
     await expect(
-      performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger),
+      performUpdateCache(
+        root,
+        cacheDbPath,
+        repo,
+        objectsRepo,
+        ignorePoliciesRepo,
+        "v0",
+        silentLogger,
+      ),
     ).rejects.toThrow(UnknownStubContentError);
   });
 
@@ -370,6 +520,7 @@ describe("performUpdateCache: stub files", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -379,6 +530,7 @@ describe("performUpdateCache: stub files", () => {
       deleted: 0,
       unchanged: 0,
       caseCollisions: [],
+      ignored: 0,
     });
     expect(repo.get("img.jpg")?.hash).toBe(hashBufferHex(Buffer.from("the real content")));
     expect(fs.existsSync(path.join(root, "img.jpg.stub"))).toBe(false); // cleaned up
@@ -406,6 +558,7 @@ describe("performUpdateCache: stub files", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -415,6 +568,7 @@ describe("performUpdateCache: stub files", () => {
       deleted: 0,
       unchanged: 1,
       caseCollisions: [],
+      ignored: 0,
     });
   });
 });
@@ -423,7 +577,15 @@ describe("performUpdateCache: staging file lifecycle", () => {
   it("leaves no staging file behind after a successful run", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
-    await performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger);
+    await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      "v0",
+      silentLogger,
+    );
     expect(fs.readdirSync(cacheDbDir)).toEqual([]);
   });
 
@@ -431,7 +593,15 @@ describe("performUpdateCache: staging file lifecycle", () => {
     fs.writeFileSync(path.join(root, "bad.jpg.stub"), "not-a-valid-tagged-hash");
     const repo = makeRepo();
     await expect(
-      performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger),
+      performUpdateCache(
+        root,
+        cacheDbPath,
+        repo,
+        objectsRepo,
+        ignorePoliciesRepo,
+        "v0",
+        silentLogger,
+      ),
     ).rejects.toThrow(/corrupt stub/);
     expect(fs.readdirSync(cacheDbDir)).toEqual([]);
   });
@@ -458,6 +628,7 @@ describe("performUpdateCache: case-insensitive collision detection", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -477,6 +648,7 @@ describe("performUpdateCache: case-insensitive collision detection", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );
@@ -514,6 +686,7 @@ describe("performUpdateCache: case-insensitive collision detection", () => {
       cacheDbPath,
       repo,
       objectsRepo,
+      ignorePoliciesRepo,
       "v0",
       silentLogger,
     );

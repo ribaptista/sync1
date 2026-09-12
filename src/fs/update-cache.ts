@@ -13,6 +13,8 @@ import {
 } from "../db/repositories/cache-entries-repository.js";
 import { StagingRepository } from "../db/repositories/staging-repository.js";
 import { toCollisionKey } from "./case-collision.js";
+import { matchesAnyGlob } from "./glob-match.js";
+import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 
 export interface CaseCollision {
   path: string;
@@ -24,6 +26,7 @@ export interface UpdateCacheStats {
   modified: number;
   deleted: number;
   unchanged: number;
+  ignored: number;
   caseCollisions: CaseCollision[];
 }
 
@@ -55,6 +58,7 @@ export async function performUpdateCache(
   cacheDbPath: string,
   cacheRepo: CacheEntriesRepository,
   objectsRepo: ObjectsRepository,
+  ignorePoliciesRepo: IgnorePoliciesRepository,
   lastSyncedVersion: string,
   logger: Logger,
   onProgress?: (scanned: number) => void,
@@ -64,8 +68,16 @@ export async function performUpdateCache(
     modified: 0,
     deleted: 0,
     unchanged: 0,
+    ignored: 0,
     caseCollisions: [],
   };
+
+  // Loaded once, up front: the list itself is expected to be tiny, and both
+  // this loop and apply-remote-changes.ts's hold an open .iterate() cursor
+  // for their whole duration, so a per-path SQL GLOB query against that
+  // same connection isn't an option. See docs/architecture/
+  // ignore-and-storage-policies.md.
+  const ignoreGlobs = ignorePoliciesRepo.listGlobs();
 
   const stagingPath = tempSiblingPath(cacheDbPath, "update-cache-staging");
   const staging = new StagingRepository(stagingPath);
@@ -83,9 +95,18 @@ export async function performUpdateCache(
       const cacheEntry = cacheNext.done ? null : cacheNext.value;
 
       if (fsEntry !== null && (cacheEntry === null || fsEntry.path < cacheEntry.path)) {
-        staging.insert(
-          await buildCreatedRow(fsEntry, root, lastSyncedVersion, objectsRepo, stats, logger),
-        );
+        const ignoreMatch = matchesAnyGlob(fsEntry.path, ignoreGlobs);
+        if (ignoreMatch.matched) {
+          stats.ignored++;
+          logger.debug(
+            { path: fsEntry.path, pattern: ignoreMatch.pattern },
+            "path matches an ignore policy -- skipping",
+          );
+        } else {
+          staging.insert(
+            await buildCreatedRow(fsEntry, root, lastSyncedVersion, objectsRepo, stats, logger),
+          );
+        }
         fsNext = await fsIter.next();
       } else if (cacheEntry !== null && (fsEntry === null || cacheEntry.path < fsEntry.path)) {
         const row = buildMissingFromFsRow(cacheEntry, lastSyncedVersion, stats, logger);

@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { runCli } from "./helpers/cli.js";
 import { openStateDb } from "../../src/db/connection.js";
 import { VersionsRepository } from "../../src/db/repositories/versions-repository.js";
+import { IgnorePoliciesRepository } from "../../src/db/repositories/ignore-policies-repository.js";
 
 function mkTempRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-e2e-uc-root-"));
@@ -44,6 +45,7 @@ describe("update_cache", () => {
       modified: number;
       deleted: number;
       unchanged: number;
+      ignored: number;
       case_collisions: unknown[];
     };
     expect(firstStats).toEqual({
@@ -52,6 +54,7 @@ describe("update_cache", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      ignored: 0,
       case_collisions: [],
     });
 
@@ -87,6 +90,31 @@ describe("update_cache", () => {
       { path: "photos", state: "created" },
       { path: "photos/img.jpg", state: "created" },
     ]);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("skips a new file matching a global ignore policy, and reports the count", async () => {
+    const root = mkTempRoot();
+    const stateDb = openStateDb(path.join(root, ".sync1", "state.db"));
+    new IgnorePoliciesRepository(stateDb).create("*.tmp");
+    stateDb.close();
+
+    fs.writeFileSync(path.join(root, "scratch.tmp"), "throwaway");
+    fs.writeFileSync(path.join(root, "keep.txt"), "hello");
+
+    const result = await runCli(["update_cache", "--root", root, "--json"]);
+    expect(result.exitCode).toBe(0);
+    const stats = JSON.parse(result.stdout) as {
+      ok: boolean;
+      created: number;
+      ignored: number;
+    };
+    expect(stats.created).toBe(1);
+    expect(stats.ignored).toBe(1);
+
+    const rows = readCacheRows(root);
+    expect(rows).toEqual([{ path: "keep.txt", state: "created" }]);
 
     fs.rmSync(root, { recursive: true, force: true });
   });
