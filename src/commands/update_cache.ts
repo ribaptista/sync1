@@ -80,6 +80,7 @@ async function runUpdateCache(
 
   const stats = await performUpdateCache(
     root,
+    localCacheDbPath(root),
     cacheRepo,
     objectsRepo,
     lastSyncedVersion,

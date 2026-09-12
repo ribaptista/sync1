@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
+import { tempSiblingPath } from "../fs/temp-path.js";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
 import { openStateDb, openCacheDb } from "../db/connection.js";
@@ -48,10 +49,6 @@ export class RemoteDivergedError extends Error {
   }
 }
 
-function tempSiblingPath(basePath: string, tag: string): string {
-  return `${basePath}.${tag}-${randomBytes(4).toString("hex")}`;
-}
-
 /**
  * Full bidirectional sync: runs update_cache, then folds local changes into
  * a candidate state.db (with conflict detection -- src/sync/conflict-
@@ -86,6 +83,7 @@ export async function performSync(
       try {
         await performUpdateCache(
           root,
+          localCacheDbPath(root),
           cacheRepo,
           new ObjectsRepository(stateDbForScan),
           lastSyncedVersion,

@@ -5,11 +5,13 @@ import { walk, type WalkEntry } from "./walker.js";
 import { hashFile } from "./hash-file.js";
 import { readStubHash, stubPathFor, StubFormatError } from "./stub.js";
 import { CorruptionError } from "../errors.js";
+import { tempSiblingPath } from "./temp-path.js";
 import type { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import {
   CacheEntriesRepository,
   type CacheEntryRow,
 } from "../db/repositories/cache-entries-repository.js";
+import { StagingRepository } from "../db/repositories/staging-repository.js";
 
 export interface UpdateCacheStats {
   created: number;
@@ -43,6 +45,7 @@ export class UnknownStubContentError extends CorruptionError {
  */
 export async function performUpdateCache(
   root: string,
+  cacheDbPath: string,
   cacheRepo: CacheEntriesRepository,
   objectsRepo: ObjectsRepository,
   lastSyncedVersion: string,
@@ -50,49 +53,59 @@ export async function performUpdateCache(
   onProgress?: (scanned: number) => void,
 ): Promise<UpdateCacheStats> {
   const stats: UpdateCacheStats = { created: 0, modified: 0, deleted: 0, unchanged: 0 };
-  const pendingWrites: CacheEntryRow[] = [];
 
-  const fsIter = walk(root);
-  const cacheIter = cacheRepo.iterateAllSortedByPath();
+  const stagingPath = tempSiblingPath(cacheDbPath, "update-cache-staging");
+  const staging = new StagingRepository(stagingPath);
 
-  let fsNext = await fsIter.next();
-  let cacheNext = cacheIter.next();
-  let scanned = 0;
+  try {
+    const fsIter = walk(root);
+    const cacheIter = cacheRepo.iterateAllSortedByPath();
 
-  while (!fsNext.done || !cacheNext.done) {
-    const fsEntry = fsNext.done ? null : fsNext.value;
-    const cacheEntry = cacheNext.done ? null : cacheNext.value;
+    let fsNext = await fsIter.next();
+    let cacheNext = cacheIter.next();
+    let scanned = 0;
 
-    if (fsEntry !== null && (cacheEntry === null || fsEntry.path < cacheEntry.path)) {
-      pendingWrites.push(
-        await buildCreatedRow(fsEntry, root, lastSyncedVersion, objectsRepo, stats, logger),
-      );
-      fsNext = await fsIter.next();
-    } else if (cacheEntry !== null && (fsEntry === null || cacheEntry.path < fsEntry.path)) {
-      const row = buildMissingFromFsRow(cacheEntry, lastSyncedVersion, stats, logger);
-      if (row) pendingWrites.push(row);
-      cacheNext = cacheIter.next();
-    } else if (fsEntry !== null && cacheEntry !== null) {
-      const row = await buildExistingRow(
-        fsEntry,
-        cacheEntry,
-        root,
-        lastSyncedVersion,
-        objectsRepo,
-        stats,
-        logger,
-      );
-      if (row) pendingWrites.push(row);
-      fsNext = await fsIter.next();
-      cacheNext = cacheIter.next();
+    while (!fsNext.done || !cacheNext.done) {
+      const fsEntry = fsNext.done ? null : fsNext.value;
+      const cacheEntry = cacheNext.done ? null : cacheNext.value;
+
+      if (fsEntry !== null && (cacheEntry === null || fsEntry.path < cacheEntry.path)) {
+        staging.insert(
+          await buildCreatedRow(fsEntry, root, lastSyncedVersion, objectsRepo, stats, logger),
+        );
+        fsNext = await fsIter.next();
+      } else if (cacheEntry !== null && (fsEntry === null || cacheEntry.path < fsEntry.path)) {
+        const row = buildMissingFromFsRow(cacheEntry, lastSyncedVersion, stats, logger);
+        if (row) staging.insert(row);
+        cacheNext = cacheIter.next();
+      } else if (fsEntry !== null && cacheEntry !== null) {
+        const row = await buildExistingRow(
+          fsEntry,
+          cacheEntry,
+          root,
+          lastSyncedVersion,
+          objectsRepo,
+          stats,
+          logger,
+        );
+        if (row) staging.insert(row);
+        fsNext = await fsIter.next();
+        cacheNext = cacheIter.next();
+      }
+
+      scanned++;
+      onProgress?.(scanned);
     }
 
-    scanned++;
-    onProgress?.(scanned);
-  }
-
-  for (const row of pendingWrites) {
-    cacheRepo.upsert(row);
+    for (const row of staging.iterateAll()) {
+      cacheRepo.upsert(row);
+    }
+  } finally {
+    staging.close();
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const p = `${stagingPath}${suffix}`;
+      if (fs.existsSync(p)) fs.rmSync(p);
+    }
   }
 
   return stats;

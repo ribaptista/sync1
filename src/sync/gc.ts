@@ -23,6 +23,7 @@ import {
 } from "../vault/paths.js";
 import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
+import { tempSiblingPath } from "../fs/temp-path.js";
 
 export interface GcResult {
   orphanCount: number;
@@ -31,10 +32,6 @@ export interface GcResult {
 }
 
 const MAX_CAS_ATTEMPTS = 5;
-
-function tempSiblingPath(basePath: string, tag: string): string {
-  return `${basePath}.${tag}-${randomBytes(4).toString("hex")}`;
-}
 
 /**
  * Removes objects no longer referenced by any *current* entry -- scoped to
