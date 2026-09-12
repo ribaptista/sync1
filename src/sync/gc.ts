@@ -3,8 +3,7 @@ import { randomBytes } from "node:crypto";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
 import { openStateDb } from "../db/connection.js";
-import { EntriesRepository } from "../db/repositories/entries-repository.js";
-import { ObjectsRepository, type ObjectRow } from "../db/repositories/objects-repository.js";
+import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
 import { generateVersionStamp } from "../vault/version-stamp.js";
 import { encryptBuffer, decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
@@ -90,32 +89,41 @@ export async function performGc(
 
     try {
       const candidateDb = openStateDb(candidatePath, logger);
-      let orphans: ObjectRow[];
       try {
-        const entriesRepo = new EntriesRepository(candidateDb);
         const objectsRepo = new ObjectsRepository(candidateDb);
 
-        const referenced = new Set<string>();
-        for (const { hash } of entriesRepo.iterateDistinctReferencedHashes()) referenced.add(hash);
-        orphans = [...objectsRepo.iterateAll()].filter((o) => !referenced.has(o.hash));
-
-        if (!apply || orphans.length === 0) {
-          return {
-            orphanCount: orphans.length,
-            reclaimedBytes: orphans.reduce((sum, o) => sum + o.size, 0),
-            applied: false,
-          };
+        if (!apply) {
+          const { count, totalSize } = objectsRepo.countOrphaned();
+          return { orphanCount: count, reclaimedBytes: totalSize, applied: false };
         }
 
-        for (const o of orphans) objectsRepo.delete(o.hash);
+        // Stages (hash, s3_key, size) for every currently-orphaned object
+        // into a connection-scoped temp table -- this is what lets the
+        // local `objects` rows be removed now (before upload) while still
+        // knowing which S3 objects to delete later (only after the CAS
+        // commit succeeds), without ever holding the orphan set as a JS
+        // array.
+        objectsRepo.stageOrphansForDeletion();
+        const { count: orphanCount, totalSize: reclaimedBytes } = objectsRepo.countStagedOrphans();
+
+        if (orphanCount === 0) {
+          return { orphanCount: 0, reclaimedBytes: 0, applied: false };
+        }
+
+        objectsRepo.deleteStagedOrphans();
         const newVersionStamp = generateVersionStamp();
         new VersionsRepository(candidateDb).insert(newVersionStamp, new Date().toISOString());
         logger.debug(
-          { orphanCount: orphans.length, versionStamp: newVersionStamp },
+          { orphanCount, versionStamp: newVersionStamp },
           "gc: removing orphan object references",
         );
 
-        candidateDb.close();
+        // Checkpoint (rather than close) so the on-disk file reflects every
+        // write before we read it back for upload -- the connection stays
+        // open because `gc_pending_deletes` (populated above) is a
+        // connection-scoped temp table, needed again below once the CAS
+        // commit succeeds.
+        candidateDb.pragma("wal_checkpoint(TRUNCATE)");
 
         const candidateBytes = fs.readFileSync(candidatePath);
         const context = randomBytes(16); // non-convergent: state.db isn't content-addressed
@@ -151,7 +159,7 @@ export async function performGc(
         // actual object bytes -- any future commit referencing one of
         // these hashes again would have to build on this version (or
         // later), which no longer lists them, so it would simply re-upload.
-        for (const o of orphans) {
+        for (const o of objectsRepo.iterateStagedOrphans()) {
           await deleteObject(s3.client, s3.bucket, remoteKey(s3.location, o.s3_key));
         }
 
@@ -159,8 +167,8 @@ export async function performGc(
         fs.writeFileSync(lastSyncedVersionPath(root), newVersionStamp, "utf8");
 
         return {
-          orphanCount: orphans.length,
-          reclaimedBytes: orphans.reduce((sum, o) => sum + o.size, 0),
+          orphanCount,
+          reclaimedBytes,
           applied: true,
         };
       } finally {

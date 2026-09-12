@@ -56,6 +56,45 @@ describe("ObjectsRepository", () => {
     const hashes = [...repo.iterateAll()].map((r) => r.hash);
     expect(hashes).toEqual(["aaa", "bbb", "ccc"]);
   });
+
+  it("computes orphan count/size via an anti-join against entries, entirely in SQL", () => {
+    const db = openStateDb(":memory:");
+    new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+    const objectsRepo = new ObjectsRepository(db);
+    const entriesRepo = new EntriesRepository(db);
+
+    objectsRepo.upsert({ hash: "referenced", s3_key: "objects/referenced", size: 10 });
+    objectsRepo.upsert({ hash: "orphan1", s3_key: "objects/orphan1", size: 20 });
+    objectsRepo.upsert({ hash: "orphan2", s3_key: "objects/orphan2", size: 30 });
+    entriesRepo.upsert({ path: "a.txt", type: "file", hash: "referenced", state_version: "v0" });
+
+    const { count, totalSize } = objectsRepo.countOrphaned();
+    expect(count).toBe(2);
+    expect(totalSize).toBe(50);
+  });
+
+  it("stages orphans, deletes them locally, then reports them for S3 cleanup", () => {
+    const db = openStateDb(":memory:");
+    new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+    const objectsRepo = new ObjectsRepository(db);
+    const entriesRepo = new EntriesRepository(db);
+
+    objectsRepo.upsert({ hash: "referenced", s3_key: "objects/referenced", size: 10 });
+    objectsRepo.upsert({ hash: "orphan1", s3_key: "objects/orphan1", size: 20 });
+    entriesRepo.upsert({ path: "a.txt", type: "file", hash: "referenced", state_version: "v0" });
+
+    objectsRepo.stageOrphansForDeletion();
+    expect(objectsRepo.countStagedOrphans()).toEqual({ count: 1, totalSize: 20 });
+
+    objectsRepo.deleteStagedOrphans();
+    expect(objectsRepo.has("orphan1")).toBe(false);
+    expect(objectsRepo.has("referenced")).toBe(true); // untouched
+
+    // the staged list itself survives the deletion (it's a separate temp
+    // table), which is exactly what lets gc drive S3 cleanup afterward
+    const staged = [...objectsRepo.iterateStagedOrphans()];
+    expect(staged).toEqual([{ hash: "orphan1", s3_key: "objects/orphan1", size: 20 }]);
+  });
 });
 
 describe("EntriesRepository (state.db)", () => {
