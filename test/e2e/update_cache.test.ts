@@ -4,11 +4,19 @@ import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { runCli } from "./helpers/cli.js";
+import { openStateDb } from "../../src/db/connection.js";
+import { VersionsRepository } from "../../src/db/repositories/versions-repository.js";
 
 function mkTempRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-e2e-uc-root-"));
   fs.mkdirSync(path.join(root, ".sync1"));
   fs.writeFileSync(path.join(root, ".sync1", "last_synced_version"), "v0", "utf8");
+  // update_cache validates stub-declared hashes against state.db's objects
+  // table (read-only, no password needed since it's already decrypted on
+  // disk) -- so even this offline, no-S3 test needs a real (if empty) one.
+  const stateDb = openStateDb(path.join(root, ".sync1", "state.db"));
+  new VersionsRepository(stateDb).insert("v0", new Date().toISOString());
+  stateDb.close();
   return root;
 }
 

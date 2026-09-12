@@ -6,6 +6,8 @@ import { registerUpdateCacheCommand } from "./commands/update_cache.js";
 import { registerSyncCommand } from "./commands/sync.js";
 import { registerFetchRemoteCommand } from "./commands/fetch_remote.js";
 import { registerEnsureStorageClassCommand } from "./commands/ensure_storage_class.js";
+import { registerMaterializeCommand } from "./commands/materialize.js";
+import { registerStubifyCommand } from "./commands/stubify.js";
 
 const program = new Command();
 
@@ -22,6 +24,8 @@ registerUpdateCacheCommand(program);
 registerSyncCommand(program);
 registerFetchRemoteCommand(program);
 registerEnsureStorageClassCommand(program);
+registerMaterializeCommand(program);
+registerStubifyCommand(program);
 // Further commands are registered here as they're implemented, task by task.
 
 program.parseAsync(process.argv).catch((err: unknown) => {

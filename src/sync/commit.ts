@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import { randomBytes } from "node:crypto";
+import Database from "better-sqlite3";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
 import { openStateDb, openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
+import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { performUpdateCache } from "../fs/update-cache.js";
 import { applyLocalChangesToCandidate } from "./apply-local-changes.js";
 import { applyRemoteChangesToLocal } from "./apply-remote-changes.js";
@@ -72,7 +74,26 @@ export async function performSync(
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
-    await performUpdateCache(root, cacheRepo, lastSyncedVersion, logger);
+    {
+      // Read-only, scoped to this call: only used to validate stub-declared
+      // hashes against known objects. Local state.db is already decrypted
+      // on disk, so this needs no password.
+      const stateDbForScan = new Database(localStateDbPath(root), {
+        readonly: true,
+        fileMustExist: true,
+      });
+      try {
+        await performUpdateCache(
+          root,
+          cacheRepo,
+          new ObjectsRepository(stateDbForScan),
+          lastSyncedVersion,
+          logger,
+        );
+      } finally {
+        stateDbForScan.close();
+      }
+    }
 
     // Snapshot dirty rows up front: better-sqlite3 disallows other
     // statements on the same connection while a .iterate() cursor is open.

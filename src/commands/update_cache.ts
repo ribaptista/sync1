@@ -1,11 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
+import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError } from "../cli/output.js";
-import { sync1Dir, localCacheDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
+import {
+  sync1Dir,
+  localCacheDbPath,
+  localStateDbPath,
+  lastSyncedVersionPath,
+} from "../vault/local-dir.js";
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
+import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { performUpdateCache, type UpdateCacheStats } from "../fs/update-cache.js";
 
 interface UpdateCacheOptions extends OptionValues {
@@ -58,6 +65,11 @@ async function runUpdateCache(
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const db = openCacheDb(localCacheDbPath(root), logger);
   const cacheRepo = new CacheEntriesRepository(db);
+  // Read-only: only used to validate stub-declared hashes against known
+  // objects. Local state.db is already decrypted on disk, so this needs no
+  // password.
+  const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const objectsRepo = new ObjectsRepository(stateDb);
 
   let bar: import("cli-progress").SingleBar | undefined;
   if (!json) {
@@ -66,14 +78,22 @@ async function runUpdateCache(
     bar.start(Math.max(cacheRepo.count(), 1), 0);
   }
 
-  const stats = await performUpdateCache(root, cacheRepo, lastSyncedVersion, logger, (n) => {
-    if (bar) {
-      if (n > bar.getTotal()) bar.setTotal(n);
-      bar.update(n);
-    }
-  });
+  const stats = await performUpdateCache(
+    root,
+    cacheRepo,
+    objectsRepo,
+    lastSyncedVersion,
+    logger,
+    (n) => {
+      if (bar) {
+        if (n > bar.getTotal()) bar.setTotal(n);
+        bar.update(n);
+      }
+    },
+  );
 
   bar?.stop();
   db.close();
+  stateDb.close();
   return stats;
 }

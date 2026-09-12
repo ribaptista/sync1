@@ -51,6 +51,13 @@ export class CacheEntriesRepository {
       .iterate();
   }
 
+  /** SQLite's native GLOB operator against `path` -- used by materialize/stubify. */
+  iterateByGlobSortedByPath(pattern: string): IterableIterator<CacheEntryRow> {
+    return this.db
+      .prepare<[string], CacheEntryRow>("SELECT * FROM entries WHERE path GLOB ? ORDER BY path ASC")
+      .iterate(pattern);
+  }
+
   count(): number {
     const row = this.db.prepare<[], CountRow>("SELECT COUNT(*) as c FROM entries").get();
     return row?.c ?? 0;

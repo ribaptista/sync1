@@ -10,6 +10,7 @@ import {
   type LocalStackHandle,
 } from "./helpers/localstack.js";
 import { runCli } from "./helpers/cli.js";
+import { hashBufferHex, formatTaggedHash } from "../../src/crypto/hash.js";
 
 const PASSWORD = "correct horse battery staple";
 
@@ -22,6 +23,19 @@ async function sync(root: string) {
     env: { SYNC1_PASSWORD: PASSWORD },
   });
   return { ...result, parsed: JSON.parse(result.stdout) as Record<string, unknown> };
+}
+
+async function materialize(root: string, glob: string) {
+  return runCli(["materialize", glob, "--root", root, "--json"], {
+    env: { SYNC1_PASSWORD: PASSWORD },
+  });
+}
+
+/** A path pulled down from remote for the first time defaults to a stub, not a download. */
+function expectStubFor(root: string, relPath: string, expectedContent: string): void {
+  expect(fs.existsSync(path.join(root, relPath))).toBe(false);
+  const stubContent = fs.readFileSync(path.join(root, `${relPath}.stub`), "utf8");
+  expect(stubContent).toBe(formatTaggedHash(hashBufferHex(Buffer.from(expectedContent))));
 }
 
 function cacheRowState(
@@ -92,8 +106,15 @@ describe("sync: full bidirectional (multi-machine)", () => {
     expect(syncB.exitCode).toBe(0);
     expect(syncB.parsed.nothing_to_sync).toBe(false);
     expect(syncB.parsed.remote_created).toBe(1);
-    expect(fs.readFileSync(path.join(rootB, "from-a.txt"), "utf8")).toBe("hello from A");
+    // A brand-new path defaults to a stub, not a download -- this is what
+    // makes attach_remote + sync a restore without downloading everything.
+    expectStubFor(rootB, "from-a.txt", "hello from A");
     expect(cacheRowState(rootB, "from-a.txt")?.state).toBe("unchanged");
+
+    const materializeResult = await materialize(rootB, "from-a.txt");
+    expect(materializeResult.exitCode).toBe(0);
+    expect(fs.readFileSync(path.join(rootB, "from-a.txt"), "utf8")).toBe("hello from A");
+    expect(fs.existsSync(path.join(rootB, "from-a.txt.stub"))).toBe(false);
 
     fs.rmSync(rootA, { recursive: true, force: true });
     fs.rmSync(rootB, { recursive: true, force: true });
@@ -142,16 +163,19 @@ describe("sync: full bidirectional (multi-machine)", () => {
     fs.writeFileSync(path.join(rootB, "file-b.txt"), "content B");
     const syncB = await sync(rootB);
     expect(syncB.exitCode).toBe(0);
-    expect(syncB.parsed.remote_created).toBe(1); // file-a.txt pulled down
+    expect(syncB.parsed.remote_created).toBe(1); // file-a.txt pulled down (as a stub -- new to B)
     expect(syncB.parsed.local_entries_changed).toBe(1); // file-b.txt pushed up
-    expect(fs.readFileSync(path.join(rootB, "file-a.txt"), "utf8")).toBe("content A");
+    expectStubFor(rootB, "file-a.txt", "content A");
+    // file-b.txt is B's own local creation -- sync never stubs a path the
+    // user already has materialized, it only defaults new pulls to stubs.
     expect(fs.readFileSync(path.join(rootB, "file-b.txt"), "utf8")).toBe("content B");
 
     // A catches up on B's change with a plain sync (no local changes of its own)
     const syncA2 = await sync(rootA);
     expect(syncA2.exitCode).toBe(0);
-    expect(syncA2.parsed.remote_created).toBe(1); // file-b.txt pulled down
-    expect(fs.readFileSync(path.join(rootA, "file-b.txt"), "utf8")).toBe("content B");
+    expect(syncA2.parsed.remote_created).toBe(1); // file-b.txt pulled down (as a stub -- new to A)
+    expectStubFor(rootA, "file-b.txt", "content B");
+    expect(fs.readFileSync(path.join(rootA, "file-a.txt"), "utf8")).toBe("content A"); // A's own file, stays real
 
     fs.rmSync(rootA, { recursive: true, force: true });
     fs.rmSync(rootB, { recursive: true, force: true });
@@ -192,15 +216,19 @@ describe("sync: full bidirectional (multi-machine)", () => {
       ],
       { env: { SYNC1_PASSWORD: PASSWORD } },
     );
-    await sync(rootB); // B catches up to "original"
-    expect(fs.readFileSync(path.join(rootB, "shared.txt"), "utf8")).toBe("original");
+    await sync(rootB); // B catches up to "original" (as a stub -- new to B)
+    expectStubFor(rootB, "shared.txt", "original");
 
     // A edits and commits first
     fs.writeFileSync(path.join(rootA, "shared.txt"), "from A");
     const syncA = await sync(rootA);
     expect(syncA.exitCode).toBe(0);
 
-    // B edits the same file independently, unaware of A's change, then syncs
+    // B edits the same file independently, unaware of A's change, then syncs.
+    // Writing straight over the stub path creates a transient "both exist"
+    // state that update_cache resolves by treating the real file as
+    // canonical and cleaning up the stray stub -- exactly like editing a
+    // materialized file, which is what this is meant to simulate.
     fs.writeFileSync(path.join(rootB, "shared.txt"), "from B");
     const syncB = await sync(rootB);
 

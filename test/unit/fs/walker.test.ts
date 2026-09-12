@@ -85,4 +85,37 @@ describe("walk", () => {
     const paths = await collectPaths(root);
     expect(paths).toEqual([]);
   });
+
+  it("merges a stub-only file into one logical entry, path stripped of .stub", async () => {
+    const root = mkTempDir();
+    fs.writeFileSync(path.join(root, "img.jpg.stub"), "blake2b:" + "a".repeat(64));
+
+    const entries = [];
+    for await (const entry of walk(root)) entries.push(entry);
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ path: "img.jpg", type: "file", representation: "stub" });
+  });
+
+  it("reports 'both' when a real file and its stub coexist", async () => {
+    const root = mkTempDir();
+    fs.writeFileSync(path.join(root, "img.jpg"), "real bytes");
+    fs.writeFileSync(path.join(root, "img.jpg.stub"), "blake2b:" + "a".repeat(64));
+
+    const entries = [];
+    for await (const entry of walk(root)) entries.push(entry);
+
+    expect(entries).toHaveLength(1); // one logical entry, not two
+    expect(entries[0]).toMatchObject({ path: "img.jpg", type: "file", representation: "both" });
+  });
+
+  it("reports 'real' for an ordinary file with no stub", async () => {
+    const root = mkTempDir();
+    fs.writeFileSync(path.join(root, "img.jpg"), "real bytes");
+
+    const entries = [];
+    for await (const entry of walk(root)) entries.push(entry);
+
+    expect(entries).toEqual([expect.objectContaining({ path: "img.jpg", representation: "real" })]);
+  });
 });

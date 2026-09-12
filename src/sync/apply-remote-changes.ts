@@ -11,6 +11,7 @@ import { hashBufferHex } from "../crypto/hash.js";
 import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { getObject } from "../s3/client.js";
 import { remoteKey, type RemoteLocation } from "../vault/paths.js";
+import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 
 export interface ApplyRemoteChangesResult {
   created: number;
@@ -32,6 +33,13 @@ export interface ApplyRemoteChangesResult {
  * version stamp changed" says no while everything still needs downloading.
  * Diffing cache.db's actual hashes against the candidate's is what's
  * actually true regardless of *why* they diverged.
+ *
+ * A brand-new path (never in cache.db before) defaults to a **stub**, not a
+ * full download -- this is what makes attach_remote + sync a real restore
+ * without downloading the whole backup. An already-known path preserves
+ * whatever representation it currently has: already-stubbed stays a stub
+ * (just its referenced hash is updated, no download at all); already
+ * materialized stays materialized (downloads the new content).
  *
  * `excludePaths` (this machine's own dirty rows) are skipped entirely --
  * handled by apply-local-changes.ts instead, or deliberately left
@@ -74,14 +82,16 @@ export async function applyRemoteChangesToLocal(
       ) {
         // Not tracked in cache.db at all -- either genuinely new remotely,
         // or (the attach_remote case) never materialized locally yet.
+        // Either way: default to a stub, never a download.
         if (!excludePaths.has(candidateEntry.path)) {
-          await applyMaterialize(
+          await applyRemoteContentChange(
             candidateEntry,
             root,
             masterKey,
             candidateObjects,
             cacheRepo,
             newBaselineVersion,
+            true,
             s3,
             logger,
           );
@@ -100,13 +110,17 @@ export async function applyRemoteChangesToLocal(
         cacheNext = cacheIter.next();
       } else if (cacheEntry !== null && candidateEntry !== null) {
         if (!excludePaths.has(candidateEntry.path) && cacheEntry.hash !== candidateEntry.hash) {
-          await applyMaterialize(
+          // Already known locally: preserve whatever representation is
+          // currently on disk rather than the default-to-stub policy above.
+          const preserveAsStub = currentlyStubBacked(root, candidateEntry.path);
+          await applyRemoteContentChange(
             candidateEntry,
             root,
             masterKey,
             candidateObjects,
             cacheRepo,
             newBaselineVersion,
+            preserveAsStub,
             s3,
             logger,
           );
@@ -123,13 +137,19 @@ export async function applyRemoteChangesToLocal(
   }
 }
 
-async function applyMaterialize(
+function currentlyStubBacked(root: string, entryPath: string): boolean {
+  const absolutePath = path.join(root, entryPath);
+  return !fs.existsSync(absolutePath) && fs.existsSync(stubPathFor(absolutePath));
+}
+
+async function applyRemoteContentChange(
   entry: EntryRow,
   root: string,
   masterKey: Buffer,
   candidateObjects: ObjectsRepository,
   cacheRepo: CacheEntriesRepository,
   newBaselineVersion: string,
+  writeAsStub: boolean,
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
 ): Promise<void> {
@@ -155,6 +175,25 @@ async function applyMaterialize(
     throw new Error(
       `remote entry for "${entry.path}" references unknown object hash ${entry.hash}`,
     );
+  }
+
+  if (writeAsStub) {
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    const stubAbsolutePath = stubPathFor(absolutePath);
+    writeStubAtomic(stubAbsolutePath, entry.hash);
+    cacheRepo.upsert({
+      path: entry.path,
+      type: "file",
+      mtime: Math.round(fs.statSync(stubAbsolutePath).mtimeMs),
+      hash: entry.hash,
+      state: "unchanged",
+      parent_state_version: newBaselineVersion,
+    });
+    logger.debug(
+      { path: entry.path, hash: entry.hash },
+      "wrote stub for remote content (no download)",
+    );
+    return;
   }
 
   const encrypted = await getObject(s3.client, s3.bucket, remoteKey(s3.location, objectRow.s3_key));
@@ -207,6 +246,11 @@ function applyRemoteDelete(
     }
   } catch {
     // already gone, or non-empty directory -- not fatal either way
+  }
+  try {
+    fs.rmSync(stubPathFor(absolutePath));
+  } catch {
+    // no stub -- fine, this was a materialized path
   }
   cacheRepo.delete(entryPath);
   logger.debug({ path: entryPath }, "applied remote deletion");
