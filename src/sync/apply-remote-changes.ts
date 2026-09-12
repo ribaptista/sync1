@@ -7,12 +7,12 @@ import type { Logger } from "../logger.js";
 import { EntriesRepository, type EntryRow } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
-import { hashBufferHex } from "../crypto/hash.js";
-import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
-import { getObject } from "../s3/client.js";
+import { CryptoAuthError } from "../crypto/chunked-codec.js";
+import { getObjectStream } from "../s3/client.js";
 import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
+import { decryptStreamToFile } from "../fs/decrypt-to-file.js";
 
 export interface ApplyRemoteChangesResult {
   created: number;
@@ -197,17 +197,24 @@ async function applyRemoteContentChange(
     return;
   }
 
-  const encrypted = await getObject(s3.client, s3.bucket, remoteKey(s3.location, objectRow.s3_key));
+  const encrypted = await getObjectStream(
+    s3.client,
+    s3.bucket,
+    remoteKey(s3.location, objectRow.s3_key),
+  );
   if (!encrypted) {
     throw new CorruptionError(
       `object ${entry.hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
     );
   }
 
-  let plaintext: Buffer;
+  fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+  const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+  let computedHash: string;
   try {
-    plaintext = decryptBuffer(encrypted.body, masterKey);
+    computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
   } catch (err) {
+    if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
     if (err instanceof CryptoAuthError) {
       throw new CorruptionError(
         `object ${entry.hash} for "${entry.path}" failed decryption/authentication`,
@@ -215,15 +222,13 @@ async function applyRemoteContentChange(
     }
     throw err;
   }
-  if (hashBufferHex(plaintext) !== entry.hash) {
+  if (computedHash !== entry.hash) {
+    fs.rmSync(tmpPath);
     throw new CorruptionError(
       `object ${entry.hash} for "${entry.path}" does not match its recorded hash`,
     );
   }
 
-  fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-  const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
-  fs.writeFileSync(tmpPath, plaintext);
   fs.renameSync(tmpPath, absolutePath);
 
   cacheRepo.upsert({

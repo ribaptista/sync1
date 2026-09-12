@@ -7,8 +7,8 @@ import type { CacheEntryRow } from "../db/repositories/cache-entries-repository.
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
-import { encryptBuffer } from "../crypto/chunked-codec.js";
-import { putObject } from "../s3/client.js";
+import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
+import { putObjectStream } from "../s3/client.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 
@@ -105,14 +105,21 @@ export async function applyLocalChangesToCandidate(
         logger.debug({ path: row.path, hash }, "content already known, skipping upload (dedup)");
       } else {
         const absolutePath = path.join(root, row.path);
-        const plaintext = fs.readFileSync(absolutePath);
         const context = Buffer.from(hash, "hex");
-        const encrypted = encryptBuffer(plaintext, masterKey, context);
+        const size = fs.statSync(absolutePath).size;
+        const sourceStream = fs.createReadStream(absolutePath);
+        const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
         const key = objectKey(hash);
-        await putObject(s3.client, s3.bucket, remoteKey(s3.location, key), encrypted);
-        objectsRepo.upsert({ hash, s3_key: key, size: plaintext.length });
+        await putObjectStream(
+          s3.client,
+          s3.bucket,
+          remoteKey(s3.location, key),
+          encryptedStream,
+          encryptedSize(size, context.length),
+        );
+        objectsRepo.upsert({ hash, s3_key: key, size });
         uploadedObjects++;
-        logger.debug({ path: row.path, hash, size: plaintext.length }, "uploaded new object");
+        logger.debug({ path: row.path, hash, size }, "uploaded new object");
       }
     }
 

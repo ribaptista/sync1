@@ -5,13 +5,13 @@ import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
-import { getObject, headObject, restoreObject } from "../s3/client.js";
+import { getObjectStream, headObject, restoreObject } from "../s3/client.js";
 import { classifyArchiveStatus } from "../s3/archive-status.js";
-import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
-import { hashBufferHex } from "../crypto/hash.js";
+import { CryptoAuthError } from "../crypto/chunked-codec.js";
 import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { stubPathFor } from "./stub.js";
 import { CorruptionError } from "../errors.js";
+import { decryptStreamToFile } from "./decrypt-to-file.js";
 
 export interface MaterializeStats {
   materialized: number;
@@ -95,15 +95,18 @@ export async function materializeGlob(
     logger.debug({ path: row.path, hash: row.hash, status }, "classified archive status");
 
     if (status === "immediate" || status === "restore-ready") {
-      const encrypted = await getObject(s3.client, s3.bucket, key);
+      const encrypted = await getObjectStream(s3.client, s3.bucket, key);
       if (!encrypted) {
         throw new CorruptionError(`object ${row.hash} for "${row.path}" is missing in S3`);
       }
 
-      let plaintext: Buffer;
+      fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+      const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+      let computedHash: string;
       try {
-        plaintext = decryptBuffer(encrypted.body, masterKey);
+        computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
       } catch (err) {
+        if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
         if (err instanceof CryptoAuthError) {
           throw new CorruptionError(
             `object ${row.hash} for "${row.path}" failed decryption/authentication`,
@@ -111,15 +114,13 @@ export async function materializeGlob(
         }
         throw err;
       }
-      if (hashBufferHex(plaintext) !== row.hash) {
+      if (computedHash !== row.hash) {
+        fs.rmSync(tmpPath);
         throw new CorruptionError(
           `object ${row.hash} for "${row.path}" does not match its recorded hash`,
         );
       }
 
-      fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-      const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
-      fs.writeFileSync(tmpPath, plaintext);
       fs.renameSync(tmpPath, absolutePath); // materialize first...
       fs.rmSync(stubAbsolutePath); // ...only then delete the stub
 

@@ -1,3 +1,4 @@
+import type { Readable } from "node:stream";
 import {
   S3Client,
   PutObjectCommand,
@@ -89,6 +90,26 @@ export async function putObject(
   await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
 }
 
+/**
+ * Streaming counterpart to `putObject` -- content-object uploads have no
+ * CAS/conditional semantics to preserve (dedup is already checked before any
+ * upload is attempted), so a plain PutObjectCommand with a precomputed
+ * `contentLength` (the chunked codec's fixed per-chunk overhead makes this
+ * exact, computed upfront by the caller via `encryptedSize`) is enough --
+ * no multipart upload machinery needed.
+ */
+export async function putObjectStream(
+  client: S3Client,
+  bucket: string,
+  key: string,
+  body: Readable,
+  contentLength: number,
+): Promise<void> {
+  await client.send(
+    new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentLength: contentLength }),
+  );
+}
+
 export async function getObject(
   client: S3Client,
   bucket: string,
@@ -100,6 +121,30 @@ export async function getObject(
     const bytes = await result.Body.transformToByteArray();
     if (!result.ETag) throw new Error(`GetObject for "${key}" did not return an ETag`);
     return { body: Buffer.from(bytes), etag: result.ETag };
+  } catch (err) {
+    if (err instanceof Error && err.name === "NoSuchKey") return null;
+    throw err;
+  }
+}
+
+/**
+ * Streaming counterpart to `getObject` -- exposes the response body as a
+ * live Node Readable instead of eagerly buffering it, so a large content
+ * object's decrypt-and-write never needs the whole thing in memory (see
+ * docs/architecture/vault-and-encryption.md).
+ */
+export async function getObjectStream(
+  client: S3Client,
+  bucket: string,
+  key: string,
+): Promise<{ body: Readable; etag: string } | null> {
+  try {
+    const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    if (!result.Body) throw new Error(`GetObject for "${key}" returned no body`);
+    if (!result.ETag) throw new Error(`GetObject for "${key}" did not return an ETag`);
+    // In the Node.js runtime (the only runtime this project runs in), Body
+    // is always a Readable, never the browser ReadableStream/Blob variants.
+    return { body: result.Body as Readable, etag: result.ETag };
   } catch (err) {
     if (err instanceof Error && err.name === "NoSuchKey") return null;
     throw err;

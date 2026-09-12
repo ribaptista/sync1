@@ -158,7 +158,7 @@ export function chunkByteRange(
   return { start, end: start + ciphertextChunkSize };
 }
 
-function plaintextChunkLength(header: ChunkedHeader, chunkIndex: number): number {
+export function plaintextChunkLength(header: ChunkedHeader, chunkIndex: number): number {
   const isLastChunk = chunkIndex === chunkCount(header) - 1;
   if (!isLastChunk) return header.chunkSize;
   const remainder = header.totalPlaintextSize % header.chunkSize;
