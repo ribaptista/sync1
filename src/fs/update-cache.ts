@@ -12,12 +12,19 @@ import {
   type CacheEntryRow,
 } from "../db/repositories/cache-entries-repository.js";
 import { StagingRepository } from "../db/repositories/staging-repository.js";
+import { toCollisionKey } from "./case-collision.js";
+
+export interface CaseCollision {
+  path: string;
+  collidesWith: string;
+}
 
 export interface UpdateCacheStats {
   created: number;
   modified: number;
   deleted: number;
   unchanged: number;
+  caseCollisions: CaseCollision[];
 }
 
 export class UnknownStubContentError extends CorruptionError {
@@ -52,7 +59,13 @@ export async function performUpdateCache(
   logger: Logger,
   onProgress?: (scanned: number) => void,
 ): Promise<UpdateCacheStats> {
-  const stats: UpdateCacheStats = { created: 0, modified: 0, deleted: 0, unchanged: 0 };
+  const stats: UpdateCacheStats = {
+    created: 0,
+    modified: 0,
+    deleted: 0,
+    unchanged: 0,
+    caseCollisions: [],
+  };
 
   const stagingPath = tempSiblingPath(cacheDbPath, "update-cache-staging");
   const staging = new StagingRepository(stagingPath);
@@ -97,7 +110,14 @@ export async function performUpdateCache(
       onProgress?.(scanned);
     }
 
+    const { excludedPaths, collisions } = detectCaseCollisions(staging, cacheRepo);
+    stats.caseCollisions = collisions;
+    if (collisions.length > 0) {
+      logger.warn({ collisions }, "case-insensitive path collision(s) detected -- not applying");
+    }
+
     for (const row of staging.iterateAll()) {
+      if (excludedPaths.has(row.path)) continue;
       cacheRepo.upsert(row);
     }
   } finally {
@@ -109,6 +129,51 @@ export async function performUpdateCache(
   }
 
   return stats;
+}
+
+/**
+ * Finds every case-insensitive collision in this run's batch, both within
+ * the batch itself (two paths newly staged as live at once) and against
+ * cache.db's existing durable rows (a newly-staged path colliding with
+ * something already tracked from an earlier scan) -- and returns which
+ * paths to leave unapplied. A durable hit doesn't count if that same path
+ * is *also* being tombstoned ('deleted') in this same batch: that's the
+ * ordinary "rename" case (delete `file.txt`, create `FILE.txt`), not a
+ * real collision. See docs/architecture/cross-platform-filesystem.md.
+ */
+function detectCaseCollisions(
+  staging: StagingRepository,
+  cacheRepo: CacheEntriesRepository,
+): { excludedPaths: Set<string>; collisions: CaseCollision[] } {
+  const excludedPaths = new Set<string>();
+  const collisions: CaseCollision[] = [];
+
+  for (const normalizedPath of staging.liveCollisionGroups()) {
+    const rows = staging.liveRowsForNormalizedPath(normalizedPath);
+    for (const row of rows) {
+      const other = rows.find((r) => r.path !== row.path);
+      if (!other) continue; // can't happen given liveCollisionGroups()'s own COUNT(*) > 1
+      excludedPaths.add(row.path);
+      collisions.push({ path: row.path, collidesWith: other.path });
+    }
+  }
+
+  // Bounded the same way the whole staging table already is (by what
+  // changed this run, not by tree size) -- materializing it here is not a
+  // new memory concern, just a second pass over an already-bounded set.
+  const allStaged = [...staging.iterateAll()];
+  const deletedInBatch = new Set(allStaged.filter((r) => r.state === "deleted").map((r) => r.path));
+
+  for (const row of allStaged) {
+    if (row.state === "deleted" || excludedPaths.has(row.path)) continue;
+    const hit = cacheRepo.findByNormalizedPath(toCollisionKey(row.path), row.path);
+    if (hit && !deletedInBatch.has(hit.path)) {
+      excludedPaths.add(row.path);
+      collisions.push({ path: row.path, collidesWith: hit.path });
+    }
+  }
+
+  return { excludedPaths, collisions };
 }
 
 interface ResolvedContent {

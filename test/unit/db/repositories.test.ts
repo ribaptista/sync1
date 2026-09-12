@@ -262,4 +262,42 @@ describe("CacheEntriesRepository (cache.db)", () => {
     const paths = [...repo.iterateAllSortedByPath()].map((r) => r.path);
     expect(paths).toEqual(["a.txt", "m/nested.txt", "z.txt"]);
   });
+
+  it("findByNormalizedPath finds a live row differing only by case, via the indexed column", () => {
+    const db = openCacheDb(":memory:");
+    const repo = new CacheEntriesRepository(db);
+    repo.upsert({
+      path: "file.txt",
+      type: "file",
+      mtime: 1,
+      hash: "h1",
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+
+    const hit = repo.findByNormalizedPath("file.txt", "FILE.txt");
+    expect(hit?.path).toBe("file.txt");
+
+    // never matches itself
+    expect(repo.findByNormalizedPath("file.txt", "file.txt")).toBeUndefined();
+    // no collision at all
+    expect(repo.findByNormalizedPath("nope.txt", "other.txt")).toBeUndefined();
+  });
+
+  it("findByNormalizedPath ignores a tombstoned ('deleted') row", () => {
+    const db = openCacheDb(":memory:");
+    const repo = new CacheEntriesRepository(db);
+    repo.upsert({
+      path: "file.txt",
+      type: "file",
+      mtime: null,
+      hash: null,
+      state: "deleted",
+      parent_state_version: "v0",
+    });
+
+    // a tombstone must never block a legitimately different case-variant
+    // path from being accepted (e.g. a rename's create half)
+    expect(repo.findByNormalizedPath("file.txt", "FILE.txt")).toBeUndefined();
+  });
 });

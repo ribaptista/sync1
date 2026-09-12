@@ -10,7 +10,7 @@ import {
   type CacheEntryRow,
 } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
-import { performUpdateCache } from "../fs/update-cache.js";
+import { performUpdateCache, type CaseCollision } from "../fs/update-cache.js";
 import { applyLocalChangesToCandidate } from "./apply-local-changes.js";
 import { applyRemoteChangesToLocal } from "./apply-remote-changes.js";
 import { reconcileCacheAfterCommit } from "./reconcile-cache.js";
@@ -41,6 +41,16 @@ export interface SyncResult {
   remoteModified: number;
   remoteDeleted: number;
   conflicts: SyncConflict[];
+  /**
+   * Case-insensitive path collisions found while this run's own internal
+   * update_cache scan staged its diff -- surfaced here (rather than only
+   * logged and silently dropped) since sync's caller has no other way to
+   * learn about them. Distinct from `conflicts`: those are state.db commit
+   * conflicts on dirty rows; these are local-scan-time and never even
+   * become dirty rows in the first place. See
+   * docs/architecture/cross-platform-filesystem.md.
+   */
+  caseCollisions: CaseCollision[];
 }
 
 export class RemoteDivergedError extends Error {
@@ -100,6 +110,7 @@ export async function performSync(
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
     const cacheReadRepo = new CacheEntriesRepository(cacheReadDb);
+    let updateCacheStats;
     {
       // Read-only, scoped to this call: only used to validate stub-declared
       // hashes against known objects. Local state.db is already decrypted
@@ -109,7 +120,7 @@ export async function performSync(
         fileMustExist: true,
       });
       try {
-        await performUpdateCache(
+        updateCacheStats = await performUpdateCache(
           root,
           localCacheDbPath(root),
           cacheRepo,
@@ -251,6 +262,7 @@ export async function performSync(
           remoteModified: remoteResult.modified,
           remoteDeleted: remoteResult.deleted,
           conflicts: localResult.conflicts,
+          caseCollisions: updateCacheStats.caseCollisions,
         };
       }
 
@@ -298,6 +310,7 @@ export async function performSync(
         remoteModified: remoteResult.modified,
         remoteDeleted: remoteResult.deleted,
         conflicts: localResult.conflicts,
+        caseCollisions: updateCacheStats.caseCollisions,
       };
     } finally {
       if (fs.existsSync(candidatePath)) fs.rmSync(candidatePath);

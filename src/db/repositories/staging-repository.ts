@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import type { CacheEntryRow } from "./cache-entries-repository.js";
+import { toCollisionKey } from "../../fs/case-collision.js";
 
 const SCHEMA = `
 CREATE TABLE pending (
@@ -47,7 +48,7 @@ export class StagingRepository {
         row.hash,
         row.state,
         row.parent_state_version,
-        row.path.toLowerCase(),
+        toCollisionKey(row.path),
       );
   }
 
@@ -57,6 +58,25 @@ export class StagingRepository {
         "SELECT path, type, mtime, hash, state, parent_state_version FROM pending",
       )
       .iterate();
+  }
+
+  /** Normalized-path groups with more than one currently-live (non-'deleted') row in this same batch. */
+  liveCollisionGroups(): string[] {
+    const rows = this.db
+      .prepare<[], { normalized_path: string }>(
+        "SELECT normalized_path FROM pending WHERE state != 'deleted' GROUP BY normalized_path HAVING COUNT(*) > 1",
+      )
+      .all();
+    return rows.map((r) => r.normalized_path);
+  }
+
+  /** Every live (non-'deleted') row sharing the given normalized path. */
+  liveRowsForNormalizedPath(normalizedPath: string): CacheEntryRow[] {
+    return this.db
+      .prepare<[string], CacheEntryRow>(
+        "SELECT path, type, mtime, hash, state, parent_state_version FROM pending WHERE normalized_path = ? AND state != 'deleted'",
+      )
+      .all(normalizedPath);
   }
 
   close(): void {

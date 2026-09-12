@@ -44,8 +44,16 @@ describe("update_cache", () => {
       modified: number;
       deleted: number;
       unchanged: number;
+      case_collisions: unknown[];
     };
-    expect(firstStats).toEqual({ ok: true, created: 3, modified: 0, deleted: 0, unchanged: 0 });
+    expect(firstStats).toEqual({
+      ok: true,
+      created: 3,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      case_collisions: [],
+    });
 
     let rows = readCacheRows(root);
     expect(rows).toEqual([

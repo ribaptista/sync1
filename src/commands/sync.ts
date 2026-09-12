@@ -33,10 +33,12 @@ export function registerSyncCommand(program: Command): void {
       try {
         const result = await runSync(opts, logger);
         const hasConflicts = result.conflicts.length > 0;
+        const hasCaseCollisions = result.caseCollisions.length > 0;
+        const hasIssues = hasConflicts || hasCaseCollisions;
 
         if (json) {
           emitJson({
-            ok: !hasConflicts,
+            ok: !hasIssues,
             version_stamp: result.versionStamp,
             nothing_to_sync: result.nothingToSync,
             uploaded_objects: result.uploadedObjects,
@@ -46,6 +48,10 @@ export function registerSyncCommand(program: Command): void {
             remote_modified: result.remoteModified,
             remote_deleted: result.remoteDeleted,
             conflicts: result.conflicts,
+            case_collisions: result.caseCollisions.map((c) => ({
+              path: c.path,
+              collides_with: c.collidesWith,
+            })),
           });
         } else if (result.nothingToSync) {
           process.stdout.write("sync: nothing to sync\n");
@@ -57,9 +63,17 @@ export function registerSyncCommand(program: Command): void {
             process.stdout.write(`${result.conflicts.length} conflict(s) left unresolved:\n`);
             for (const c of result.conflicts) process.stdout.write(`  - ${c.path}: ${c.reason}\n`);
           }
+          if (hasCaseCollisions) {
+            process.stdout.write(
+              `${result.caseCollisions.length} case-insensitive collision(s) detected (not synced):\n`,
+            );
+            for (const c of result.caseCollisions) {
+              process.stdout.write(`  - "${c.path}" vs "${c.collidesWith}"\n`);
+            }
+          }
         }
 
-        if (hasConflicts) process.exitCode = EXIT_CONFLICT;
+        if (hasIssues) process.exitCode = EXIT_CONFLICT;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "sync failed");

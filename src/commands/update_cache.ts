@@ -3,7 +3,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
-import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
+import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
 import {
   sync1Dir,
   localCacheDbPath,
@@ -36,13 +36,30 @@ export function registerUpdateCacheCommand(program: Command): void {
 
       try {
         const stats = await runUpdateCache(opts, logger, json);
+        const ok = stats.caseCollisions.length === 0;
         if (json) {
-          emitJson({ ok: true, ...stats });
+          emitJson({
+            ok,
+            created: stats.created,
+            modified: stats.modified,
+            deleted: stats.deleted,
+            unchanged: stats.unchanged,
+            case_collisions: stats.caseCollisions.map((c) => ({
+              path: c.path,
+              collides_with: c.collidesWith,
+            })),
+          });
         } else {
           process.stdout.write(
             `update_cache: ${stats.created} created, ${stats.modified} modified, ${stats.deleted} deleted, ${stats.unchanged} unchanged\n`,
           );
+          for (const c of stats.caseCollisions) {
+            process.stdout.write(
+              `  case collision: "${c.path}" vs "${c.collidesWith}" -- rename or remove one of them, then run update_cache again\n`,
+            );
+          }
         }
+        if (!ok) process.exitCode = EXIT_GENERIC_ERROR;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "update_cache failed");

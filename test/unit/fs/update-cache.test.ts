@@ -77,7 +77,13 @@ describe("performUpdateCache", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 1, modified: 0, deleted: 0, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 1,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+    });
 
     const row = repo.get("a.txt");
     expect(row?.state).toBe("created");
@@ -100,7 +106,13 @@ describe("performUpdateCache", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 0, modified: 0, deleted: 0, unchanged: 1 });
+    expect(stats).toEqual({
+      created: 0,
+      modified: 0,
+      deleted: 0,
+      unchanged: 1,
+      caseCollisions: [],
+    });
     expect(hashFileMock).not.toHaveBeenCalled();
   });
 
@@ -128,7 +140,13 @@ describe("performUpdateCache", () => {
       "v1",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 0, modified: 1, deleted: 0, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 0,
+      modified: 1,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+    });
     const row = repo.get("a.txt");
     expect(row?.state).toBe("modified");
     expect(row?.parent_state_version).toBe("v1"); // fresh baseline, established now
@@ -155,7 +173,13 @@ describe("performUpdateCache", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 0, modified: 0, deleted: 0, unchanged: 1 });
+    expect(stats).toEqual({
+      created: 0,
+      modified: 0,
+      deleted: 0,
+      unchanged: 1,
+      caseCollisions: [],
+    });
     expect(repo.get("a.txt")?.state).toBe("unchanged");
     expect(repo.get("a.txt")?.mtime).toBe(1_700_000_005_000);
   });
@@ -174,7 +198,13 @@ describe("performUpdateCache", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 0, modified: 0, deleted: 1, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 0,
+      modified: 0,
+      deleted: 1,
+      unchanged: 0,
+      caseCollisions: [],
+    });
     const row = repo.get("a.txt");
     expect(row?.state).toBe("deleted");
     expect(row?.hash).toBeNull();
@@ -196,7 +226,13 @@ describe("performUpdateCache", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 0, modified: 0, deleted: 1, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 0,
+      modified: 0,
+      deleted: 1,
+      unchanged: 0,
+      caseCollisions: [],
+    });
   });
 
   it("treats a file recreated at a previously-deleted path as a fresh creation", async () => {
@@ -215,7 +251,13 @@ describe("performUpdateCache", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 1, modified: 0, deleted: 0, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 1,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+    });
     expect(repo.get("a.txt")?.state).toBe("created");
   });
 
@@ -235,7 +277,13 @@ describe("performUpdateCache", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 1, modified: 0, deleted: 0, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 1,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+    });
     const row = repo.get("a.txt");
     expect(row?.state).toBe("created"); // still 'created', not flipped to 'modified'
     expect(row?.parent_state_version).toBe("v0"); // unchanged baseline
@@ -253,7 +301,13 @@ describe("performUpdateCache", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 2, modified: 0, deleted: 0, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 2,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+    });
     expect(repo.get("photos")?.hash).toBeNull();
     expect(repo.get("photos")?.type).toBe("dir");
   });
@@ -274,7 +328,13 @@ describe("performUpdateCache: stub files", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 1, modified: 0, deleted: 0, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 1,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+    });
     expect(hashFileMock).not.toHaveBeenCalled(); // never hashes the stub's own bytes
     const row = repo.get("img.jpg");
     expect(row?.hash).toBe(knownHash);
@@ -313,7 +373,13 @@ describe("performUpdateCache: stub files", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 1, modified: 0, deleted: 0, unchanged: 0 });
+    expect(stats).toEqual({
+      created: 1,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      caseCollisions: [],
+    });
     expect(repo.get("img.jpg")?.hash).toBe(hashBufferHex(Buffer.from("the real content")));
     expect(fs.existsSync(path.join(root, "img.jpg.stub"))).toBe(false); // cleaned up
   });
@@ -343,7 +409,13 @@ describe("performUpdateCache: stub files", () => {
       "v0",
       silentLogger,
     );
-    expect(stats).toEqual({ created: 0, modified: 0, deleted: 0, unchanged: 1 });
+    expect(stats).toEqual({
+      created: 0,
+      modified: 0,
+      deleted: 0,
+      unchanged: 1,
+      caseCollisions: [],
+    });
   });
 });
 
@@ -362,5 +434,92 @@ describe("performUpdateCache: staging file lifecycle", () => {
       performUpdateCache(root, cacheDbPath, repo, objectsRepo, "v0", silentLogger),
     ).rejects.toThrow(/corrupt stub/);
     expect(fs.readdirSync(cacheDbDir)).toEqual([]);
+  });
+});
+
+describe("performUpdateCache: case-insensitive collision detection", () => {
+  it("applies a rename (tombstone + case-variant create in the same batch) with no collision reported", async () => {
+    const repo = makeRepo();
+    // Simulate "file.txt" already fully synced, then renamed to "FILE.txt"
+    // on disk before the next scan -- update_cache sees this as one path
+    // vanishing and a case-variant appearing in the very same run.
+    repo.upsert({
+      path: "file.txt",
+      type: "file",
+      mtime: 1_700_000_000_000,
+      hash: hashBufferHex(Buffer.from("hello")),
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+    touch("FILE.txt", "hello");
+
+    const stats = await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      "v0",
+      silentLogger,
+    );
+    expect(stats.caseCollisions).toEqual([]);
+    expect(repo.get("file.txt")?.state).toBe("deleted");
+    expect(repo.get("FILE.txt")?.state).toBe("created");
+  });
+
+  it("reports a genuine collision, applies every other row, and leaves neither colliding path tracked", async () => {
+    touch("file.txt", "one");
+    touch("FILE.txt", "two");
+    touch("other.txt", "unrelated");
+    const repo = makeRepo();
+
+    const stats = await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      "v0",
+      silentLogger,
+    );
+
+    expect(stats.caseCollisions).toHaveLength(2);
+    const collidingPaths = stats.caseCollisions.map((c) => c.path).sort();
+    expect(collidingPaths).toEqual(["FILE.txt", "file.txt"]);
+    for (const c of stats.caseCollisions) {
+      expect(["FILE.txt", "file.txt"]).toContain(c.collidesWith);
+    }
+
+    // neither colliding path got tracked...
+    expect(repo.get("file.txt")).toBeUndefined();
+    expect(repo.get("FILE.txt")).toBeUndefined();
+    // ...but the unrelated new file still applied normally
+    expect(repo.get("other.txt")?.state).toBe("created");
+  });
+
+  it("a durable cache.db collision does not block an unrelated file in the same batch", async () => {
+    const repo = makeRepo();
+    repo.upsert({
+      path: "file.txt",
+      type: "file",
+      mtime: 1_700_000_000_000,
+      hash: hashBufferHex(Buffer.from("existing")),
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+    touch("file.txt", "existing", 1_700_000_000_000); // matches cache.db's baseline, stays untouched
+    touch("FILE.txt", "new content"); // collides with the existing "file.txt" row
+    touch("other.txt", "unrelated");
+
+    const stats = await performUpdateCache(
+      root,
+      cacheDbPath,
+      repo,
+      objectsRepo,
+      "v0",
+      silentLogger,
+    );
+
+    expect(stats.caseCollisions).toEqual([{ path: "FILE.txt", collidesWith: "file.txt" }]);
+    expect(repo.get("FILE.txt")).toBeUndefined();
+    expect(repo.get("other.txt")?.state).toBe("created");
   });
 });
