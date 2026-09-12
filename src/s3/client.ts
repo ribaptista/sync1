@@ -4,7 +4,11 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
+  CopyObjectCommand,
+  RestoreObjectCommand,
   type S3ClientConfig,
+  type StorageClass,
+  type Tier,
 } from "@aws-sdk/client-s3";
 
 export interface S3ClientOptions {
@@ -123,6 +127,58 @@ export async function headObject(
     if (err instanceof Error && err.name === "NotFound") return null;
     throw err;
   }
+}
+
+function encodeCopySource(bucket: string, key: string): string {
+  const encodedKey = key
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `${bucket}/${encodedKey}`;
+}
+
+/**
+ * Self-copy (same bucket/key as source and destination) that only changes
+ * the object's storage class -- the standard S3 mechanism for an in-place
+ * class change, since there's no direct "set storage class" API. Metadata
+ * is preserved (the default `MetadataDirective` behavior) since we're not
+ * changing anything else about the object.
+ */
+export async function copyObjectStorageClass(
+  client: S3Client,
+  bucket: string,
+  key: string,
+  storageClass: StorageClass,
+): Promise<void> {
+  await client.send(
+    new CopyObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      CopySource: encodeCopySource(bucket, key),
+      StorageClass: storageClass,
+    }),
+  );
+}
+
+export interface RestoreOptions {
+  days: number;
+  tier: Tier;
+}
+
+/** Requests a temporary restored copy of an archived (Glacier/Deep Archive) object. */
+export async function restoreObject(
+  client: S3Client,
+  bucket: string,
+  key: string,
+  opts: RestoreOptions,
+): Promise<void> {
+  await client.send(
+    new RestoreObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      RestoreRequest: { Days: opts.days, Tier: opts.tier },
+    }),
+  );
 }
 
 /** True if no object exists under `prefix` — used by init_remote's empty-vault check. */

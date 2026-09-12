@@ -55,6 +55,20 @@ export class EntriesRepository {
       .iterate();
   }
 
+  /**
+   * Distinct hashes among paths matching a SQLite GLOB pattern (directories
+   * excluded, since they have no hash/storage class). One row per
+   * *content*, not per path, since operations like `ensure_storage_class`
+   * act on the underlying object, which may be referenced by several paths.
+   */
+  iterateDistinctHashesMatchingGlob(pattern: string): IterableIterator<HashRow> {
+    return this.db
+      .prepare<[string], HashRow>(
+        "SELECT DISTINCT hash FROM entries WHERE hash IS NOT NULL AND path GLOB ?",
+      )
+      .iterate(pattern);
+  }
+
   count(): number {
     const row = this.db.prepare<[], CountRow>("SELECT COUNT(*) as c FROM entries").get();
     return row?.c ?? 0;

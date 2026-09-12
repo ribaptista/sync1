@@ -5,6 +5,7 @@ import { registerAttachRemoteCommand } from "./commands/attach_remote.js";
 import { registerUpdateCacheCommand } from "./commands/update_cache.js";
 import { registerSyncCommand } from "./commands/sync.js";
 import { registerFetchRemoteCommand } from "./commands/fetch_remote.js";
+import { registerEnsureStorageClassCommand } from "./commands/ensure_storage_class.js";
 
 const program = new Command();
 
@@ -20,6 +21,7 @@ registerAttachRemoteCommand(program);
 registerUpdateCacheCommand(program);
 registerSyncCommand(program);
 registerFetchRemoteCommand(program);
+registerEnsureStorageClassCommand(program);
 // Further commands are registered here as they're implemented, task by task.
 
 program.parseAsync(process.argv).catch((err: unknown) => {
