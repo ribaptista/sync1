@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { registerInitRemoteCommand } from "./commands/init_remote.js";
 
 const program = new Command();
 
@@ -10,9 +11,8 @@ program
   .option("--json", "output machine-readable JSON on stdout")
   .option("--verbose", "enable debug-level logging on stderr");
 
-// Commands are registered here as they're implemented, task by task.
-// Each command module reads global flags via `command.optsWithGlobals()`
-// and constructs its own logger via createLogger(opts.verbose) from ./logger.js.
+registerInitRemoteCommand(program);
+// Further commands are registered here as they're implemented, task by task.
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);

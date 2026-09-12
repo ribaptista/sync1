@@ -13,6 +13,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
@@ -20,6 +21,7 @@
     "test:unit": "vitest run --project unit",
     "test:e2e": "vitest run --project e2e",
     "test": "npm run test:unit && npm run test:e2e",
+    "verify": "npm run typecheck && npm run lint && npm run format:check && npm run test:unit && npm run test:e2e",
     "prepare": "husky"
   },
   "dependencies": {

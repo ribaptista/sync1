@@ -94,7 +94,8 @@ describe("chunked codec security properties", () => {
 
     const header = decodeHeader(encoded);
     const tampered = Buffer.from(encoded);
-    tampered[header.headerSize] ^= 0xff; // flip a byte inside chunk 0's ciphertext
+    // flip a byte inside chunk 0's ciphertext
+    tampered.writeUInt8(tampered.readUInt8(header.headerSize) ^ 0xff, header.headerSize);
 
     expect(() => decryptBuffer(tampered, masterKey)).toThrow(CryptoAuthError);
   });

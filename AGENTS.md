@@ -5,10 +5,14 @@
 A task (in the sense of the tasks laid out in the project plan) is **not complete** until all of the
 following pass, in this order:
 
-1. `npm run lint` (ESLint, zero warnings)
-2. `npm run format:check` (Prettier)
-3. `npm run test:unit`
-4. `npm run test:e2e`
+1. `npm run typecheck` (`tsc --noEmit` — tests run via `tsx`, which transpiles but does not type-check,
+   so this is the only thing that actually catches a type error)
+2. `npm run lint` (ESLint, zero warnings)
+3. `npm run format:check` (Prettier)
+4. `npm run test:unit`
+5. `npm run test:e2e`
+
+`npm run verify` runs all five in order in one command.
 
 This is enforced locally by a `husky` pre-commit hook (`lint-staged`: `eslint --fix` + `prettier --write`
 on staged files), but pre-commit only covers staged-file lint/format — it does **not** run the test

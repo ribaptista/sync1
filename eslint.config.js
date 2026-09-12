@@ -19,4 +19,13 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // Ambient module declarations (e.g. sodium-native, which ships no types
+    // of its own) legitimately declare top-level bindings used only via
+    // `typeof` elsewhere in the same file.
+    files: ["**/*.d.ts"],
+    rules: {
+      "@typescript-eslint/no-unused-vars": "off",
+    },
+  },
 );
