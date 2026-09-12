@@ -16,8 +16,8 @@ import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { StoragePoliciesRepository } from "../db/repositories/storage-policies-repository.js";
 import { CorruptionError } from "../errors.js";
 
-// Not exposed as flags (matches ensure_storage_class's own scope) -- a
-// reasonable default balance of cost/latency for the temporary restore window.
+// Not exposed as flags -- a reasonable default balance of cost/latency for
+// the temporary restore window.
 const RESTORE_DAYS = 7;
 const RESTORE_TIER = "Standard";
 

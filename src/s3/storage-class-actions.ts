@@ -9,7 +9,7 @@ export type StorageClassAction =
   | { kind: "finalize-copy" };
 
 /**
- * Pure decision for `ensure_storage_class`, given an object's current class,
+ * Pure decision for `status`/`converge`, given an object's current class,
  * the requested target class, and its current archive/restore status
  * (`classifyArchiveStatus`). Colder-target moves are always immediate
  * (a plain self-copy); warmer-target moves need the two-phase

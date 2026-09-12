@@ -18,7 +18,7 @@ sync1 status --root <local-path> [--filter <glob>] [--json]
 | `--filter <glob>` | no       | SQLite `GLOB` pattern scoping which tracked paths' objects are considered (default `*`, everything). |
 
 No password needed — `HEAD` requests don't decrypt anything, and policies are read from the
-already-locally-decrypted `state.db`, same as `ensure_storage_class`.
+already-locally-decrypted `state.db`.
 
 ## What it does
 
@@ -31,9 +31,9 @@ For every distinct object (hash) with at least one path matching `--filter`:
    implies it should stay warm. When the paths disagreed, that's reported as a conflict alongside the
    counts — see [ignore-and-storage-policies.md](../architecture/ignore-and-storage-policies.md).
 3. `HEAD`s the object's actual current storage class and archive/restore status, and buckets the
-   comparison exactly like `ensure_storage_class` does: already correct, needs an immediate copy (colder
-   target), needs a restore request issued, a restore already in progress, or a restore that's ready to
-   finalize with a copy.
+   comparison into one of five categories: already correct, needs an immediate copy (colder target),
+   needs a restore request issued, a restore already in progress, or a restore that's ready to finalize
+   with a copy.
 
 ## Output
 

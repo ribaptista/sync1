@@ -74,7 +74,7 @@ export class EntriesRepository {
   /**
    * Distinct hashes among paths matching a SQLite GLOB pattern (directories
    * excluded, since they have no hash/storage class). One row per
-   * *content*, not per path, since operations like `ensure_storage_class`
+   * *content*, not per path, since operations like `status`/`converge`
    * act on the underlying object, which may be referenced by several paths.
    */
   iterateDistinctHashesMatchingGlob(pattern: string): IterableIterator<HashRow> {

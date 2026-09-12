@@ -13,10 +13,10 @@ sync1 gc --root <local-path> [--apply] [--json] [--verbose]
 
 ## Options
 
-| Flag            | Required | Description                                                                                                                            |
-| --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `--root <path>` | yes      | Local directory whose vault to clean up.                                                                                               |
-| `--apply`       | no       | Actually delete orphaned objects. Without it, only counts what _would_ be removed — the same safety default as `ensure_storage_class`. |
+| Flag            | Required | Description                                                                        |
+| --------------- | -------- | ---------------------------------------------------------------------------------- |
+| `--root <path>` | yes      | Local directory whose vault to clean up.                                           |
+| `--apply`       | no       | Actually delete orphaned objects. Without it, only counts what _would_ be removed. |
 
 The vault password is required (gc reads and re-encrypts state.db).
 

@@ -30,11 +30,12 @@ end-to-end, and that the correct API calls get issued for the warmer/restore pat
 
 ## Two consumers, one primitive, different decisions
 
-`decideStorageClassAction` (`src/s3/storage-class-actions.ts`) is `ensure_storage_class`'s decision
-layer on top of `classifyArchiveStatus` — it also knows the _target_ class, so it can tell "colder
-target, always immediate" apart from "warmer target, follow the restore dance." `materialize` (Task 11)
-will use `classifyArchiveStatus` directly instead, with a simpler question: "can I read this content
-right now, or do I need to ask for temporary access first" — it has no target-class concept, since
+`decideStorageClassAction` (`src/s3/storage-class-actions.ts`) is `status`/`converge`'s decision layer
+on top of `classifyArchiveStatus` — it also knows the _target_ class (resolved per object from
+`storage_policy`'s rules, see [storage-class-policies.md](storage-class-policies.md)), so it can tell
+"colder target, always immediate" apart from "warmer target, follow the restore dance." `materialize`
+uses `classifyArchiveStatus` directly instead, with a simpler question: "can I read this content right
+now, or do I need to ask for temporary access first" — it has no target-class concept, since
 materializing never changes an object's permanent storage class.
 
 ## Colder is a plain copy; warmer is two-phase
@@ -48,10 +49,13 @@ itself does not.
 
 ## Dedup interaction
 
-`ensure_storage_class` resolves its glob against **distinct content hashes**
+`status`/`converge` resolve `--filter` against **distinct content hashes**
 (`EntriesRepository.iterateDistinctHashesMatchingGlob`), not paths, using SQLite's native `GLOB`
 operator directly against `entries.path` — no separate pattern-matching library needed. Since storage
-class is a property of the object, not any individual path, a class change affects every path that
-references that hash, including ones the glob didn't match, if they happen to share identical content.
-This isn't a bug to work around — it's the direct, correct consequence of content-addressed dedup, and
-it's called out in the command's own docs so it isn't a surprise.
+class is a property of the object, not any individual path, its resolved target affects every path that
+references that hash, including ones outside `--filter`'s scope, if they happen to share identical
+content. Unlike the single-glob-target model this replaced (the removed `ensure_storage_class`, where
+every matched path always implied the same target), `storage_policy` lets different paths imply
+_different_ target classes for the very same shared object — see
+[storage-class-policies.md](storage-class-policies.md) for how that's resolved (warmest wins, with the
+disagreement surfaced rather than silently picked).

@@ -22,7 +22,7 @@ export interface MaterializeStats {
   pending: number;
 }
 
-// Not exposed as flags -- matches ensure_storage_class's defaults.
+// Not exposed as flags -- matches status/converge's restore defaults.
 const RESTORE_DAYS = 7;
 const RESTORE_TIER = "Standard";
 

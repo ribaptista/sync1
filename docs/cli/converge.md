@@ -3,8 +3,8 @@
 Applies `storage_policy`: moves each tracked object's actual S3 storage class to match what the
 policies imply. Shares the exact same iteration/evaluation as [`status`](status.md) — `status` counts,
 `converge` actually performs each transition (a self-copy for a colder target, `RestoreObject` for a
-warmer one). No password needed — like `ensure_storage_class`, changing storage-class metadata or
-requesting a restore never reads or writes encrypted object content.
+warmer one). No password needed — changing storage-class metadata or requesting a restore never reads
+or writes encrypted object content.
 
 ## Usage
 
