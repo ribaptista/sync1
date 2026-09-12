@@ -13,6 +13,7 @@ import { registerGcCommand } from "./commands/gc.js";
 import { registerIgnoreCommand } from "./commands/ignore.js";
 import { registerSanityCheckCommand } from "./commands/sanity_check.js";
 import { registerStoragePolicyCommand } from "./commands/storage_policy.js";
+import { registerStatusCommand } from "./commands/status.js";
 
 const program = new Command();
 
@@ -36,6 +37,7 @@ registerGcCommand(program);
 registerIgnoreCommand(program);
 registerSanityCheckCommand(program);
 registerStoragePolicyCommand(program);
+registerStatusCommand(program);
 // Further commands are registered here as they're implemented, task by task.
 
 program.parseAsync(process.argv).catch((err: unknown) => {
