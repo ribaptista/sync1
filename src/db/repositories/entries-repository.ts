@@ -48,6 +48,13 @@ export class EntriesRepository {
       .iterate(hash);
   }
 
+  /** SQLite's native GLOB operator against `path` -- used by `inspect`. */
+  iterateByGlobSortedByPath(pattern: string): IterableIterator<EntryRow> {
+    return this.db
+      .prepare<[string], EntryRow>("SELECT * FROM entries WHERE path GLOB ? ORDER BY path ASC")
+      .iterate(pattern);
+  }
+
   /** Every hash currently referenced by a live entry — the GC "keep" set. */
   iterateDistinctReferencedHashes(): IterableIterator<HashRow> {
     return this.db
