@@ -18,7 +18,14 @@ describe("migration runner", () => {
       .all()
       .map((r) => r.name)
       .sort();
-    expect(tables).toEqual(["_migrations", "entries", "ignore_policies", "objects", "versions"]);
+    expect(tables).toEqual([
+      "_migrations",
+      "entries",
+      "ignore_policies",
+      "objects",
+      "storage_policies",
+      "versions",
+    ]);
   });
 
   it("applies cache.db migrations and creates the expected tables", () => {
@@ -46,6 +53,7 @@ describe("migration runner", () => {
       { filename: "0001_init.sql" },
       { filename: "0002_add_normalized_path.sql" },
       { filename: "0003_add_ignore_policies.sql" },
+      { filename: "0004_add_storage_policies.sql" },
     ]);
 
     // Running again must not error (e.g. re-executing CREATE TABLE) and must
@@ -54,7 +62,7 @@ describe("migration runner", () => {
     const appliedSecond = db
       .prepare<[], { filename: string }>("SELECT filename FROM _migrations")
       .all();
-    expect(appliedSecond).toHaveLength(3);
+    expect(appliedSecond).toHaveLength(4);
   });
 
   it("creates the indexes named in the schema", () => {

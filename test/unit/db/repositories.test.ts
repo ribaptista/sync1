@@ -5,6 +5,7 @@ import { ObjectsRepository } from "../../../src/db/repositories/objects-reposito
 import { EntriesRepository } from "../../../src/db/repositories/entries-repository.js";
 import { CacheEntriesRepository } from "../../../src/db/repositories/cache-entries-repository.js";
 import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
+import { StoragePoliciesRepository } from "../../../src/db/repositories/storage-policies-repository.js";
 
 describe("VersionsRepository", () => {
   it("inserts and reads back versions in sequence order", () => {
@@ -328,5 +329,73 @@ describe("IgnorePoliciesRepository (state.db)", () => {
     repo.create("photos/raw/*");
 
     expect(repo.listGlobs().sort()).toEqual(["*.tmp", "photos/raw/*"]);
+  });
+});
+
+describe("StoragePoliciesRepository (state.db)", () => {
+  it("seeds exactly one default row from the migration itself", () => {
+    const db = openStateDb(":memory:");
+    const repo = new StoragePoliciesRepository(db);
+
+    const all = repo.list();
+    expect(all).toHaveLength(1);
+    expect(all[0]).toEqual({
+      id: expect.any(Number) as number,
+      glob: null,
+      target_class: "STANDARD",
+      priority: null,
+      is_default: 1,
+    });
+    expect(repo.getDefault()).toEqual(all[0]);
+    expect(repo.listNonDefaultByPriority()).toEqual([]);
+  });
+
+  it("creates, lists (default last), updates, and deletes non-default policies", () => {
+    const db = openStateDb(":memory:");
+    const repo = new StoragePoliciesRepository(db);
+
+    const coldId = repo.create("archive/*", "DEEP_ARCHIVE", 1);
+    const warmId = repo.create("archive/keep-warm/*", "STANDARD", 0);
+
+    const all = repo.list();
+    expect(all.map((r) => r.id)).toEqual([warmId, coldId, expect.any(Number) as number]); // priority order, default last
+    expect(repo.listNonDefaultByPriority().map((r) => r.id)).toEqual([warmId, coldId]);
+
+    expect(repo.get(coldId)).toEqual({
+      id: coldId,
+      glob: "archive/*",
+      target_class: "DEEP_ARCHIVE",
+      priority: 1,
+      is_default: 0,
+    });
+
+    expect(repo.update(coldId, { targetClass: "GLACIER", priority: 2 })).toBe(true);
+    expect(repo.get(coldId)).toMatchObject({ target_class: "GLACIER", priority: 2 });
+    expect(repo.update(999, { targetClass: "STANDARD" })).toBe(false);
+
+    expect(repo.delete(warmId)).toBe(true);
+    expect(repo.get(warmId)).toBeUndefined();
+    expect(repo.delete(warmId)).toBe(false);
+  });
+
+  it("only allows the default row's target_class to change, never its glob/priority", () => {
+    const db = openStateDb(":memory:");
+    const repo = new StoragePoliciesRepository(db);
+    const defaultId = repo.getDefault().id;
+
+    expect(repo.update(defaultId, { targetClass: "GLACIER" })).toBe(true);
+    expect(repo.getDefault().target_class).toBe("GLACIER");
+
+    expect(() => repo.update(defaultId, { glob: "*" })).toThrow(/glob\/priority/);
+    expect(() => repo.update(defaultId, { priority: 5 })).toThrow(/glob\/priority/);
+  });
+
+  it("refuses to delete the default row", () => {
+    const db = openStateDb(":memory:");
+    const repo = new StoragePoliciesRepository(db);
+    const defaultId = repo.getDefault().id;
+
+    expect(() => repo.delete(defaultId)).toThrow(/default policy can't be deleted/);
+    expect(repo.get(defaultId)).toBeDefined();
   });
 });
