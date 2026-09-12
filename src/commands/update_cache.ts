@@ -3,7 +3,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
-import { emitJson, emitError } from "../cli/output.js";
+import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import {
   sync1Dir,
   localCacheDbPath,
@@ -46,7 +46,7 @@ export function registerUpdateCacheCommand(program: Command): void {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "update_cache failed");
-        emitError(json, message);
+        emitError(json, message, exitCodeForError(err));
       }
     });
 }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
-import { emitJson, emitError, EXIT_CONFLICT } from "../cli/output.js";
+import { emitJson, emitError, exitCodeForError, EXIT_CONFLICT } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
@@ -63,7 +63,7 @@ export function registerSyncCommand(program: Command): void {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "sync failed");
-        const exitCode = err instanceof RemoteDivergedError ? EXIT_CONFLICT : undefined;
+        const exitCode = err instanceof RemoteDivergedError ? EXIT_CONFLICT : exitCodeForError(err);
         emitError(json, message, exitCode);
       }
     });

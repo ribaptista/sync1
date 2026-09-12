@@ -4,6 +4,7 @@ import type { Logger } from "../logger.js";
 import { walk, type WalkEntry } from "./walker.js";
 import { hashFile } from "./hash-file.js";
 import { readStubHash, stubPathFor, StubFormatError } from "./stub.js";
+import { CorruptionError } from "../errors.js";
 import type { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import {
   CacheEntriesRepository,
@@ -17,7 +18,7 @@ export interface UpdateCacheStats {
   unchanged: number;
 }
 
-export class UnknownStubContentError extends Error {
+export class UnknownStubContentError extends CorruptionError {
   constructor(entryPath: string, hash: string) {
     super(
       `stub for "${entryPath}" references content hash ${hash}, which isn't known in this vault`,
@@ -147,7 +148,7 @@ async function resolveFileContent(
       hash = readStubHash(stubPathFor(absolutePath));
     } catch (err) {
       if (err instanceof StubFormatError) {
-        throw new Error(`corrupt stub at "${fsEntry.path}.stub": ${err.message}`);
+        throw new CorruptionError(`corrupt stub at "${fsEntry.path}.stub": ${err.message}`);
       }
       throw err;
     }

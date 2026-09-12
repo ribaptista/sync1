@@ -3,7 +3,7 @@ import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import sodium from "sodium-native";
 import { createLogger } from "../logger.js";
-import { emitJson, emitError } from "../cli/output.js";
+import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client, putObjectCas, isPrefixEmpty } from "../s3/client.js";
 import { createVaultManifest, serializeManifest } from "../vault/manifest.js";
@@ -73,7 +73,7 @@ export function registerInitRemoteCommand(program: Command): void {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "init_remote failed");
-        emitError(json, message);
+        emitError(json, message, exitCodeForError(err));
       }
     });
 }

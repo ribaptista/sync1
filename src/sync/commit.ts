@@ -20,6 +20,7 @@ import {
   type RemoteLocation,
 } from "../vault/paths.js";
 import { localCacheDbPath, localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
+import { CorruptionError } from "../errors.js";
 
 export interface SyncConflict {
   path: string;
@@ -101,7 +102,7 @@ export async function performSync(
 
     const currentKey = remoteKey(s3.location, CURRENT_POINTER_KEY);
     const current = await getObject(s3.client, s3.bucket, currentKey);
-    if (!current) throw new Error("vault has no /current pointer (corrupt vault?)");
+    if (!current) throw new CorruptionError("vault has no /current pointer (corrupt vault?)");
     const remoteVersionStamp = current.body.toString("utf8");
     const remoteHasMoved = remoteVersionStamp !== lastSyncedVersion;
 
@@ -130,14 +131,16 @@ export async function performSync(
         remoteKey(s3.location, stateSnapshotKey(remoteVersionStamp)),
       );
       if (!snapshot) {
-        throw new Error(`state.db snapshot for version "${remoteVersionStamp}" is missing`);
+        throw new CorruptionError(
+          `state.db snapshot for version "${remoteVersionStamp}" is missing`,
+        );
       }
       let decrypted: Buffer;
       try {
         decrypted = decryptBuffer(snapshot.body, masterKey);
       } catch (err) {
         if (err instanceof CryptoAuthError) {
-          throw new Error("remote state.db snapshot failed decryption/authentication");
+          throw new CorruptionError("remote state.db snapshot failed decryption/authentication");
         }
         throw err;
       }

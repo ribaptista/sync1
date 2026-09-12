@@ -6,12 +6,13 @@ import {
   isValidHashHex,
   HASH_ALGORITHM,
 } from "../crypto/hash.js";
+import { CorruptionError } from "../errors.js";
 
 export function stubPathFor(realAbsolutePath: string): string {
   return `${realAbsolutePath}.stub`;
 }
 
-export class StubFormatError extends Error {
+export class StubFormatError extends CorruptionError {
   constructor(message: string) {
     super(message);
     this.name = "StubFormatError";

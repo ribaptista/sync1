@@ -11,6 +11,7 @@ import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { hashBufferHex } from "../crypto/hash.js";
 import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { stubPathFor } from "./stub.js";
+import { CorruptionError } from "../errors.js";
 
 export interface MaterializeStats {
   materialized: number;
@@ -79,32 +80,41 @@ export async function materializeGlob(
     if (!row.hash) throw new Error(`stub for "${row.path}" has no recorded hash in cache.db`);
     const objectRow = objectsRepo.get(row.hash);
     if (!objectRow) {
-      throw new Error(`stub for "${row.path}" references unknown object ${row.hash}`);
+      throw new CorruptionError(`stub for "${row.path}" references unknown object ${row.hash}`);
     }
 
     const key = remoteKey(s3.location, objectRow.s3_key);
     const head = await headObject(s3.client, s3.bucket, key);
-    if (!head)
-      throw new Error(`object ${row.hash} for "${row.path}" is missing in S3 (corrupt vault?)`);
+    if (!head) {
+      throw new CorruptionError(
+        `object ${row.hash} for "${row.path}" is missing in S3 (corrupt vault?)`,
+      );
+    }
 
     const status = classifyArchiveStatus(head);
     logger.debug({ path: row.path, hash: row.hash, status }, "classified archive status");
 
     if (status === "immediate" || status === "restore-ready") {
       const encrypted = await getObject(s3.client, s3.bucket, key);
-      if (!encrypted) throw new Error(`object ${row.hash} for "${row.path}" is missing in S3`);
+      if (!encrypted) {
+        throw new CorruptionError(`object ${row.hash} for "${row.path}" is missing in S3`);
+      }
 
       let plaintext: Buffer;
       try {
         plaintext = decryptBuffer(encrypted.body, masterKey);
       } catch (err) {
         if (err instanceof CryptoAuthError) {
-          throw new Error(`object ${row.hash} for "${row.path}" failed decryption/authentication`);
+          throw new CorruptionError(
+            `object ${row.hash} for "${row.path}" failed decryption/authentication`,
+          );
         }
         throw err;
       }
       if (hashBufferHex(plaintext) !== row.hash) {
-        throw new Error(`object ${row.hash} for "${row.path}" does not match its recorded hash`);
+        throw new CorruptionError(
+          `object ${row.hash} for "${row.path}" does not match its recorded hash`,
+        );
       }
 
       fs.mkdirSync(path.dirname(absolutePath), { recursive: true });

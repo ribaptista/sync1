@@ -12,6 +12,7 @@ import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { getObject } from "../s3/client.js";
 import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
+import { CorruptionError } from "../errors.js";
 
 export interface ApplyRemoteChangesResult {
   created: number;
@@ -172,7 +173,7 @@ async function applyRemoteContentChange(
   if (!entry.hash) throw new Error(`remote entry for "${entry.path}" is a file with no hash`);
   const objectRow = candidateObjects.get(entry.hash);
   if (!objectRow) {
-    throw new Error(
+    throw new CorruptionError(
       `remote entry for "${entry.path}" references unknown object hash ${entry.hash}`,
     );
   }
@@ -198,7 +199,9 @@ async function applyRemoteContentChange(
 
   const encrypted = await getObject(s3.client, s3.bucket, remoteKey(s3.location, objectRow.s3_key));
   if (!encrypted) {
-    throw new Error(`object ${entry.hash} for "${entry.path}" is missing in S3 (corrupt vault?)`);
+    throw new CorruptionError(
+      `object ${entry.hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
+    );
   }
 
   let plaintext: Buffer;
@@ -206,12 +209,16 @@ async function applyRemoteContentChange(
     plaintext = decryptBuffer(encrypted.body, masterKey);
   } catch (err) {
     if (err instanceof CryptoAuthError) {
-      throw new Error(`object ${entry.hash} for "${entry.path}" failed decryption/authentication`);
+      throw new CorruptionError(
+        `object ${entry.hash} for "${entry.path}" failed decryption/authentication`,
+      );
     }
     throw err;
   }
   if (hashBufferHex(plaintext) !== entry.hash) {
-    throw new Error(`object ${entry.hash} for "${entry.path}" does not match its recorded hash`);
+    throw new CorruptionError(
+      `object ${entry.hash} for "${entry.path}" does not match its recorded hash`,
+    );
   }
 
   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });

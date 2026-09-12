@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import { createLogger } from "../logger.js";
-import { emitJson, emitError } from "../cli/output.js";
+import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client, getObject } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
@@ -25,6 +25,7 @@ import {
 } from "../vault/paths.js";
 import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { openCacheDb } from "../db/connection.js";
+import { CorruptionError } from "../errors.js";
 
 interface AttachRemoteOptions extends OptionValues {
   bucket: string;
@@ -73,7 +74,7 @@ export function registerAttachRemoteCommand(program: Command): void {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "attach_remote failed");
-        emitError(json, message);
+        emitError(json, message, exitCodeForError(err));
       }
     });
 }
@@ -106,7 +107,7 @@ async function runAttachRemote(
   logger.debug({}, "fetching /current pointer");
   const currentObj = await getObject(client, opts.bucket, remoteKey(location, CURRENT_POINTER_KEY));
   if (!currentObj) {
-    throw new Error(
+    throw new CorruptionError(
       `vault at s3://${opts.bucket}/${prefix} has no /current pointer (corrupt vault?)`,
     );
   }
@@ -119,7 +120,9 @@ async function runAttachRemote(
     remoteKey(location, stateSnapshotKey(versionStamp)),
   );
   if (!snapshotObj) {
-    throw new Error(`state.db snapshot for version "${versionStamp}" is missing (corrupt vault?)`);
+    throw new CorruptionError(
+      `state.db snapshot for version "${versionStamp}" is missing (corrupt vault?)`,
+    );
   }
 
   let stateDbBytes: Buffer;
@@ -127,7 +130,9 @@ async function runAttachRemote(
     stateDbBytes = decryptBuffer(snapshotObj.body, masterKey);
   } catch (err) {
     if (err instanceof CryptoAuthError) {
-      throw new Error("state.db snapshot failed decryption/authentication (corrupted upload?)");
+      throw new CorruptionError(
+        "state.db snapshot failed decryption/authentication (corrupted upload?)",
+      );
     }
     throw err;
   }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
-import { emitJson, emitError } from "../cli/output.js";
+import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
@@ -50,7 +50,7 @@ export function registerGcCommand(program: Command): void {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "gc failed");
-        emitError(json, message);
+        emitError(json, message, exitCodeForError(err));
       }
     });
 }

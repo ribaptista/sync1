@@ -22,6 +22,7 @@ import {
   type RemoteLocation,
 } from "../vault/paths.js";
 import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
+import { CorruptionError } from "../errors.js";
 
 export interface GcResult {
   orphanCount: number;
@@ -66,7 +67,7 @@ export async function performGc(
 
   for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
     const current = await getObject(s3.client, s3.bucket, currentKey);
-    if (!current) throw new Error("vault has no /current pointer (corrupt vault?)");
+    if (!current) throw new CorruptionError("vault has no /current pointer (corrupt vault?)");
     const versionStamp = current.body.toString("utf8");
 
     const snapshot = await getObject(
@@ -74,14 +75,15 @@ export async function performGc(
       s3.bucket,
       remoteKey(s3.location, stateSnapshotKey(versionStamp)),
     );
-    if (!snapshot) throw new Error(`state.db snapshot for version "${versionStamp}" is missing`);
+    if (!snapshot)
+      throw new CorruptionError(`state.db snapshot for version "${versionStamp}" is missing`);
 
     let decrypted: Buffer;
     try {
       decrypted = decryptBuffer(snapshot.body, masterKey);
     } catch (err) {
       if (err instanceof CryptoAuthError) {
-        throw new Error("state.db snapshot failed decryption/authentication");
+        throw new CorruptionError("state.db snapshot failed decryption/authentication");
       }
       throw err;
     }

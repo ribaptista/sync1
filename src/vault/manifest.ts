@@ -7,6 +7,7 @@ import {
   type KdfParams,
 } from "../crypto/kdf.js";
 import { encryptBuffer, decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
+import { CorruptionError } from "../errors.js";
 
 export interface VaultManifest {
   version: 1;
@@ -84,7 +85,7 @@ export function parseManifest(data: Buffer): VaultManifest {
     typeof (parsed as { verifier?: unknown }).verifier !== "string" ||
     typeof (parsed as { kdf_params?: unknown }).kdf_params !== "object"
   ) {
-    throw new Error("malformed vault.json: not a recognizable sync1 vault manifest");
+    throw new CorruptionError("malformed vault.json: not a recognizable sync1 vault manifest");
   }
   return parsed as VaultManifest;
 }

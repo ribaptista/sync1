@@ -3,7 +3,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
-import { emitJson, emitError } from "../cli/output.js";
+import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { createS3Client, headObject, copyObjectStorageClass, restoreObject } from "../s3/client.js";
 import { classifyArchiveStatus, isSupportedStorageClass } from "../s3/archive-status.js";
 import { decideStorageClassAction } from "../s3/storage-class-actions.js";
@@ -12,6 +12,7 @@ import { sync1Dir, localStateDbPath, localRemoteConfigPath } from "../vault/loca
 import { remoteKey, normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
+import { CorruptionError } from "../errors.js";
 
 // Not exposed as flags (matches the plan's scope) -- a reasonable default
 // balance of cost/latency for the temporary restore window.
@@ -78,7 +79,7 @@ export function registerEnsureStorageClassCommand(program: Command): void {
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logger.debug({ err: message }, "ensure_storage_class failed");
-          emitError(json, message);
+          emitError(json, message, exitCodeForError(err));
         }
       },
     );
@@ -128,7 +129,7 @@ async function runEnsureStorageClass(
     for (const { hash } of entriesRepo.iterateDistinctHashesMatchingGlob(glob)) {
       const objectRow = objectsRepo.get(hash);
       if (!objectRow) {
-        throw new Error(
+        throw new CorruptionError(
           `entries reference object ${hash} but no objects row exists (corrupt state.db?)`,
         );
       }
@@ -136,7 +137,7 @@ async function runEnsureStorageClass(
 
       const head = await headObject(client, remoteConfig.bucket, key);
       if (!head) {
-        throw new Error(`object ${hash} is missing in S3 at "${key}" (corrupt vault?)`);
+        throw new CorruptionError(`object ${hash} is missing in S3 at "${key}" (corrupt vault?)`);
       }
       const currentClass = head.storageClass ?? "STANDARD";
       if (!isSupportedStorageClass(currentClass)) {

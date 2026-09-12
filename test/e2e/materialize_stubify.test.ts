@@ -148,7 +148,7 @@ describe("materialize / stubify", () => {
     fs.writeFileSync(path.join(root, "phantom.jpg.stub"), formatTaggedHash("f".repeat(64)));
 
     const result = await runCli(["update_cache", "--root", root, "--json"]);
-    expect(result.exitCode).not.toBe(0);
+    expect(result.exitCode).toBe(3);
     const parsed = JSON.parse(result.stdout) as { ok: boolean; error: string };
     expect(parsed.error).toMatch(/isn't known in this vault/);
 
