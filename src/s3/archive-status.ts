@@ -16,7 +16,8 @@ export type ArchiveStatus =
 
 export type SupportedStorageClass = "STANDARD" | "GLACIER" | "DEEP_ARCHIVE";
 
-const COLDNESS_ORDER: Record<SupportedStorageClass, number> = {
+/** Exported for reuse wherever two storage classes need to be compared by warmth (e.g. dedup's warmest-wins policy resolution). */
+export const COLDNESS_ORDER: Record<SupportedStorageClass, number> = {
   STANDARD: 0,
   GLACIER: 1,
   DEEP_ARCHIVE: 2,
