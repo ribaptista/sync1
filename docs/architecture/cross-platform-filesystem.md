@@ -96,3 +96,14 @@ Neither checkpoint retroactively detects a collision that already exists in a va
 feature was added, or one introduced by some other tool writing directly to a vault's S3 objects rather
 than through sync1. Both checkpoints only ever prevent a _new_ collision from being introduced going
 forward.
+
+## A separate, Windows-only risk: transient locks on `state.db`
+
+Unrelated to case-insensitivity, but adjacent in scope: the local `state.db` file gets renamed or
+overwritten in place at a few points (`commit.ts`'s final commit and early-return-adoption paths, `gc.ts`,
+`attach_remote`/`fetch_remote`'s initial writes). On Windows, an external process — most commonly an
+antivirus scanner or the search indexer — can transiently hold a lock on a file that briefly blocks a
+rename or open-for-write against it. Tracing every one of these call sites confirmed sync1's own process
+never holds a handle on the destination at the moment of the write, so `src/fs/safe-fs.ts` wraps each of
+them in a short retry-with-backoff (5 attempts, doubling from 50ms, retried only for `EBUSY`/`EPERM`/
+`EACCES`) — purely a defensive measure against an external actor, not a fix to a bug in sync1's own logic.

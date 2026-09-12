@@ -22,6 +22,7 @@ import {
 } from "../vault/paths.js";
 import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { CorruptionError } from "../errors.js";
+import { writeFileWithRetry } from "../fs/safe-fs.js";
 
 interface FetchRemoteOptions extends OptionValues {
   root: string;
@@ -107,7 +108,7 @@ async function runFetchRemote(opts: FetchRemoteOptions, logger: Logger): Promise
   // attach_remote's contract. Deliberately does NOT touch last_synced_version
   // either: that file records what this machine has *synced* (folded local
   // changes into), not merely fetched -- sync is what advances it.
-  fs.writeFileSync(localStateDbPath(root), decrypted);
+  await writeFileWithRetry(localStateDbPath(root), decrypted);
 
   return versionStamp;
 }

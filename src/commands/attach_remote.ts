@@ -25,6 +25,7 @@ import {
 } from "../vault/paths.js";
 import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { openCacheDb } from "../db/connection.js";
+import { writeFileWithRetry } from "../fs/safe-fs.js";
 import { CorruptionError } from "../errors.js";
 
 interface AttachRemoteOptions extends OptionValues {
@@ -141,7 +142,7 @@ async function runAttachRemote(
   // fetch_remote's contract. Materializing the tree (as stubs) happens the
   // first time `sync` runs, not here.
   fs.mkdirSync(sync1DirPath, { recursive: true });
-  fs.writeFileSync(localStateDbPath(root), stateDbBytes);
+  await writeFileWithRetry(localStateDbPath(root), stateDbBytes);
   fs.writeFileSync(localVaultJsonPath(root), manifestObj.body);
   fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
 

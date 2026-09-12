@@ -25,6 +25,7 @@ import {
 } from "../vault/paths.js";
 import { localCacheDbPath, localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
+import { renameWithRetry, copyFileWithRetry } from "../fs/safe-fs.js";
 
 export interface SyncConflict {
   path: string;
@@ -239,7 +240,7 @@ export async function performSync(
         // moved, and still reconcile any no-op-resolved rows to
         // 'unchanged' -- they're resolved even though nothing was uploaded.
         if (remoteHasMoved) {
-          fs.copyFileSync(remoteFreshPath, localStateDbPath(root));
+          await copyFileWithRetry(remoteFreshPath, localStateDbPath(root));
           fs.writeFileSync(lastSyncedVersionPath(root), remoteVersionStamp, "utf8");
         }
         reconcileCacheAfterCommit(
@@ -292,7 +293,7 @@ export async function performSync(
       // reconcile the successfully-applied cache rows -- a crash before
       // this point just leaves ignorable stray temp files and an untouched
       // cache.db, safe to retry.
-      fs.renameSync(candidatePath, localStateDbPath(root));
+      await renameWithRetry(candidatePath, localStateDbPath(root));
       fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
       reconcileCacheAfterCommit(
         cacheRepo,

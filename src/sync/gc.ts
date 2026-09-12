@@ -23,6 +23,7 @@ import {
 import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
 import { tempSiblingPath } from "../fs/temp-path.js";
+import { copyFileWithRetry } from "../fs/safe-fs.js";
 
 export interface GcResult {
   orphanCount: number;
@@ -163,7 +164,7 @@ export async function performGc(
           await deleteObject(s3.client, s3.bucket, remoteKey(s3.location, o.s3_key));
         }
 
-        fs.copyFileSync(candidatePath, localStateDbPath(root));
+        await copyFileWithRetry(candidatePath, localStateDbPath(root));
         fs.writeFileSync(lastSyncedVersionPath(root), newVersionStamp, "utf8");
 
         return {
