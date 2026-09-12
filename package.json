@@ -1,0 +1,57 @@
+{
+  "name": "sync1",
+  "version": "0.1.0",
+  "description": "E2E-encrypted, deduplicated, incremental backup CLI",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "sync1": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test:unit": "vitest run --project unit",
+    "test:e2e": "vitest run --project e2e",
+    "test": "npm run test:unit && npm run test:e2e",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.700.0",
+    "better-sqlite3": "^11.7.0",
+    "cli-progress": "^3.12.0",
+    "commander": "^12.1.0",
+    "pino": "^9.5.0",
+    "sodium-native": "^4.3.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/cli-progress": "^3.11.6",
+    "@types/node": "^22.10.2",
+    "@eslint/js": "^9.17.0",
+    "typescript-eslint": "^8.18.0",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.2.11",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{md,json}": [
+      "prettier --write"
+    ]
+  }
+}
