@@ -32,22 +32,34 @@ export function registerSyncCommand(program: Command): void {
 
       try {
         const result = await runSync(opts, logger);
+        const hasConflicts = result.conflicts.length > 0;
+
         if (json) {
           emitJson({
-            ok: true,
+            ok: !hasConflicts,
             version_stamp: result.versionStamp,
             nothing_to_sync: result.nothingToSync,
             uploaded_objects: result.uploadedObjects,
             deduped_objects: result.dedupedObjects,
-            entries_changed: result.entriesChanged,
+            local_entries_changed: result.localEntriesChanged,
+            remote_created: result.remoteCreated,
+            remote_modified: result.remoteModified,
+            remote_deleted: result.remoteDeleted,
+            conflicts: result.conflicts,
           });
         } else if (result.nothingToSync) {
           process.stdout.write("sync: nothing to sync\n");
         } else {
           process.stdout.write(
-            `sync: version ${result.versionStamp} -- ${result.uploadedObjects} objects uploaded, ${result.dedupedObjects} deduped, ${result.entriesChanged} entries changed\n`,
+            `sync: version ${result.versionStamp} -- ${result.uploadedObjects} objects uploaded, ${result.dedupedObjects} deduped, ${result.localEntriesChanged} local entries changed, ${result.remoteCreated} remote created, ${result.remoteModified} remote modified, ${result.remoteDeleted} remote deleted\n`,
           );
+          if (hasConflicts) {
+            process.stdout.write(`${result.conflicts.length} conflict(s) left unresolved:\n`);
+            for (const c of result.conflicts) process.stdout.write(`  - ${c.path}: ${c.reason}\n`);
+          }
         }
+
+        if (hasConflicts) process.exitCode = EXIT_CONFLICT;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "sync failed");
