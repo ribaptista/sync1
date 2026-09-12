@@ -9,7 +9,7 @@ import { sync1Dir, localRemoteConfigPath } from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { convergeStoragePolicies, type ConvergeResult } from "../sync/converge-storage-policies.js";
 
-interface StatusOptions extends OptionValues {
+interface ConvergeOptions extends OptionValues {
   root: string;
   filter?: string;
 }
@@ -19,21 +19,21 @@ interface GlobalOptions extends OptionValues {
   verbose?: boolean;
 }
 
-export function registerStatusCommand(program: Command): void {
+export function registerConvergeCommand(program: Command): void {
   program
-    .command("status")
+    .command("converge")
     .description(
-      "Report how each tracked object's actual S3 storage class compares to what storage_policy implies",
+      "Apply storage_policy: move each tracked object's actual S3 storage class to match what the policies imply",
     )
-    .requiredOption("--root <path>", "local directory whose vault to inspect")
-    .option("--filter <glob>", "SQLite GLOB pattern scoping which tracked paths to consider", "*")
-    .action(async (opts: StatusOptions, command: Command) => {
+    .requiredOption("--root <path>", "local directory whose vault to operate on")
+    .option("--filter <glob>", "SQLite GLOB pattern scoping which tracked paths to converge", "*")
+    .action(async (opts: ConvergeOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
-      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "status" });
+      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "converge" });
 
       try {
-        const result = await runStatus(opts, logger);
+        const result = await runConverge(opts, logger);
         if (json) {
           emitJson({
             ok: true,
@@ -50,11 +50,11 @@ export function registerStatusCommand(program: Command): void {
           });
         } else {
           process.stdout.write(
-            `status: ${result.counts.alreadyCorrect} already correct, ${result.counts.changedImmediate} need an immediate copy, ${result.counts.restoreRequested} need a restore request, ${result.counts.restorePending} restore pending, ${result.counts.finalized} ready to finalize\n`,
+            `converge: ${result.counts.alreadyCorrect} already correct, ${result.counts.changedImmediate} changed immediately, ${result.counts.restoreRequested} restore requested, ${result.counts.restorePending} restore pending, ${result.counts.finalized} finalized\n`,
           );
           if (result.conflicts.length > 0) {
             process.stdout.write(
-              `${result.conflicts.length} dedup warmest-wins conflict(s) (shared object, disagreeing policies):\n`,
+              `${result.conflicts.length} dedup warmest-wins conflict(s) (shared object, disagreeing policies -- converged to the warmest):\n`,
             );
             for (const c of result.conflicts) {
               process.stdout.write(
@@ -65,13 +65,13 @@ export function registerStatusCommand(program: Command): void {
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        logger.debug({ err: message }, "status failed");
+        logger.debug({ err: message }, "converge failed");
         emitError(json, message, exitCodeForError(err));
       }
     });
 }
 
-async function runStatus(opts: StatusOptions, logger: Logger): Promise<ConvergeResult> {
+async function runConverge(opts: ConvergeOptions, logger: Logger): Promise<ConvergeResult> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
   if (!fs.existsSync(sync1DirPath)) {
@@ -87,7 +87,7 @@ async function runStatus(opts: StatusOptions, logger: Logger): Promise<ConvergeR
   return convergeStoragePolicies(
     root,
     filter,
-    false,
+    true,
     { client, bucket: remoteConfig.bucket, location },
     logger,
   );
