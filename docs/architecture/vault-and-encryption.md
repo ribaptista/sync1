@@ -38,7 +38,9 @@ needless friction on every invocation for a personal backup tool's threat model.
 
 ## Chunked AEAD codec: convergent objects, non-convergent snapshots, and random access
 
-Both content objects (in `objects/<hash>`) and state.db snapshots (in `states/<version_stamp>`) are
+Both content objects (in `objects/<hash[0:2]>/<hash[2:4]>/<hash>` — sharded purely for browsability, see
+[dedup-and-object-storage.md](dedup-and-object-storage.md)) and state.db snapshots (in
+`states/<version_stamp>`) are
 encrypted with the same wire format — chunked `crypto_aead_xchacha20poly1305_ietf`:
 
 ```

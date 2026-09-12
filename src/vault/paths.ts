@@ -19,6 +19,12 @@ export function stateSnapshotKey(versionStamp: string): string {
   return `states/${versionStamp}`;
 }
 
+/**
+ * 2-level sharded prefix (git/restic-style: objects/ab/cd/<hash>), purely
+ * for browsability in the S3 console/third-party tools -- S3 has
+ * auto-scaled per-prefix request rates since 2018, so this has no
+ * throughput rationale. See docs/architecture/dedup-and-object-storage.md.
+ */
 export function objectKey(hash: string): string {
-  return `objects/${hash}`;
+  return `objects/${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}`;
 }

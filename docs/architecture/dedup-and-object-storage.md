@@ -13,13 +13,24 @@ byte-identical ciphertext — see
 download anything to decide whether an upload is needed: `objectsRepo.has(hash)` against the local,
 already-decrypted state.db is enough.
 
+## Object key layout: sharded, for browsability
+
+Content objects live under a 2-level sharded prefix — `objects/<hash[0:2]>/<hash[2:4]>/<hash>` (the
+same convention git and restic use) — rather than a flat `objects/<hash>`. This is purely so a human (or
+a third-party tool) browsing the bucket in the S3 console isn't looking at one flat listing of every
+object the vault has ever stored; S3 itself has auto-scaled per-prefix request rates since 2018, so
+there's no throughput reason to shard anymore. `objectKey()` in `src/vault/paths.ts` is the only place
+this layout is decided — every read site consumes the `s3_key` column already stored on the `objects`
+row rather than recomputing a key from a hash, so the layout could change again later without touching
+any read path.
+
 ## Upload-before-reference, always
 
 For every dirty cache row being folded into a sync, `applyLocalChangesToCandidate` does, in order:
 
 1. Check `objects` for the hash. If present, skip the upload entirely (the dedup path).
-2. If absent: read the file, encrypt it, upload it to `objects/<hash>`, **then** insert its `objects`
-   row.
+2. If absent: read the file, encrypt it, upload it to `objects/<hash[0:2]>/<hash[2:4]>/<hash>`, **then**
+   insert its `objects` row.
 3. Only then insert/update the `entries` row that references that hash.
 
 This ordering means a crash between steps 2 and 3 leaves an uploaded-but-unreferenced object — wasted
