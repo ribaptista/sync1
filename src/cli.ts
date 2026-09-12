@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { registerInitRemoteCommand } from "./commands/init_remote.js";
+import { registerAttachRemoteCommand } from "./commands/attach_remote.js";
 
 const program = new Command();
 
@@ -12,6 +13,7 @@ program
   .option("--verbose", "enable debug-level logging on stderr");
 
 registerInitRemoteCommand(program);
+registerAttachRemoteCommand(program);
 // Further commands are registered here as they're implemented, task by task.
 
 program.parseAsync(process.argv).catch((err: unknown) => {
