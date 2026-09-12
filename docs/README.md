@@ -1,5 +1,8 @@
 # sync1 documentation
 
+See [platform-setup.md](platform-setup.md) for build/install/run instructions on Linux, macOS, and
+Windows.
+
 ## CLI commands
 
 | Command                                               | Description                                                                     |
