@@ -13,7 +13,7 @@ import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { performUpdateCache, type CaseCollision } from "../fs/update-cache.js";
 import { applyLocalChangesToCandidate } from "./apply-local-changes.js";
-import { applyRemoteChangesToLocal } from "./apply-remote-changes.js";
+import { applyRemoteChangesToLocal, type IgnoredButSyncedEntry } from "./apply-remote-changes.js";
 import { reconcileCacheAfterCommit } from "./reconcile-cache.js";
 import { generateVersionStamp } from "../vault/version-stamp.js";
 import { encryptBuffer, decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
@@ -53,6 +53,14 @@ export interface SyncResult {
    * docs/architecture/cross-platform-filesystem.md.
    */
   caseCollisions: CaseCollision[];
+  /**
+   * Remote content materialized/stub-updated despite matching a global
+   * ignore policy -- always pre-existing shared content (committed before
+   * the policy existed, or before this machine had synced it). Purely
+   * informational: never affects sync's exit code, since nothing failed to
+   * apply here.
+   */
+  ignoredButSynced: IgnoredButSyncedEntry[];
 }
 
 export class RemoteDivergedError extends Error {
@@ -266,6 +274,7 @@ export async function performSync(
           remoteDeleted: remoteResult.deleted,
           conflicts: localResult.conflicts,
           caseCollisions: updateCacheStats.caseCollisions,
+          ignoredButSynced: remoteResult.ignoredButSynced,
         };
       }
 
@@ -314,6 +323,7 @@ export async function performSync(
         remoteDeleted: remoteResult.deleted,
         conflicts: localResult.conflicts,
         caseCollisions: updateCacheStats.caseCollisions,
+        ignoredButSynced: remoteResult.ignoredButSynced,
       };
     } finally {
       if (fs.existsSync(candidatePath)) fs.rmSync(candidatePath);

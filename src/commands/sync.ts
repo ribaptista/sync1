@@ -52,6 +52,10 @@ export function registerSyncCommand(program: Command): void {
               path: c.path,
               collides_with: c.collidesWith,
             })),
+            ignored_but_synced: result.ignoredButSynced.map((c) => ({
+              path: c.path,
+              matched_glob: c.matchedGlob,
+            })),
           });
         } else if (result.nothingToSync) {
           process.stdout.write("sync: nothing to sync\n");
@@ -69,6 +73,14 @@ export function registerSyncCommand(program: Command): void {
             );
             for (const c of result.caseCollisions) {
               process.stdout.write(`  - "${c.path}" vs "${c.collidesWith}"\n`);
+            }
+          }
+          if (result.ignoredButSynced.length > 0) {
+            process.stdout.write(
+              `warning: ${result.ignoredButSynced.length} path(s) matched a global ignore policy but were already shared, so materialized anyway:\n`,
+            );
+            for (const c of result.ignoredButSynced) {
+              process.stdout.write(`  - "${c.path}" matches "${c.matchedGlob}"\n`);
             }
           }
         }

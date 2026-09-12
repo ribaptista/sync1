@@ -7,6 +7,8 @@ import type { Logger } from "../logger.js";
 import { EntriesRepository, type EntryRow } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
+import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
+import { matchesAnyGlob } from "../fs/glob-match.js";
 import { CryptoAuthError } from "../crypto/chunked-codec.js";
 import { getObjectStream } from "../s3/client.js";
 import { remoteKey, type RemoteLocation } from "../vault/paths.js";
@@ -14,10 +16,23 @@ import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "../fs/decrypt-to-file.js";
 
+/**
+ * A path materialized (or stub-updated) here despite matching a global
+ * ignore policy -- always content this machine already shared before the
+ * policy existed (or before this machine had synced it). Ignore policies
+ * gate new local creations only; they never retroactively un-share content
+ * already committed to the vault, so this is a warning, not a failure.
+ */
+export interface IgnoredButSyncedEntry {
+  path: string;
+  matchedGlob: string;
+}
+
 export interface ApplyRemoteChangesResult {
   created: number;
   modified: number;
   deleted: number;
+  ignoredButSynced: IgnoredButSyncedEntry[];
 }
 
 /**
@@ -61,6 +76,7 @@ export async function applyRemoteChangesToLocal(
 ): Promise<ApplyRemoteChangesResult> {
   const candidateEntries = new EntriesRepository(candidateDb);
   const candidateObjects = new ObjectsRepository(candidateDb);
+  const ignoreGlobs = new IgnorePoliciesRepository(candidateDb).listGlobs();
 
   const cacheReadDb = new Database(cacheDbPath, { readonly: true, fileMustExist: true });
   try {
@@ -71,7 +87,12 @@ export async function applyRemoteChangesToLocal(
     let cacheNext = cacheIter.next();
     let candidateNext = candidateIter.next();
 
-    const result: ApplyRemoteChangesResult = { created: 0, modified: 0, deleted: 0 };
+    const result: ApplyRemoteChangesResult = {
+      created: 0,
+      modified: 0,
+      deleted: 0,
+      ignoredButSynced: [],
+    };
 
     while (!cacheNext.done || !candidateNext.done) {
       const cacheEntry = cacheNext.done ? null : cacheNext.value;
@@ -97,6 +118,18 @@ export async function applyRemoteChangesToLocal(
             logger,
           );
           result.created++;
+
+          const ignoreMatch = matchesAnyGlob(candidateEntry.path, ignoreGlobs);
+          if (ignoreMatch.matched) {
+            result.ignoredButSynced.push({
+              path: candidateEntry.path,
+              matchedGlob: ignoreMatch.pattern!,
+            });
+            logger.warn(
+              { path: candidateEntry.path, pattern: ignoreMatch.pattern },
+              "path matches a global ignore policy but was already shared before the policy applied -- materializing anyway",
+            );
+          }
         }
         candidateNext = candidateIter.next();
       } else if (
