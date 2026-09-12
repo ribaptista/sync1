@@ -6,6 +6,7 @@ import {
   ListObjectsV2Command,
   CopyObjectCommand,
   RestoreObjectCommand,
+  DeleteObjectCommand,
   type S3ClientConfig,
   type StorageClass,
   type Tier,
@@ -179,6 +180,11 @@ export async function restoreObject(
       RestoreRequest: { Days: opts.days, Tier: opts.tier },
     }),
   );
+}
+
+/** Permanent deletion -- used only by `gc`, only after a CAS-guarded commit removing the reference succeeded. */
+export async function deleteObject(client: S3Client, bucket: string, key: string): Promise<void> {
+  await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 }
 
 /** True if no object exists under `prefix` — used by init_remote's empty-vault check. */
