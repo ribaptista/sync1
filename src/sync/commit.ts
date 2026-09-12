@@ -5,7 +5,10 @@ import { tempSiblingPath } from "../fs/temp-path.js";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
 import { openStateDb, openCacheDb } from "../db/connection.js";
-import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
+import {
+  CacheEntriesRepository,
+  type CacheEntryRow,
+} from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { performUpdateCache } from "../fs/update-cache.js";
 import { applyLocalChangesToCandidate } from "./apply-local-changes.js";
@@ -49,6 +52,24 @@ export class RemoteDivergedError extends Error {
   }
 }
 
+/** Yields every row from `rows` unchanged, while also recording its path into `sink` as a side effect. */
+function* tapPaths(rows: Iterable<CacheEntryRow>, sink: Set<string>): Generator<CacheEntryRow> {
+  for (const row of rows) {
+    sink.add(row.path);
+    yield row;
+  }
+}
+
+/** Yields only the rows from `rows` whose path is in `paths`. */
+function* filterByPath(
+  rows: Iterable<CacheEntryRow>,
+  paths: ReadonlySet<string>,
+): Generator<CacheEntryRow> {
+  for (const row of rows) {
+    if (paths.has(row.path)) yield row;
+  }
+}
+
 /**
  * Full bidirectional sync: runs update_cache, then folds local changes into
  * a candidate state.db (with conflict detection -- src/sync/conflict-
@@ -69,9 +90,16 @@ export async function performSync(
 ): Promise<SyncResult> {
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
+  // Read-only, dedicated to iterating dirty rows: reconciliation below
+  // writes to `cacheRepo`'s connection *while* iterating the dirty set, so
+  // that iteration has to come from a different connection (the same
+  // "iterate() cursor busy" constraint documented in update-cache.ts) --
+  // this mirrors apply-remote-changes.ts's cacheReadDb pattern.
+  const cacheReadDb = new Database(localCacheDbPath(root), { readonly: true, fileMustExist: true });
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
+    const cacheReadRepo = new CacheEntriesRepository(cacheReadDb);
     {
       // Read-only, scoped to this call: only used to validate stub-declared
       // hashes against known objects. Local state.db is already decrypted
@@ -94,9 +122,7 @@ export async function performSync(
       }
     }
 
-    // Snapshot dirty rows up front: better-sqlite3 disallows other
-    // statements on the same connection while a .iterate() cursor is open.
-    const dirtyRows = [...cacheRepo.iterateDirty()];
+    const dirtyCount = cacheRepo.countDirty();
 
     const currentKey = remoteKey(s3.location, CURRENT_POINTER_KEY);
     const current = await getObject(s3.client, s3.bucket, currentKey);
@@ -104,8 +130,8 @@ export async function performSync(
     const remoteVersionStamp = current.body.toString("utf8");
     const remoteHasMoved = remoteVersionStamp !== lastSyncedVersion;
 
-    // Deliberately NOT an early-exit on "!remoteHasMoved && dirtyRows.length
-    // === 0": a version-stamp match does NOT mean cache.db already matches
+    // Deliberately NOT an early-exit on "!remoteHasMoved && dirtyCount ===
+    // 0": a version-stamp match does NOT mean cache.db already matches
     // state.db's content -- right after a fresh attach_remote, local
     // state.db is fully populated but cache.db is completely empty, so
     // "nothing to sync" always has to be determined from the real
@@ -113,7 +139,7 @@ export async function performSync(
     // alone.
 
     logger.debug(
-      { dirtyCount: dirtyRows.length, remoteHasMoved, remoteVersionStamp, lastSyncedVersion },
+      { dirtyCount, remoteHasMoved, remoteVersionStamp, lastSyncedVersion },
       "sync starting",
     );
 
@@ -155,9 +181,14 @@ export async function performSync(
       const candidateDb = openStateDb(candidatePath, logger);
       let localResult, remoteResult, willCommit, cacheBaselineVersion;
       try {
+        // excludePaths is filled in as a side effect of the same pass that
+        // feeds applyLocalChangesToCandidate, rather than a second read --
+        // it needs every dirty path (not just handled ones), which isn't
+        // known until this loop actually runs.
+        const excludePaths = new Set<string>();
         localResult = await applyLocalChangesToCandidate(
           candidateDb,
-          dirtyRows,
+          tapPaths(cacheReadRepo.iterateDirty(), excludePaths),
           root,
           masterKey,
           versionStamp,
@@ -171,7 +202,6 @@ export async function performSync(
         willCommit = localResult.appliedCount > 0;
         cacheBaselineVersion = willCommit ? versionStamp : remoteVersionStamp;
 
-        const excludePaths = new Set(dirtyRows.map((r) => r.path));
         // Diffs cache.db directly against the candidate (remote + this
         // machine's own successful edits) -- see apply-remote-changes.ts
         // for why version-stamp comparison alone isn't the right basis.
@@ -201,19 +231,22 @@ export async function performSync(
           fs.copyFileSync(remoteFreshPath, localStateDbPath(root));
           fs.writeFileSync(lastSyncedVersionPath(root), remoteVersionStamp, "utf8");
         }
-        const handledRows = dirtyRows.filter((r) => localResult.handledPaths.has(r.path));
-        reconcileCacheAfterCommit(cacheRepo, handledRows, cacheBaselineVersion);
+        reconcileCacheAfterCommit(
+          cacheRepo,
+          filterByPath(cacheReadRepo.iterateDirty(), localResult.handledPaths),
+          cacheBaselineVersion,
+        );
 
         const remoteTotal = remoteResult.created + remoteResult.modified + remoteResult.deleted;
         const nothingToSync =
-          dirtyRows.length === 0 && remoteTotal === 0 && localResult.conflicts.length === 0;
+          dirtyCount === 0 && remoteTotal === 0 && localResult.conflicts.length === 0;
 
         return {
           versionStamp: cacheBaselineVersion,
           nothingToSync,
           uploadedObjects: 0,
           dedupedObjects: 0,
-          localEntriesChanged: handledRows.length,
+          localEntriesChanged: localResult.handledPaths.size,
           remoteCreated: remoteResult.created,
           remoteModified: remoteResult.modified,
           remoteDeleted: remoteResult.deleted,
@@ -249,8 +282,11 @@ export async function performSync(
       // cache.db, safe to retry.
       fs.renameSync(candidatePath, localStateDbPath(root));
       fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
-      const handledRows = dirtyRows.filter((r) => localResult.handledPaths.has(r.path));
-      reconcileCacheAfterCommit(cacheRepo, handledRows, versionStamp);
+      reconcileCacheAfterCommit(
+        cacheRepo,
+        filterByPath(cacheReadRepo.iterateDirty(), localResult.handledPaths),
+        versionStamp,
+      );
 
       return {
         versionStamp,
@@ -268,6 +304,7 @@ export async function performSync(
       if (remoteFreshIsTemp && fs.existsSync(remoteFreshPath)) fs.rmSync(remoteFreshPath);
     }
   } finally {
+    cacheReadDb.close();
     cacheDb.close();
   }
 }

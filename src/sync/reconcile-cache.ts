@@ -12,7 +12,7 @@ import type {
  */
 export function reconcileCacheAfterCommit(
   cacheRepo: CacheEntriesRepository,
-  dirtyRows: readonly CacheEntryRow[],
+  dirtyRows: Iterable<CacheEntryRow>,
   newVersionStamp: string,
 ): void {
   for (const row of dirtyRows) {

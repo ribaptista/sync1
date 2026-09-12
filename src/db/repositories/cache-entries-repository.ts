@@ -42,11 +42,23 @@ export class CacheEntriesRepository {
     return this.db.prepare<[], CacheEntryRow>("SELECT * FROM entries ORDER BY path ASC").iterate();
   }
 
-  /** Uses the partial idx_cache_state index — rows with pending local changes. */
+  /**
+   * Uses the partial idx_cache_state index — rows with pending local
+   * changes. Ordered so every 'deleted' row comes before any
+   * 'created'/'modified' row (then by path within each group) — this
+   * matters for a same-machine rename (update_cache always resolves it as
+   * an independent delete+create, since there's no rename primitive
+   * anywhere in this system): folding the delete half into the candidate
+   * before the create half is checked means a case-insensitive collision
+   * check never sees the old path as still "live" merely because it hasn't
+   * been processed yet. Without this, whether a rename happened to trigger
+   * a false collision would depend on which way the casing changed sorted
+   * alphabetically — see docs/architecture/cross-platform-filesystem.md.
+   */
   iterateDirty(): IterableIterator<CacheEntryRow> {
     return this.db
       .prepare<[], CacheEntryRow>(
-        "SELECT * FROM entries WHERE state != 'unchanged' ORDER BY path ASC",
+        "SELECT * FROM entries WHERE state != 'unchanged' ORDER BY (state != 'deleted'), path ASC",
       )
       .iterate();
   }
@@ -60,6 +72,13 @@ export class CacheEntriesRepository {
 
   count(): number {
     const row = this.db.prepare<[], CountRow>("SELECT COUNT(*) as c FROM entries").get();
+    return row?.c ?? 0;
+  }
+
+  countDirty(): number {
+    const row = this.db
+      .prepare<[], CountRow>("SELECT COUNT(*) as c FROM entries WHERE state != 'unchanged'")
+      .get();
     return row?.c ?? 0;
   }
 }

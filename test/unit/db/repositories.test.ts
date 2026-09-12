@@ -156,7 +156,55 @@ describe("CacheEntriesRepository (cache.db)", () => {
     });
 
     const dirtyPaths = [...repo.iterateDirty()].map((r) => r.path);
-    expect(dirtyPaths).toEqual(["b.txt", "c.txt"]);
+    // deleted rows first (c.txt), then created/modified by path (b.txt) --
+    // see iterateDirty()'s doc comment for why this ordering matters.
+    expect(dirtyPaths).toEqual(["c.txt", "b.txt"]);
+  });
+
+  it("iterateDirty always orders every deleted row before every created/modified row, regardless of path", () => {
+    const db = openCacheDb(":memory:");
+    const repo = new CacheEntriesRepository(db);
+    // Deliberately alphabetically interleaved, so a plain path-only sort
+    // would NOT put all deletions first -- e.g. "FILE.txt" (created) sorts
+    // before "file.txt" (deleted) in plain ASCII order.
+    repo.upsert({
+      path: "FILE.txt",
+      type: "file",
+      mtime: 1,
+      hash: "h1",
+      state: "created",
+      parent_state_version: "v0",
+    });
+    repo.upsert({
+      path: "aaa.txt",
+      type: "file",
+      mtime: null,
+      hash: null,
+      state: "deleted",
+      parent_state_version: "v0",
+    });
+    repo.upsert({
+      path: "file.txt",
+      type: "file",
+      mtime: null,
+      hash: null,
+      state: "deleted",
+      parent_state_version: "v0",
+    });
+    repo.upsert({
+      path: "zzz.txt",
+      type: "file",
+      mtime: 2,
+      hash: "h2",
+      state: "modified",
+      parent_state_version: "v0",
+    });
+
+    const dirtyRows = [...repo.iterateDirty()];
+    const deletedIndex = dirtyRows.findIndex((r) => r.state !== "deleted");
+    expect(dirtyRows.slice(0, deletedIndex).every((r) => r.state === "deleted")).toBe(true);
+    expect(dirtyRows.slice(deletedIndex).every((r) => r.state !== "deleted")).toBe(true);
+    expect(dirtyRows.map((r) => r.path)).toEqual(["aaa.txt", "file.txt", "FILE.txt", "zzz.txt"]);
   });
 
   it("iterateAllSortedByPath returns rows in lexicographic path order", () => {

@@ -44,7 +44,7 @@ export interface ApplyLocalChangesResult {
  */
 export async function applyLocalChangesToCandidate(
   candidateDb: Database.Database,
-  dirtyRows: readonly CacheEntryRow[],
+  dirtyRows: Iterable<CacheEntryRow>,
   root: string,
   masterKey: Buffer,
   versionStamp: string,
