@@ -32,17 +32,14 @@ beforeEach(() => {
   dbPath = path.join(dbDir, "state.db");
   existingS3Keys = new Set();
 
-  // Two separate connections to the same file, exactly like the CLI
-  // command does -- entriesRepo's iterator holds an open cursor for the
-  // whole merge-join, so objectsRepo/ignorePoliciesRepo need their own.
-  const setupDb = openStateDb(dbPath);
-  new VersionsRepository(setupDb).insert("v0", new Date().toISOString());
-  setupDb.close();
-  const entriesDb = openStateDb(dbPath);
-  const lookupDb = openStateDb(dbPath);
-  entriesRepo = new EntriesRepository(entriesDb);
-  objectsRepo = new ObjectsRepository(lookupDb);
-  ignorePoliciesRepo = new IgnorePoliciesRepository(lookupDb);
+  // One connection, exactly like the CLI command does -- entriesRepo's
+  // iterateAllSortedByPath() is keyset-paginated, not a live `.iterate()`
+  // cursor, so objectsRepo/ignorePoliciesRepo can safely share it.
+  const db = openStateDb(dbPath);
+  new VersionsRepository(db).insert("v0", new Date().toISOString());
+  entriesRepo = new EntriesRepository(db);
+  objectsRepo = new ObjectsRepository(db);
+  ignorePoliciesRepo = new IgnorePoliciesRepository(db);
 });
 
 afterEach(() => {

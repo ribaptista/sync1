@@ -60,12 +60,16 @@ export interface ApplyRemoteChangesResult {
  * `excludePaths` (this machine's own dirty rows) are skipped entirely --
  * handled by apply-local-changes.ts instead, or deliberately left
  * conflicted; this function never overwrites a file the user has a pending
- * edit to. Uses a second, read-only connection to cache.db so it can
- * iterate it while the caller's own connection is used to write.
+ * edit to. Reads and writes both go through the caller's own `cacheRepo` --
+ * a second connection isn't needed: `CacheEntriesRepository.
+ * iterateAllSortedByPath()` is keyset-paginated (src/db/keyset-
+ * pagination.ts), not a live `.iterate()` cursor, so `cacheRepo.upsert()`/
+ * `.delete()` can safely interleave with it on the same connection (a
+ * write only ever conflicts with a *paused* cursor on that connection,
+ * and pagination never leaves one paused between pages).
  */
 export async function applyRemoteChangesToLocal(
   candidateDb: Database.Database,
-  cacheDbPath: string,
   root: string,
   masterKey: Buffer,
   cacheRepo: CacheEntriesRepository,
@@ -78,10 +82,8 @@ export async function applyRemoteChangesToLocal(
   const candidateObjects = new ObjectsRepository(candidateDb);
   const ignoreGlobs = new IgnorePoliciesRepository(candidateDb).listGlobs();
 
-  const cacheReadDb = new Database(cacheDbPath, { readonly: true, fileMustExist: true });
-  try {
-    const cacheReadRepo = new CacheEntriesRepository(cacheReadDb);
-    const cacheIter = cacheReadRepo.iterateAllSortedByPath();
+  {
+    const cacheIter = cacheRepo.iterateAllSortedByPath();
     const candidateIter = candidateEntries.iterateAllSortedByPath();
 
     let cacheNext = cacheIter.next();
@@ -166,8 +168,6 @@ export async function applyRemoteChangesToLocal(
     }
 
     return result;
-  } finally {
-    cacheReadDb.close();
   }
 }
 

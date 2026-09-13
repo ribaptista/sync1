@@ -68,10 +68,11 @@ function emptyResult(): SanityCheckResult {
  * never notice at all. See docs/architecture/ignore-and-storage-policies.md
  * for why ignore-policy matching happens in-memory rather than via SQL.
  *
- * `entriesRepo` and `objectsRepo`/`ignorePoliciesRepo` must come from
- * *separate* connections to state.db: `entriesRepo`'s iterator holds an
- * open cursor for the whole merge-join, and better-sqlite3 forbids any
- * other statement on that same connection while it's open.
+ * `entriesRepo`, `objectsRepo`, and `ignorePoliciesRepo` may all share one
+ * connection: `entriesRepo.iterateAllSortedByPath()` is keyset-paginated
+ * (src/db/keyset-pagination.ts), not a live `.iterate()` cursor, so the
+ * connection is free between pages -- unlike a real cursor, which would
+ * forbid any other statement on that same connection while it's open.
  *
  * `filterGlob`, when given, scopes which tracked/untracked paths are
  * actually reported (and, for tracked paths, which ones incur the cost of

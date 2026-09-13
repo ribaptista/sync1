@@ -110,16 +110,16 @@ export async function performSync(
 ): Promise<SyncResult> {
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
-  // Read-only, dedicated to iterating dirty rows: reconciliation below
-  // writes to `cacheRepo`'s connection *while* iterating the dirty set, so
-  // that iteration has to come from a different connection (the same
-  // "iterate() cursor busy" constraint documented in update-cache.ts) --
-  // this mirrors apply-remote-changes.ts's cacheReadDb pattern.
-  const cacheReadDb = new Database(localCacheDbPath(root), { readonly: true, fileMustExist: true });
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
-    const cacheReadRepo = new CacheEntriesRepository(cacheReadDb);
+    // A single repo/connection now covers both reads and writes:
+    // CacheEntriesRepository.iterateDirty() is keyset-paginated (src/db/
+    // keyset-pagination.ts), not a live `.iterate()` cursor, so
+    // reconciliation's writes below can safely interleave with iterating
+    // the dirty set on the same connection -- a write only ever conflicts
+    // with a *paused* cursor, and pagination never leaves one paused
+    // between pages.
     let updateCacheStats;
     {
       // Read-only, scoped to this call: only used to validate stub-declared
@@ -210,7 +210,7 @@ export async function performSync(
         const excludePaths = new Set<string>();
         localResult = await applyLocalChangesToCandidate(
           candidateDb,
-          tapPaths(cacheReadRepo.iterateDirty(), excludePaths),
+          tapPaths(cacheRepo.iterateDirty(), excludePaths),
           root,
           masterKey,
           versionStamp,
@@ -229,7 +229,6 @@ export async function performSync(
         // for why version-stamp comparison alone isn't the right basis.
         remoteResult = await applyRemoteChangesToLocal(
           candidateDb,
-          localCacheDbPath(root),
           root,
           masterKey,
           cacheRepo,
@@ -255,7 +254,7 @@ export async function performSync(
         }
         reconcileCacheAfterCommit(
           cacheRepo,
-          filterByPath(cacheReadRepo.iterateDirty(), localResult.handledPaths),
+          filterByPath(cacheRepo.iterateDirty(), localResult.handledPaths),
           cacheBaselineVersion,
         );
 
@@ -308,7 +307,7 @@ export async function performSync(
       fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
       reconcileCacheAfterCommit(
         cacheRepo,
-        filterByPath(cacheReadRepo.iterateDirty(), localResult.handledPaths),
+        filterByPath(cacheRepo.iterateDirty(), localResult.handledPaths),
         versionStamp,
       );
 
@@ -330,7 +329,6 @@ export async function performSync(
       if (remoteFreshIsTemp && fs.existsSync(remoteFreshPath)) fs.rmSync(remoteFreshPath);
     }
   } finally {
-    cacheReadDb.close();
     cacheDb.close();
   }
 }

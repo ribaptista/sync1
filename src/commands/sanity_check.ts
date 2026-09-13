@@ -129,18 +129,17 @@ async function runSanityCheck(
   const prefix = normalizePrefix(remoteConfig.prefix);
   const location: RemoteLocation = { bucket: remoteConfig.bucket, prefix };
 
-  // Two separate connections to the same (already-decrypted, read-only, no
-  // password needed) state.db: entriesRepo's iterator holds an open cursor
-  // for the whole merge-join, and better-sqlite3 forbids any other
-  // statement on that same connection meanwhile -- objectsRepo and
-  // ignorePoliciesRepo need their own connection to be queried mid-loop.
-  const entriesDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
-  const lookupDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  // Single connection: entriesRepo.iterateAllSortedByPath() is
+  // keyset-paginated (src/db/keyset-pagination.ts), not a live `.iterate()`
+  // cursor, so the connection is free between pages -- objectsRepo and
+  // ignorePoliciesRepo can safely be queried mid-loop on the same
+  // connection now, unlike when this held a real cursor open throughout.
+  const db = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
 
   try {
-    const entriesRepo = new EntriesRepository(entriesDb);
-    const objectsRepo = new ObjectsRepository(lookupDb);
-    const ignorePoliciesRepo = new IgnorePoliciesRepository(lookupDb);
+    const entriesRepo = new EntriesRepository(db);
+    const objectsRepo = new ObjectsRepository(db);
+    const ignorePoliciesRepo = new IgnorePoliciesRepository(db);
 
     const objectExists = async (s3Key: string): Promise<boolean> => {
       const head = await headObject(client, remoteConfig.bucket, remoteKey(location, s3Key));
@@ -157,7 +156,6 @@ async function runSanityCheck(
       opts.filter,
     );
   } finally {
-    entriesDb.close();
-    lookupDb.close();
+    db.close();
   }
 }

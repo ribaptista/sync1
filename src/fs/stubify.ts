@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import Database from "better-sqlite3";
 import type { Logger } from "../logger.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { hashFile } from "./hash-file.js";
@@ -32,22 +31,19 @@ export interface StubifyStats {
  */
 export async function stubifyGlob(
   root: string,
-  cacheDbPath: string,
   glob: string,
   cacheRepo: CacheEntriesRepository,
   logger: Logger,
 ): Promise<StubifyStats> {
   const stats: StubifyStats = { stubified: 0, alreadyStub: 0, skipped: [] };
 
-  // A dedicated read-only connection for the glob scan: cacheRepo.upsert()
-  // below writes to cacheRepo's own connection while this iterates, which
-  // the same connection couldn't do at once (the "iterate() cursor busy"
-  // constraint documented in update-cache.ts).
-  const cacheReadDb = new Database(cacheDbPath, { readonly: true, fileMustExist: true });
-  const cacheReadRepo = new CacheEntriesRepository(cacheReadDb);
-
-  try {
-    for (const row of cacheReadRepo.iterateByGlobSortedByPath(glob)) {
+  // A single connection/repo covers both the glob scan and cacheRepo.upsert()
+  // below: iterateByGlobSortedByPath() is keyset-paginated (src/db/keyset-
+  // pagination.ts), not a live `.iterate()` cursor, so the write can safely
+  // interleave with it -- a write only ever conflicts with a *paused*
+  // cursor, and pagination never leaves one paused between pages.
+  {
+    for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
       if (row.type !== "file") continue;
       const absolutePath = path.join(root, row.path);
       const stubAbsolutePath = stubPathFor(absolutePath);
@@ -87,8 +83,6 @@ export async function stubifyGlob(
       stats.stubified++;
       logger.debug({ path: row.path }, "stubified");
     }
-  } finally {
-    cacheReadDb.close();
   }
 
   return stats;
