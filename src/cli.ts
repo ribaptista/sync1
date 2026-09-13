@@ -22,7 +22,20 @@ program
   .description("E2E-encrypted, deduplicated, incremental backup CLI")
   .version("0.1.0")
   .option("--json", "output machine-readable JSON on stdout")
-  .option("--verbose", "enable debug-level logging on stderr");
+  .option("--verbose", "enable debug-level logging on stderr")
+  .option(
+    "--s3-metadata-parallelism <n>",
+    "max concurrent bare S3 calls (HEAD/copy/restore/delete) -- default 8",
+  )
+  .option(
+    "--hash-parallelism <n>",
+    "max concurrent file-hashing worker threads -- default: cpu count",
+  )
+  .option(
+    "--file-stream-parallelism <n>",
+    "max concurrent encrypt+upload / download+decrypt pipelines -- default 4",
+  )
+  .option("--no-progress", "disable progress bars even on a real terminal");
 
 registerInitRemoteCommand(program);
 registerAttachRemoteCommand(program);
