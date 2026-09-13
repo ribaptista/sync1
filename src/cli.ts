@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import { registerInitRemoteCommand } from "./commands/init_remote.js";
@@ -41,7 +42,13 @@ program.hook("postAction", (_thisCommand, actionCommand) => {
 });
 
 function handleTerminationSignal(signal: "SIGINT" | "SIGTERM"): void {
-  process.stderr.write(
+  // fs.writeSync (not process.stderr.write) deliberately: a stderr write to
+  // a pipe/socket is documented as *asynchronous* on POSIX, so the
+  // process.exit() right below could otherwise race ahead of it and drop
+  // this warning entirely -- writeSync to fd 2 is synchronous on every
+  // platform, guaranteeing it's flushed before we exit.
+  fs.writeSync(
+    2,
     `\nsync1: received ${signal} -- exiting immediately; the vault may be left in an unfinished state (in-flight work is not awaited)\n`,
   );
   forceReleaseActiveLockSync();

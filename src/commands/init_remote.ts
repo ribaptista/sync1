@@ -27,6 +27,7 @@ import {
 import { openStateDb } from "../db/connection.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
 import { encryptBuffer } from "../crypto/chunked-codec.js";
+import { acquireLock } from "../vault/lock.js";
 
 interface InitRemoteOptions extends OptionValues {
   bucket: string;
@@ -84,71 +85,82 @@ async function runInitRemote(
 ): Promise<string> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
-  if (fs.existsSync(sync1DirPath)) {
+  // Checked via vault.json (not .sync1/'s own existence): vault.json is only
+  // ever written at the very end of a successful run, below -- so a prior
+  // attempt that failed partway through (bad password, non-empty bucket, a
+  // CAS race) never permanently blocks a retry against the same root, even
+  // though it left a non-empty .sync1/ behind (holding, at least, the lock
+  // acquired just below).
+  if (fs.existsSync(localVaultJsonPath(root))) {
     throw new Error(`"${sync1DirPath}" already exists — this root is already initialized`);
   }
 
-  const password = await getPassword();
-  const client = createS3Client({ endpoint: opts.endpoint, region: opts.region });
-  const prefix = normalizePrefix(opts.prefix);
-  const location: RemoteLocation = { bucket: opts.bucket, prefix };
-
-  logger.debug({ bucket: opts.bucket, prefix }, "checking S3 location is empty");
-  const empty = await isPrefixEmpty(client, opts.bucket, prefix);
-  if (!empty) {
-    throw new Error(
-      `s3://${opts.bucket}/${prefix} is not empty — refusing to init a new vault here`,
-    );
-  }
-
-  const { manifest, masterKey } = createVaultManifest(password);
-  const versionStamp = generateVersionStamp();
-  logger.debug({ versionStamp }, "generated initial version stamp");
-
   fs.mkdirSync(sync1DirPath, { recursive: true });
-  const stateDbPath = localStateDbPath(root);
-  const db = openStateDb(stateDbPath, logger);
-  new VersionsRepository(db).insert(versionStamp, new Date().toISOString());
-  db.close(); // checkpoints WAL so the file on disk is complete before we read it back
+  const lock = acquireLock(root);
+  try {
+    const password = await getPassword();
+    const client = createS3Client({ endpoint: opts.endpoint, region: opts.region });
+    const prefix = normalizePrefix(opts.prefix);
+    const location: RemoteLocation = { bucket: opts.bucket, prefix };
 
-  const stateDbBytes = fs.readFileSync(stateDbPath);
-  const stateContext = Buffer.alloc(16);
-  sodium.randombytes_buf(stateContext); // random, non-convergent (state.db isn't content-addressed)
-  const encryptedStateDb = encryptBuffer(stateDbBytes, masterKey, stateContext);
+    logger.debug({ bucket: opts.bucket, prefix }, "checking S3 location is empty");
+    const empty = await isPrefixEmpty(client, opts.bucket, prefix);
+    if (!empty) {
+      throw new Error(
+        `s3://${opts.bucket}/${prefix} is not empty — refusing to init a new vault here`,
+      );
+    }
 
-  logger.debug({ key: VAULT_MANIFEST_KEY }, "uploading vault manifest");
-  await putObjectCas(
-    client,
-    opts.bucket,
-    remoteKey(location, VAULT_MANIFEST_KEY),
-    serializeManifest(manifest),
-    { ifNoneMatchAny: true },
-  );
+    const { manifest, masterKey } = createVaultManifest(password);
+    const versionStamp = generateVersionStamp();
+    logger.debug({ versionStamp }, "generated initial version stamp");
 
-  logger.debug({ versionStamp }, "uploading initial state.db snapshot");
-  await putObjectCas(
-    client,
-    opts.bucket,
-    remoteKey(location, stateSnapshotKey(versionStamp)),
-    encryptedStateDb,
-    { ifNoneMatchAny: true },
-  );
+    const stateDbPath = localStateDbPath(root);
+    const db = openStateDb(stateDbPath, logger);
+    new VersionsRepository(db).insert(versionStamp, new Date().toISOString());
+    db.close(); // checkpoints WAL so the file on disk is complete before we read it back
 
-  logger.debug({ versionStamp }, "publishing /current pointer");
-  await putObjectCas(
-    client,
-    opts.bucket,
-    remoteKey(location, CURRENT_POINTER_KEY),
-    Buffer.from(versionStamp, "utf8"),
-    { ifNoneMatchAny: true },
-  );
+    const stateDbBytes = fs.readFileSync(stateDbPath);
+    const stateContext = Buffer.alloc(16);
+    sodium.randombytes_buf(stateContext); // random, non-convergent (state.db isn't content-addressed)
+    const encryptedStateDb = encryptBuffer(stateDbBytes, masterKey, stateContext);
 
-  fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
-  fs.writeFileSync(localVaultJsonPath(root), serializeManifest(manifest));
+    logger.debug({ key: VAULT_MANIFEST_KEY }, "uploading vault manifest");
+    await putObjectCas(
+      client,
+      opts.bucket,
+      remoteKey(location, VAULT_MANIFEST_KEY),
+      serializeManifest(manifest),
+      { ifNoneMatchAny: true },
+    );
 
-  const remoteConfig: RemoteConfig = { bucket: opts.bucket, prefix, region: opts.region };
-  if (opts.endpoint) remoteConfig.endpoint = opts.endpoint;
-  fs.writeFileSync(localRemoteConfigPath(root), serializeRemoteConfig(remoteConfig));
+    logger.debug({ versionStamp }, "uploading initial state.db snapshot");
+    await putObjectCas(
+      client,
+      opts.bucket,
+      remoteKey(location, stateSnapshotKey(versionStamp)),
+      encryptedStateDb,
+      { ifNoneMatchAny: true },
+    );
 
-  return versionStamp;
+    logger.debug({ versionStamp }, "publishing /current pointer");
+    await putObjectCas(
+      client,
+      opts.bucket,
+      remoteKey(location, CURRENT_POINTER_KEY),
+      Buffer.from(versionStamp, "utf8"),
+      { ifNoneMatchAny: true },
+    );
+
+    fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
+    fs.writeFileSync(localVaultJsonPath(root), serializeManifest(manifest));
+
+    const remoteConfig: RemoteConfig = { bucket: opts.bucket, prefix, region: opts.region };
+    if (opts.endpoint) remoteConfig.endpoint = opts.endpoint;
+    fs.writeFileSync(localRemoteConfigPath(root), serializeRemoteConfig(remoteConfig));
+
+    return versionStamp;
+  } finally {
+    lock.release();
+  }
 }

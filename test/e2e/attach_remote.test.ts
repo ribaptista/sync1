@@ -139,7 +139,28 @@ describe("attach_remote", () => {
     const parsed = JSON.parse(attachResult.stdout) as { ok: boolean; error: string };
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toMatch(/incorrect password/);
-    expect(fs.existsSync(path.join(machineBRoot, ".sync1"))).toBe(false);
+    // A failed attempt may leave a bare .sync1/ behind (it's created early,
+    // to hold the per-vault lock before any network work) -- but never
+    // vault.json, which is only written near the very end of success. A
+    // retry against the same root, with the correct password this time,
+    // must still succeed.
+    expect(fs.existsSync(path.join(machineBRoot, ".sync1", "vault.json"))).toBe(false);
+
+    const retryResult = await runCli(
+      [
+        "attach_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        machineBRoot,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(retryResult.exitCode).toBe(0);
+    expect(fs.existsSync(path.join(machineBRoot, ".sync1", "vault.json"))).toBe(true);
 
     fs.rmSync(machineARoot, { recursive: true, force: true });
     fs.rmSync(machineBRoot, { recursive: true, force: true });

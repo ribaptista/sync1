@@ -27,6 +27,7 @@ import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { openCacheDb } from "../db/connection.js";
 import { writeFileWithRetry } from "../fs/safe-fs.js";
 import { CorruptionError } from "../errors.js";
+import { acquireLock } from "../vault/lock.js";
 
 interface AttachRemoteOptions extends OptionValues {
   bucket: string;
@@ -86,73 +87,91 @@ async function runAttachRemote(
 ): Promise<string> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
-  if (fs.existsSync(sync1DirPath)) {
+  // Checked via vault.json (not .sync1/'s own existence) -- see init_remote.ts
+  // for why: vault.json is only ever written near the end of a successful
+  // run, so a prior attempt that failed partway through (wrong password, a
+  // missing/corrupt vault) never permanently blocks a retry against the
+  // same root.
+  if (fs.existsSync(localVaultJsonPath(root))) {
     throw new Error(`"${sync1DirPath}" already exists — this root is already attached/initialized`);
   }
 
-  const password = await getPassword();
-  const client = createS3Client({ endpoint: opts.endpoint, region: opts.region });
-  const prefix = normalizePrefix(opts.prefix);
-  const location: RemoteLocation = { bucket: opts.bucket, prefix };
-
-  logger.debug({ bucket: opts.bucket, prefix }, "fetching vault manifest");
-  const manifestObj = await getObject(client, opts.bucket, remoteKey(location, VAULT_MANIFEST_KEY));
-  if (!manifestObj) {
-    throw new Error(`no vault found at s3://${opts.bucket}/${prefix} (missing vault.json)`);
-  }
-  const manifest = parseManifest(manifestObj.body);
-
-  // Fails fast and clearly on a wrong password, before touching the filesystem at all.
-  const masterKey = unlockVault(manifest, password);
-
-  logger.debug({}, "fetching /current pointer");
-  const currentObj = await getObject(client, opts.bucket, remoteKey(location, CURRENT_POINTER_KEY));
-  if (!currentObj) {
-    throw new CorruptionError(
-      `vault at s3://${opts.bucket}/${prefix} has no /current pointer (corrupt vault?)`,
-    );
-  }
-  const versionStamp = currentObj.body.toString("utf8");
-
-  logger.debug({ versionStamp }, "fetching current state.db snapshot");
-  const snapshotObj = await getObject(
-    client,
-    opts.bucket,
-    remoteKey(location, stateSnapshotKey(versionStamp)),
-  );
-  if (!snapshotObj) {
-    throw new CorruptionError(
-      `state.db snapshot for version "${versionStamp}" is missing (corrupt vault?)`,
-    );
-  }
-
-  let stateDbBytes: Buffer;
+  fs.mkdirSync(sync1DirPath, { recursive: true });
+  const lock = acquireLock(root);
   try {
-    stateDbBytes = decryptBuffer(snapshotObj.body, masterKey);
-  } catch (err) {
-    if (err instanceof CryptoAuthError) {
+    const password = await getPassword();
+    const client = createS3Client({ endpoint: opts.endpoint, region: opts.region });
+    const prefix = normalizePrefix(opts.prefix);
+    const location: RemoteLocation = { bucket: opts.bucket, prefix };
+
+    logger.debug({ bucket: opts.bucket, prefix }, "fetching vault manifest");
+    const manifestObj = await getObject(
+      client,
+      opts.bucket,
+      remoteKey(location, VAULT_MANIFEST_KEY),
+    );
+    if (!manifestObj) {
+      throw new Error(`no vault found at s3://${opts.bucket}/${prefix} (missing vault.json)`);
+    }
+    const manifest = parseManifest(manifestObj.body);
+
+    // Fails fast and clearly on a wrong password, before touching the filesystem at all.
+    const masterKey = unlockVault(manifest, password);
+
+    logger.debug({}, "fetching /current pointer");
+    const currentObj = await getObject(
+      client,
+      opts.bucket,
+      remoteKey(location, CURRENT_POINTER_KEY),
+    );
+    if (!currentObj) {
       throw new CorruptionError(
-        "state.db snapshot failed decryption/authentication (corrupted upload?)",
+        `vault at s3://${opts.bucket}/${prefix} has no /current pointer (corrupt vault?)`,
       );
     }
-    throw err;
+    const versionStamp = currentObj.body.toString("utf8");
+
+    logger.debug({ versionStamp }, "fetching current state.db snapshot");
+    const snapshotObj = await getObject(
+      client,
+      opts.bucket,
+      remoteKey(location, stateSnapshotKey(versionStamp)),
+    );
+    if (!snapshotObj) {
+      throw new CorruptionError(
+        `state.db snapshot for version "${versionStamp}" is missing (corrupt vault?)`,
+      );
+    }
+
+    let stateDbBytes: Buffer;
+    try {
+      stateDbBytes = decryptBuffer(snapshotObj.body, masterKey);
+    } catch (err) {
+      if (err instanceof CryptoAuthError) {
+        throw new CorruptionError(
+          "state.db snapshot failed decryption/authentication (corrupted upload?)",
+        );
+      }
+      throw err;
+    }
+
+    // No filesystem writes beyond .sync1/ itself at this stage — mirrors
+    // fetch_remote's contract. Materializing the tree (as stubs) happens the
+    // first time `sync` runs, not here.
+    await writeFileWithRetry(localStateDbPath(root), stateDbBytes);
+    fs.writeFileSync(localVaultJsonPath(root), manifestObj.body);
+    fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
+
+    const remoteConfig: RemoteConfig = { bucket: opts.bucket, prefix, region: opts.region };
+    if (opts.endpoint) remoteConfig.endpoint = opts.endpoint;
+    fs.writeFileSync(localRemoteConfigPath(root), serializeRemoteConfig(remoteConfig));
+
+    // cache.db is created empty (migrated) now so it's ready for the first
+    // update_cache/sync run; it holds no rows yet.
+    openCacheDb(localCacheDbPath(root), logger).close();
+
+    return versionStamp;
+  } finally {
+    lock.release();
   }
-
-  // No filesystem writes beyond .sync1/ itself at this stage — mirrors
-  // fetch_remote's contract. Materializing the tree (as stubs) happens the
-  // first time `sync` runs, not here.
-  fs.mkdirSync(sync1DirPath, { recursive: true });
-  await writeFileWithRetry(localStateDbPath(root), stateDbBytes);
-  fs.writeFileSync(localVaultJsonPath(root), manifestObj.body);
-  fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
-
-  const remoteConfig: RemoteConfig = { bucket: opts.bucket, prefix, region: opts.region };
-  if (opts.endpoint) remoteConfig.endpoint = opts.endpoint;
-  fs.writeFileSync(localRemoteConfigPath(root), serializeRemoteConfig(remoteConfig));
-
-  // cache.db is created empty (migrated) now so it's ready for the first
-  // update_cache/sync run; it holds no rows yet.
-  openCacheDb(localCacheDbPath(root), logger).close();
-
-  return versionStamp;
 }
