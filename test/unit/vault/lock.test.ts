@@ -27,6 +27,14 @@ function deadPid(): number {
 }
 
 describe("acquireLock", () => {
+  it("is a no-op (no throw, no file written) when .sync1/ doesn't exist yet", () => {
+    const bareRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-lock-test-bare-"));
+    const handle = acquireLock(bareRoot);
+    expect(fs.existsSync(path.join(bareRoot, ".sync1"))).toBe(false);
+    expect(() => handle.release()).not.toThrow();
+    fs.rmSync(bareRoot, { recursive: true, force: true });
+  });
+
   it("acquires a fresh lock, writing pid/acquiredAt/hostname", () => {
     const handle = acquireLock(root);
     const content = JSON.parse(fs.readFileSync(localLockPath(root), "utf8")) as {

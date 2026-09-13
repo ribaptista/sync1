@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import os from "node:os";
-import { localLockPath } from "./local-dir.js";
+import { localLockPath, sync1Dir } from "./local-dir.js";
 import { tempSiblingPath } from "../fs/temp-path.js";
 import { VaultLockedError } from "../errors.js";
 
@@ -80,8 +80,20 @@ function isProcessAlive(pid: number): boolean {
  * that would risk silently overwriting a lock written by some future format
  * this version doesn't recognize. It throws a plain `Error` instead, asking
  * the user to inspect/remove it by hand.
+ *
+ * If `.sync1/` doesn't exist at all (an uninitialized/unattached root),
+ * this is a no-op returning a do-nothing handle -- there's no vault state
+ * here yet to protect, and the caller's own "not initialized" check (run
+ * immediately after this) will fail with its own clear message regardless.
+ * Creating `.sync1/` here just to hold a lock file would make an
+ * uninitialized root look partially set up, which is worse than not
+ * locking at all in this specific case.
  */
 export function acquireLock(root: string): LockHandle {
+  if (!fs.existsSync(sync1Dir(root))) {
+    return { release(): void {} };
+  }
+
   const lockPath = localLockPath(root);
   const existing = readExistingLock(lockPath);
 
