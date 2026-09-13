@@ -242,6 +242,8 @@ export async function performSync(
           cacheBaselineVersion,
           s3,
           logger,
+          pools.stream,
+          pools.stream.concurrency * 2,
         );
       } finally {
         candidateDb.close(); // checkpoints WAL before we read the file back

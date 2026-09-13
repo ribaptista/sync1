@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
+import type PQueue from "p-queue";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
 import { EntriesRepository, type EntryRow } from "../db/repositories/entries-repository.js";
@@ -15,6 +16,7 @@ import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "../fs/decrypt-to-file.js";
+import { waitForRoom } from "../concurrency/pools.js";
 
 /**
  * A path materialized (or stub-updated) here despite matching a global
@@ -57,6 +59,18 @@ export interface ApplyRemoteChangesResult {
  * (just its referenced hash is updated, no download at all); already
  * materialized stays materialized (downloads the new content).
  *
+ * Only that last case -- an already-materialized path whose remote content
+ * changed -- involves any real I/O worth parallelizing (directory creation
+ * and stub writes are cheap, synchronous, and stay that way). Such a
+ * download is *dispatched* to `streamPool` rather than awaited inline: the
+ * merge-join loop advances to the next path immediately, and up to
+ * `streamQueueLimit` downloads run concurrently in the background, joined
+ * (via `Promise.all`) before this function returns. No in-memory
+ * ledger/bookkeeping is needed for this pass the way apply-local-changes.ts
+ * needs one -- this function does no cross-row collision or dedup
+ * detection of its own, so a dispatched download never needs to be looked
+ * up again by a later row.
+ *
  * `excludePaths` (this machine's own dirty rows) are skipped entirely --
  * handled by apply-local-changes.ts instead, or deliberately left
  * conflicted; this function never overwrites a file the user has a pending
@@ -77,10 +91,13 @@ export async function applyRemoteChangesToLocal(
   newBaselineVersion: string,
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
+  streamPool: PQueue,
+  streamQueueLimit: number,
 ): Promise<ApplyRemoteChangesResult> {
   const candidateEntries = new EntriesRepository(candidateDb);
   const candidateObjects = new ObjectsRepository(candidateDb);
   const ignoreGlobs = new IgnorePoliciesRepository(candidateDb).listGlobs();
+  const pendingDownloads: Promise<void>[] = [];
 
   {
     const cacheIter = cacheRepo.iterateAllSortedByPath();
@@ -118,6 +135,9 @@ export async function applyRemoteChangesToLocal(
             true,
             s3,
             logger,
+            streamPool,
+            streamQueueLimit,
+            pendingDownloads,
           );
           result.created++;
 
@@ -159,6 +179,9 @@ export async function applyRemoteChangesToLocal(
             preserveAsStub,
             s3,
             logger,
+            streamPool,
+            streamQueueLimit,
+            pendingDownloads,
           );
           result.modified++;
         }
@@ -166,6 +189,8 @@ export async function applyRemoteChangesToLocal(
         candidateNext = candidateIter.next();
       }
     }
+
+    await Promise.all(pendingDownloads);
 
     return result;
   }
@@ -176,6 +201,13 @@ function currentlyStubBacked(root: string, entryPath: string): boolean {
   return !fs.existsSync(absolutePath) && fs.existsSync(stubPathFor(absolutePath));
 }
 
+/**
+ * Classifies synchronously (directory / stub write / real download needed),
+ * only dispatching to `streamPool` -- rather than awaiting inline -- for the
+ * one case that's genuine network I/O: a real download. Directory creation
+ * and stub writes are cheap and synchronous, so they're applied immediately
+ * and never touch the pool.
+ */
 async function applyRemoteContentChange(
   entry: EntryRow,
   root: string,
@@ -186,6 +218,9 @@ async function applyRemoteContentChange(
   writeAsStub: boolean,
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
+  streamPool: PQueue,
+  streamQueueLimit: number,
+  pendingDownloads: Promise<void>[],
 ): Promise<void> {
   const absolutePath = path.join(root, entry.path);
 
@@ -230,49 +265,65 @@ async function applyRemoteContentChange(
     return;
   }
 
-  const encrypted = await getObjectStream(
-    s3.client,
-    s3.bucket,
-    remoteKey(s3.location, objectRow.s3_key),
-  );
-  if (!encrypted) {
-    throw new CorruptionError(
-      `object ${entry.hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
+  const hash = entry.hash;
+  await waitForRoom(streamPool, streamQueueLimit);
+  const downloadDone = streamPool.add(async () => {
+    const encrypted = await getObjectStream(
+      s3.client,
+      s3.bucket,
+      remoteKey(s3.location, objectRow.s3_key),
     );
-  }
-
-  fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-  const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
-  let computedHash: string;
-  try {
-    computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
-  } catch (err) {
-    if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
-    if (err instanceof CryptoAuthError) {
+    if (!encrypted) {
       throw new CorruptionError(
-        `object ${entry.hash} for "${entry.path}" failed decryption/authentication`,
+        `object ${hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
       );
     }
-    throw err;
-  }
-  if (computedHash !== entry.hash) {
-    fs.rmSync(tmpPath);
-    throw new CorruptionError(
-      `object ${entry.hash} for "${entry.path}" does not match its recorded hash`,
+
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+    let computedHash: string;
+    try {
+      computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
+    } catch (err) {
+      if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
+      if (err instanceof CryptoAuthError) {
+        throw new CorruptionError(
+          `object ${hash} for "${entry.path}" failed decryption/authentication`,
+        );
+      }
+      throw err;
+    }
+    if (computedHash !== hash) {
+      fs.rmSync(tmpPath);
+      throw new CorruptionError(
+        `object ${hash} for "${entry.path}" does not match its recorded hash`,
+      );
+    }
+
+    fs.renameSync(tmpPath, absolutePath);
+
+    cacheRepo.upsert({
+      path: entry.path,
+      type: "file",
+      mtime: Math.round(fs.statSync(absolutePath).mtimeMs),
+      hash,
+      state: "unchanged",
+      parent_state_version: newBaselineVersion,
+    });
+    logger.debug({ path: entry.path, hash }, "materialized remote file create/modify");
+    logger.debug(
+      { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+      "completed",
     );
-  }
-
-  fs.renameSync(tmpPath, absolutePath);
-
-  cacheRepo.upsert({
-    path: entry.path,
-    type: "file",
-    mtime: Math.round(fs.statSync(absolutePath).mtimeMs),
-    hash: entry.hash,
-    state: "unchanged",
-    parent_state_version: newBaselineVersion,
-  });
-  logger.debug({ path: entry.path, hash: entry.hash }, "materialized remote file create/modify");
+  }) as Promise<void>;
+  // Logged after add(), not before -- add() synchronously starts the task
+  // (if capacity allows) before returning, so this reflects occupancy
+  // *including* the job just dispatched.
+  logger.debug(
+    { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+    "dispatched",
+  );
+  pendingDownloads.push(downloadDone);
 }
 
 function applyRemoteDelete(
