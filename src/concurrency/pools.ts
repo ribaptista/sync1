@@ -1,0 +1,66 @@
+import PQueue from "p-queue";
+import { Piscina } from "piscina";
+import { fileURLToPath } from "node:url";
+import os from "node:os";
+
+export interface ConcurrencyPools {
+  s3: PQueue;
+  hash: Piscina;
+  stream: PQueue;
+}
+
+export interface ConcurrencyPoolOptions {
+  s3MetadataParallelism?: number;
+  hashParallelism?: number;
+  fileStreamParallelism?: number;
+}
+
+export function createConcurrencyPools(opts: ConcurrencyPoolOptions): ConcurrencyPools {
+  return {
+    s3: new PQueue({ concurrency: opts.s3MetadataParallelism ?? 8 }),
+    hash: new Piscina({
+      filename: fileURLToPath(new URL("./hash-worker.js", import.meta.url)),
+      maxThreads: opts.hashParallelism ?? os.cpus().length,
+    }),
+    stream: new PQueue({ concurrency: opts.fileStreamParallelism ?? 4 }),
+  };
+}
+
+// Keeps a p-queue-backed pool's producer from getting more than `limit` jobs
+// ahead of what the pool can actually run -- an unbounded producer feeding a
+// pool is just as unbounded as loading everything into an array up front.
+export async function waitForRoom(pool: PQueue, limit: number): Promise<void> {
+  if (pool.size + pool.pending >= limit) {
+    await pool.onSizeLessThan(limit);
+  }
+}
+
+// Same backpressure discipline for the piscina hash pool, which has no
+// onSizeLessThan equivalent: track submitted-but-not-yet-settled runs in a
+// bounded set, capped at `limit`, and await room before submitting more.
+export class BoundedHashRunner {
+  private readonly inFlight = new Set<Promise<unknown>>();
+
+  constructor(
+    private readonly pool: Pick<Piscina, "run">,
+    private readonly limit: number,
+  ) {}
+
+  get size(): number {
+    return this.inFlight.size;
+  }
+
+  async run(absolutePath: string): Promise<string> {
+    while (this.inFlight.size >= this.limit) {
+      await Promise.race(this.inFlight);
+    }
+    const promise = this.pool.run(absolutePath) as Promise<string>;
+    const tracked = promise.finally(() => this.inFlight.delete(tracked));
+    this.inFlight.add(tracked);
+    return promise;
+  }
+
+  async onIdle(): Promise<void> {
+    await Promise.all(this.inFlight);
+  }
+}
