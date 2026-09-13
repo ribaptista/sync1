@@ -24,6 +24,7 @@ describe("migration runner", () => {
       "ignore_policies",
       "objects",
       "storage_policies",
+      "thumbnail_policies",
       "versions",
     ]);
   });
@@ -54,6 +55,7 @@ describe("migration runner", () => {
       { filename: "0002_add_normalized_path.sql" },
       { filename: "0003_add_ignore_policies.sql" },
       { filename: "0004_add_storage_policies.sql" },
+      { filename: "0005_add_thumbnail_policies.sql" },
     ]);
 
     // Running again must not error (e.g. re-executing CREATE TABLE) and must
@@ -62,7 +64,7 @@ describe("migration runner", () => {
     const appliedSecond = db
       .prepare<[], { filename: string }>("SELECT filename FROM _migrations")
       .all();
-    expect(appliedSecond).toHaveLength(4);
+    expect(appliedSecond).toHaveLength(5);
   });
 
   it("creates the indexes named in the schema", () => {

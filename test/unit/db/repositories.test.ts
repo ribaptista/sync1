@@ -6,6 +6,7 @@ import { EntriesRepository } from "../../../src/db/repositories/entries-reposito
 import { CacheEntriesRepository } from "../../../src/db/repositories/cache-entries-repository.js";
 import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
 import { StoragePoliciesRepository } from "../../../src/db/repositories/storage-policies-repository.js";
+import { ThumbnailPoliciesRepository } from "../../../src/db/repositories/thumbnail-policies-repository.js";
 
 describe("VersionsRepository", () => {
   it("inserts and reads back versions in sequence order", () => {
@@ -397,5 +398,177 @@ describe("StoragePoliciesRepository (state.db)", () => {
 
     expect(() => repo.delete(defaultId)).toThrow(/default policy can't be deleted/);
     expect(repo.get(defaultId)).toBeDefined();
+  });
+});
+
+const GENERATE_INPUT = {
+  glob: "**/*.jpg",
+  action: "generate" as const,
+  mimeTypes: ["image/jpeg"],
+  priority: 0,
+  imageWidth: 320,
+  imageHeight: 240,
+  tileRowCount: 4,
+  tileColumnCount: 4,
+  tileWidth: 160,
+  tileHeight: 90,
+  jpegQuality: 80,
+};
+
+const SKIP_INPUT = {
+  glob: "private/**",
+  action: "skip" as const,
+  mimeTypes: ["image/*", "video/*"],
+};
+
+describe("ThumbnailPoliciesRepository (state.db)", () => {
+  it("starts empty -- no mandatory default row, unlike storage_policies", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    expect(repo.list()).toEqual([]);
+  });
+
+  it("creates, lists, gets, updates, and deletes both skip and generate rows", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+
+    const generateId = repo.create(GENERATE_INPUT);
+    const skipId = repo.create(SKIP_INPUT);
+
+    expect(repo.list().map((r) => r.id)).toEqual([generateId, skipId]);
+
+    expect(repo.get(generateId)).toEqual({
+      id: generateId,
+      glob: "**/*.jpg",
+      action: "generate",
+      priority: 0,
+      mimeTypes: ["image/jpeg"],
+      imageWidth: 320,
+      imageHeight: 240,
+      tileRowCount: 4,
+      tileColumnCount: 4,
+      tileWidth: 160,
+      tileHeight: 90,
+      jpegQuality: 80,
+      createdAt: expect.any(String) as string,
+    });
+
+    expect(repo.get(skipId)).toEqual({
+      id: skipId,
+      glob: "private/**",
+      action: "skip",
+      priority: null,
+      mimeTypes: ["image/*", "video/*"],
+      imageWidth: null,
+      imageHeight: null,
+      tileRowCount: null,
+      tileColumnCount: null,
+      tileWidth: null,
+      tileHeight: null,
+      jpegQuality: null,
+      createdAt: expect.any(String) as string,
+    });
+
+    expect(repo.update(generateId, { jpegQuality: 60, priority: 5 })).toBe(true);
+    expect(repo.get(generateId)).toMatchObject({ jpegQuality: 60, priority: 5 });
+    expect(repo.update(999, { jpegQuality: 60 })).toBe(false);
+
+    expect(repo.delete(skipId)).toBe(true);
+    expect(repo.get(skipId)).toBeUndefined();
+    expect(repo.delete(skipId)).toBe(false);
+  });
+
+  it("round-trips mimeTypes through the JSON-encoded column, preserving order", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const id = repo.create({ ...SKIP_INPUT, mimeTypes: ["video/*", "image/png", "image/jpeg"] });
+    expect(repo.get(id)?.mimeTypes).toEqual(["video/*", "image/png", "image/jpeg"]);
+  });
+
+  it("listGenerateByPriority orders by priority, listSkip returns only skip rows", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const lowId = repo.create({ ...GENERATE_INPUT, glob: "a/*", priority: 5 });
+    const highId = repo.create({ ...GENERATE_INPUT, glob: "b/*", priority: 1 });
+    const skipId = repo.create(SKIP_INPUT);
+
+    expect(repo.listGenerateByPriority().map((r) => r.id)).toEqual([highId, lowId]);
+    expect(repo.listSkip().map((r) => r.id)).toEqual([skipId]);
+  });
+
+  it("rejects a 'skip' policy that sets a priority or any generate field", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    expect(() => repo.create({ ...SKIP_INPUT, priority: 1 })).toThrow(/priority/);
+    expect(() => repo.create({ ...SKIP_INPUT, jpegQuality: 80 })).toThrow(/jpegQuality/);
+  });
+
+  it("rejects a 'generate' policy missing a priority or any generate field", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const { priority: _priority, ...withoutPriority } = GENERATE_INPUT;
+    expect(() => repo.create(withoutPriority)).toThrow(/priority/);
+
+    const { jpegQuality: _jpegQuality, ...withoutQuality } = GENERATE_INPUT;
+    expect(() => repo.create(withoutQuality)).toThrow(/jpegQuality/);
+  });
+
+  it("rejects an invalid mime type, and requires at least one", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    expect(() => repo.create({ ...SKIP_INPUT, mimeTypes: ["not-a-mime-type"] })).toThrow(
+      /invalid mime type/,
+    );
+    expect(() => repo.create({ ...SKIP_INPUT, mimeTypes: [] })).toThrow(/at least one mime type/);
+    expect(repo.create({ ...SKIP_INPUT, mimeTypes: ["video/*"] })).toEqual(expect.any(Number));
+  });
+
+  it("update() re-validates the merged whole, catching an update that would leave it inconsistent", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const generateId = repo.create(GENERATE_INPUT);
+
+    // Clearing jpegQuality alone (without also switching to 'skip') would
+    // leave a 'generate' row missing a required field.
+    expect(() => repo.update(generateId, { mimeTypes: [] })).toThrow(/at least one mime type/);
+  });
+
+  it("update() switching action clears the fields that no longer apply", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const generateId = repo.create(GENERATE_INPUT);
+
+    expect(repo.update(generateId, { action: "skip" })).toBe(true);
+    expect(repo.get(generateId)).toMatchObject({
+      action: "skip",
+      priority: null,
+      imageWidth: null,
+      imageHeight: null,
+      tileRowCount: null,
+      tileColumnCount: null,
+      tileWidth: null,
+      tileHeight: null,
+      jpegQuality: null,
+    });
+
+    const skipId = repo.create(SKIP_INPUT);
+    // Switching skip -> generate without supplying the newly-required fields
+    // in the same call fails -- nothing carries over from the skip row's
+    // (all-null) generate fields.
+    expect(() => repo.update(skipId, { action: "generate", priority: 0 })).toThrow(/imageWidth/);
+    expect(
+      repo.update(skipId, {
+        action: "generate",
+        priority: 0,
+        imageWidth: 100,
+        imageHeight: 100,
+        tileRowCount: 2,
+        tileColumnCount: 2,
+        tileWidth: 50,
+        tileHeight: 50,
+        jpegQuality: 70,
+      }),
+    ).toBe(true);
+    expect(repo.get(skipId)).toMatchObject({ action: "generate", priority: 0, imageWidth: 100 });
   });
 });
