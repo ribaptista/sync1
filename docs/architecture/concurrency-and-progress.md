@@ -74,10 +74,12 @@ collision detection of its own.
 ## Two concurrency primitives, chosen per workload
 
 - **`p-queue`** (`PQueue`) — a bounded async queue, used for the S3-call pool (`--s3-metadata-parallelism`,
-  default 8) and the file-content-pipeline pool (`--file-stream-parallelism`, default 4). Both are
-  I/O-bound: concurrency helps by overlapping different items' network/disk waits, not by using more
-  CPU cores. `PQueue` already has `.onIdle()`/`.pending`/`.size`, so no extra bookkeeping is needed
-  beyond the shared backpressure helper (below).
+  default 8), the file-content-pipeline pool (`--file-stream-parallelism`, default 4), and the thumbnail
+  classification+generation pool (`--thumbnail-parallelism`, default 4 — see
+  [thumbnails.md](thumbnails.md)). All three are dominated by waiting (network/disk I/O, or an external
+  `identify`/`ffmpeg` subprocess), not CPU work on the main thread itself — concurrency helps by
+  overlapping different items' waits. `PQueue` already has `.onIdle()`/`.pending`/`.size`, so no extra
+  bookkeeping is needed beyond the shared backpressure helper (below).
 - **`piscina`** (real OS worker threads) — used only for `--hash-parallelism` (file hashing in
   `update_cache`/`sanity_check`/`stubify`). Hashing many _different_ files is the one place in this
   plan that's genuinely CPU-bound and embarrassingly parallel across files, so it's the one place

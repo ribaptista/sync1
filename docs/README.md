@@ -5,22 +5,24 @@ Windows.
 
 ## CLI commands
 
-| Command                                   | Description                                                                     |
-| ----------------------------------------- | ------------------------------------------------------------------------------- |
-| [`init_remote`](cli/init_remote.md)       | Create a brand-new vault in S3 for a local root directory.                      |
-| [`attach_remote`](cli/attach_remote.md)   | Attach a local root to an existing vault (join from a new machine, or restore). |
-| [`update_cache`](cli/update_cache.md)     | Rescan the local root and refresh `cache.db` to match what's on disk.           |
-| [`sync`](cli/sync.md)                     | Reconcile local changes with the remote vault, in both directions.              |
-| [`fetch_remote`](cli/fetch_remote.md)     | Pull the latest state.db snapshot without touching the filesystem or cache.db.  |
-| [`materialize`](cli/materialize.md)       | Download and materialize stub files matching a glob into real content.          |
-| [`stubify`](cli/stubify.md)               | Replace real files matching a glob with stubs, freeing local disk space.        |
-| [`inspect`](cli/inspect.md)               | Read-only JSON query over cache.db/state.db for a path or glob, for tooling.    |
-| [`gc`](cli/gc.md)                         | Remove S3 objects no longer referenced by the vault's current live state.       |
-| [`ignore`](cli/ignore.md)                 | Manage global (shared) ignore policies -- GLOB patterns kept out of the vault.  |
-| [`sanity_check`](cli/sanity_check.md)     | Read-only diagnostic cross-checking state.db against S3 and the filesystem.     |
-| [`storage_policy`](cli/storage_policy.md) | Manage global storage-class policies -- GLOB patterns mapped to an S3 class.    |
-| [`status`](cli/status.md)                 | Read-only report: actual S3 storage class vs. what storage_policy implies.      |
-| [`converge`](cli/converge.md)             | Apply storage_policy: move objects' actual S3 storage class to match it.        |
+| Command                                       | Description                                                                              |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| [`init_remote`](cli/init_remote.md)           | Create a brand-new vault in S3 for a local root directory.                               |
+| [`attach_remote`](cli/attach_remote.md)       | Attach a local root to an existing vault (join from a new machine, or restore).          |
+| [`update_cache`](cli/update_cache.md)         | Rescan the local root and refresh `cache.db` to match what's on disk.                    |
+| [`sync`](cli/sync.md)                         | Reconcile local changes with the remote vault, in both directions.                       |
+| [`fetch_remote`](cli/fetch_remote.md)         | Pull the latest state.db snapshot without touching the filesystem or cache.db.           |
+| [`materialize`](cli/materialize.md)           | Download and materialize stub files matching a glob into real content.                   |
+| [`stubify`](cli/stubify.md)                   | Replace real files matching a glob with stubs, freeing local disk space.                 |
+| [`inspect`](cli/inspect.md)                   | Read-only JSON query over cache.db/state.db for a path or glob, for tooling.             |
+| [`gc`](cli/gc.md)                             | Remove S3 objects no longer referenced by the vault's current live state.                |
+| [`ignore`](cli/ignore.md)                     | Manage global (shared) ignore policies -- GLOB patterns kept out of the vault.           |
+| [`sanity_check`](cli/sanity_check.md)         | Read-only diagnostic cross-checking state.db against S3 and the filesystem.              |
+| [`storage_policy`](cli/storage_policy.md)     | Manage global storage-class policies -- GLOB patterns mapped to an S3 class.             |
+| [`status`](cli/status.md)                     | Read-only report: actual S3 storage class vs. what storage_policy implies.               |
+| [`converge`](cli/converge.md)                 | Apply storage_policy: move objects' actual S3 storage class to match it.                 |
+| [`thumbnail_policy`](cli/thumbnail_policy.md) | Manage global thumbnail-generation policies -- glob + mime type mapped to skip/generate. |
+| [`thumbnail`](cli/thumbnail.md)               | Generate/report/clean up thumbnails and video mosaics per thumbnail_policy.              |
 
 ## Architecture
 
@@ -37,12 +39,15 @@ Windows.
 | [ignore-and-storage-policies.md](architecture/ignore-and-storage-policies.md)                 | Why ignore policies are global (state.db) with no priority, why matching happens in memory, what a match gates for local creations vs. remote arrivals, and `sanity_check`'s design.                           |
 | [storage-class-policies.md](architecture/storage-class-policies.md)                           | `storage_policy`'s priority/default-policy model, warmest-wins dedup resolution, and how `status`/`converge` share one evaluation.                                                                             |
 | [concurrency-and-progress.md](architecture/concurrency-and-progress.md)                       | The decide-sequentially/dispatch-concurrently pattern, the keyset-pagination foundation, the worker-thread-vs-async-pool split, backpressure, and how progress bars share a terminal with `--verbose` logging. |
+| [locking.md](architecture/locking.md)                                                         | The per-vault lock file: shape, staleness detection, the `preAction`/`postAction` hook wiring, and Ctrl+C behavior.                                                                                            |
+| [thumbnails.md](architecture/thumbnails.md)                                                   | `thumbnail_policy`'s skip/generate resolution, the naming convention, the `**` glob support it needed, resize math, video mosaics, and the shared state/ensure/cleanup scan.                                   |
 
 ## Conventions across all commands
 
 - **`--json`**: every command supports a global `--json` flag for machine-readable output. On success, output is a single JSON object (or JSONL for glob/batch results like `inspect`) with `ok: true` plus command-specific fields. On failure, `{ ok: false, error: "<message>" }`.
 - **`--verbose`**: raises logging to debug level (structured, stderr-only via `pino`, never stdout) — safe to combine with `--json` since logs never share a stream with result output. While a progress bar is actually rendering, `--verbose` output is diverted to file descriptor 3 instead (only if the caller redirected it there, e.g. `3>/tmp/sync1.log`) so bars and logs never corrupt each other on stderr — see [concurrency-and-progress.md](architecture/concurrency-and-progress.md).
 - **`--no-progress`**: disables progress bars even on a real terminal. Bars are already off automatically for `--json` output or when stderr isn't a TTY (e.g. piped/redirected).
-- **`--s3-metadata-parallelism <n>`** (default 8), **`--hash-parallelism <n>`** (default: CPU count), **`--file-stream-parallelism <n>`** (default 4): concurrency knobs for, respectively, bare S3 calls (HEAD/copy/restore/delete), file hashing (real worker threads), and encrypt+upload/download+decrypt pipelines. Every command accepts all three globally, but only acts on the ones relevant to its own work — see each command's Options table and [concurrency-and-progress.md](architecture/concurrency-and-progress.md) for which pools a given command actually uses.
-- **Exit codes**: `0` success, `1` generic error, `2` unresolved sync conflict, `3` data corruption (a malformed/unverifiable stub, a missing or undecryptable S3 object, a vault or snapshot that fails to parse). See [conflict-resolution.md](architecture/conflict-resolution.md) for what triggers `2` and each architecture doc above for what triggers `3` in that area.
-- **Password scope**: only commands that read or write encrypted content (state.db snapshots or content objects) prompt for the vault password — `init_remote`, `attach_remote`, `fetch_remote`, `sync`, `gc`, `materialize`, `ignore create`/`edit`/`delete`, and `storage_policy create`/`edit`/`delete` (each of those last two is a real state.db commit). `update_cache`, `inspect`, `stubify`, `ignore list`, `sanity_check`, `storage_policy list`, `status`, and `converge` never need it: the `list`/`inspect`/`sanity_check`/`update_cache`/`status` group only ever read the unencrypted `cache.db` or the already-locally-decrypted `state.db`, `stubify` only ever removes local files it already has and writes a stub containing a hash already recorded locally, and `sanity_check`/`status`/`converge` only touch S3 storage-class metadata/existence (`HEAD`/copy/restore) without reading or writing object content.
+- **`--s3-metadata-parallelism <n>`** (default 8), **`--hash-parallelism <n>`** (default: CPU count), **`--file-stream-parallelism <n>`** (default 4), **`--thumbnail-parallelism <n>`** (default 4): concurrency knobs for, respectively, bare S3 calls (HEAD/copy/restore/delete), file hashing (real worker threads), encrypt+upload/download+decrypt pipelines, and thumbnail/mosaic classification+generation jobs. Every command accepts all four globally, but only acts on the ones relevant to its own work — see each command's Options table and [concurrency-and-progress.md](architecture/concurrency-and-progress.md) for which pools a given command actually uses.
+- **Exit codes**: `0` success, `1` generic error, `2` unresolved sync conflict or an active per-vault lock held by another invocation, `3` data corruption (a malformed/unverifiable stub, a missing or undecryptable S3 object, a vault or snapshot that fails to parse). See [conflict-resolution.md](architecture/conflict-resolution.md) for what triggers `2` from a sync conflict, [locking.md](architecture/locking.md) for the lock-conflict case, and each architecture doc above for what triggers `3` in that area.
+- **Password scope**: only commands that read or write encrypted content (state.db snapshots or content objects) prompt for the vault password — `init_remote`, `attach_remote`, `fetch_remote`, `sync`, `gc`, `materialize`, `ignore create`/`edit`/`delete`, `storage_policy create`/`edit`/`delete`, and `thumbnail_policy create`/`edit`/`delete` (each of those last three is a real state.db commit). `update_cache`, `inspect`, `stubify`, `ignore list`, `sanity_check`, `storage_policy list`, `status`, `converge`, `thumbnail_policy list`, and `thumbnail state`/`ensure`/`cleanup` never need it: the `list`/`inspect`/`sanity_check`/`update_cache`/`status`/`thumbnail` group only ever read the unencrypted `cache.db` or the already-locally-decrypted `state.db`, `stubify` only ever removes local files it already has and writes a stub containing a hash already recorded locally, and `sanity_check`/`status`/`converge` only touch S3 storage-class metadata/existence (`HEAD`/copy/restore) without reading or writing object content.
+- **Per-vault lock**: every command except `init_remote`/`attach_remote` (which manage it themselves) acquires a lock at `<root>/.sync1/lock` before running and releases it after — a second invocation against the same `--root` while one is still running fails immediately (exit `2`) rather than racing it. Ctrl+C prints a warning, force-releases the lock, and exits immediately with no draining of in-flight work. See [locking.md](architecture/locking.md).
