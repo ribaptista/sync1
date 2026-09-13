@@ -131,8 +131,12 @@ describe("per-vault lock", () => {
     // Real file content to hash/encrypt/upload -- gives the first `sync` a
     // reliably wide time window to still be running (on top of the vault
     // password's own ~250-450ms Argon2id KDF pass and the real LocalStack
-    // round-trips), rather than depending on KDF/network timing alone.
-    for (let i = 0; i < 40; i++) {
+    // round-trips), rather than depending on KDF/network timing alone. 200
+    // (not 40): under a full-suite run's CPU contention, this test's own
+    // `waitFor` polling loop lags too, eating into the margin between "lock
+    // file observed" and "first process finishes" -- 200 was empirically
+    // wide enough to stop that observed flake, still fast in isolation.
+    for (let i = 0; i < 200; i++) {
       fs.writeFileSync(path.join(root, `f${i}.txt`), `content of file ${i}`.repeat(2000));
     }
 
