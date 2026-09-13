@@ -2,8 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../logger.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
-import { hashFile } from "./hash-file.js";
 import { writeStubAtomic, stubPathFor } from "./stub.js";
+import { BoundedTaskTracker } from "../concurrency/pools.js";
+import type { HashRunner } from "../concurrency/hash-runner.js";
 
 export interface StubifySkip {
   path: string;
@@ -25,6 +26,12 @@ export interface StubifyStats {
  * would silently discard an un-synced edit by deleting the real file out
  * from under it.
  *
+ * A needed rehash is *dispatched* to `hashRunner` (worker threads, via
+ * `hashJobs`) rather than awaited inline, same as update_cache/sanity_check
+ * -- the glob scan advances immediately, rehashes run concurrently in the
+ * background, and `hashJobs.onIdle()` joins them all before this returns.
+ * The common case (mtime unchanged) never touches the pool at all.
+ *
  * Crash-safety mirrors materialize's, in reverse: the stub is written
  * (atomically, via tmp + rename) *before* the real file is deleted, so an
  * interrupted stubify also lands in the safe "both exist" state.
@@ -34,56 +41,70 @@ export async function stubifyGlob(
   glob: string,
   cacheRepo: CacheEntriesRepository,
   logger: Logger,
+  hashRunner: HashRunner,
+  maxInFlightHashes: number,
+  onProgress?: (scanned: number) => void,
 ): Promise<StubifyStats> {
   const stats: StubifyStats = { stubified: 0, alreadyStub: 0, skipped: [] };
+  const hashJobs = new BoundedTaskTracker(maxInFlightHashes);
 
   // A single connection/repo covers both the glob scan and cacheRepo.upsert()
   // below: iterateByGlobSortedByPath() is keyset-paginated (src/db/keyset-
   // pagination.ts), not a live `.iterate()` cursor, so the write can safely
   // interleave with it -- a write only ever conflicts with a *paused*
   // cursor, and pagination never leaves one paused between pages.
-  {
-    for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
-      if (row.type !== "file") continue;
-      const absolutePath = path.join(root, row.path);
-      const stubAbsolutePath = stubPathFor(absolutePath);
+  let scanned = 0;
+  for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
+    scanned++;
+    onProgress?.(scanned);
+    if (row.type !== "file") continue;
+    const absolutePath = path.join(root, row.path);
+    const stubAbsolutePath = stubPathFor(absolutePath);
 
-      if (!fs.existsSync(absolutePath)) {
-        stats.alreadyStub++;
-        continue;
-      }
+    if (!fs.existsSync(absolutePath)) {
+      stats.alreadyStub++;
+      continue;
+    }
 
-      if (row.state !== "unchanged") {
-        stats.skipped.push({
-          path: row.path,
-          reason: "not fully committed (has pending local changes)",
-        });
-        continue;
-      }
+    if (row.state !== "unchanged") {
+      stats.skipped.push({
+        path: row.path,
+        reason: "not fully committed (has pending local changes)",
+      });
+      continue;
+    }
 
-      let confirmedHash = row.hash;
-      const currentMtime = Math.round(fs.statSync(absolutePath).mtimeMs);
-      if (currentMtime !== row.mtime) {
-        const rehash = await hashFile(absolutePath);
-        if (rehash !== row.hash) {
-          stats.skipped.push({
-            path: row.path,
-            reason: "file changed since it was last synced -- run sync first",
-          });
-          continue;
-        }
-        confirmedHash = rehash;
-      }
+    const finalize = (confirmedHash: string | null): void => {
       if (!confirmedHash) throw new Error(`cache row for "${row.path}" has no hash`);
-
       writeStubAtomic(stubAbsolutePath, confirmedHash); // write the stub first...
       fs.rmSync(absolutePath); // ...only then delete the real file
-
       cacheRepo.upsert({ ...row, mtime: Math.round(fs.statSync(stubAbsolutePath).mtimeMs) });
       stats.stubified++;
       logger.debug({ path: row.path }, "stubified");
+    };
+
+    const currentMtime = Math.round(fs.statSync(absolutePath).mtimeMs);
+    if (currentMtime === row.mtime) {
+      finalize(row.hash);
+      continue;
     }
+
+    await hashJobs.dispatch(async () => {
+      const rehash = await hashRunner.run(absolutePath);
+      logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
+      if (rehash !== row.hash) {
+        stats.skipped.push({
+          path: row.path,
+          reason: "file changed since it was last synced -- run sync first",
+        });
+        return;
+      }
+      finalize(rehash);
+    });
+    logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
   }
+
+  await hashJobs.onIdle();
 
   return stats;
 }

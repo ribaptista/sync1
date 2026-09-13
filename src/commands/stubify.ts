@@ -1,20 +1,26 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Command, OptionValues } from "commander";
-import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { sync1Dir, localCacheDbPath } from "../vault/local-dir.js";
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { stubifyGlob, type StubifyStats } from "../fs/stubify.js";
+import { createConcurrencyPools } from "../concurrency/pools.js";
+import {
+  resolveConcurrencyOptions,
+  type GlobalConcurrencyOptions,
+} from "../cli/concurrency-options.js";
+import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
 
 interface StubifyOptions extends OptionValues {
   root: string;
 }
 
-interface GlobalOptions extends OptionValues {
+interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
+  progress?: boolean;
 }
 
 export function registerStubifyCommand(program: Command): void {
@@ -26,10 +32,14 @@ export function registerStubifyCommand(program: Command): void {
     .action(async (glob: string, opts: StubifyOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
-      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "stubify" });
+      const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
+      const logger = createLoggerForRun({
+        verbose: globalOpts.verbose ?? false,
+        showProgress,
+      }).child({ command: "stubify" });
 
       try {
-        const stats = await runStubify(glob, opts, logger);
+        const stats = await runStubify(glob, opts, globalOpts, logger, showProgress);
         if (json) {
           emitJson({
             ok: stats.skipped.length === 0,
@@ -54,7 +64,9 @@ export function registerStubifyCommand(program: Command): void {
 async function runStubify(
   glob: string,
   opts: StubifyOptions,
-  logger: Logger,
+  globalOpts: GlobalOptions,
+  logger: import("../logger.js").Logger,
+  showProgress: boolean,
 ): Promise<StubifyStats> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
@@ -63,10 +75,31 @@ async function runStubify(
   }
 
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
+  const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
+  const progress = startProgressSession({
+    show: showProgress,
+    overallLabel: "stubifying",
+    overallUnit: "entries",
+  });
+
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
-    return await stubifyGlob(root, glob, cacheRepo, logger);
+    progress.setOverallTotal(Math.max(cacheRepo.count(), 1));
+    return await stubifyGlob(
+      root,
+      glob,
+      cacheRepo,
+      logger,
+      pools.hash,
+      pools.hash.maxThreads,
+      (n) => {
+        progress.setOverallTotal(n);
+        progress.advanceOverall(1);
+      },
+    );
   } finally {
+    progress.stop();
+    await pools.hash.close();
     cacheDb.close();
   }
 }

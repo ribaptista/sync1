@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
-import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
@@ -20,15 +19,22 @@ import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { materializeGlob, type MaterializeStats } from "../fs/materialize.js";
+import { createConcurrencyPools } from "../concurrency/pools.js";
+import {
+  resolveConcurrencyOptions,
+  type GlobalConcurrencyOptions,
+} from "../cli/concurrency-options.js";
+import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
 
 interface MaterializeOptions extends OptionValues {
   root: string;
   requestRetrieval?: boolean;
 }
 
-interface GlobalOptions extends OptionValues {
+interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
+  progress?: boolean;
 }
 
 export function registerMaterializeCommand(program: Command): void {
@@ -41,10 +47,14 @@ export function registerMaterializeCommand(program: Command): void {
     .action(async (glob: string, opts: MaterializeOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
-      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "materialize" });
+      const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
+      const logger = createLoggerForRun({
+        verbose: globalOpts.verbose ?? false,
+        showProgress,
+      }).child({ command: "materialize" });
 
       try {
-        const stats = await runMaterialize(glob, opts, logger);
+        const stats = await runMaterialize(glob, opts, globalOpts, logger, showProgress);
         if (json) {
           emitJson({
             ok: true,
@@ -70,7 +80,9 @@ export function registerMaterializeCommand(program: Command): void {
 async function runMaterialize(
   glob: string,
   opts: MaterializeOptions,
-  logger: Logger,
+  globalOpts: GlobalOptions,
+  logger: import("../logger.js").Logger,
+  showProgress: boolean,
 ): Promise<MaterializeStats> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
@@ -89,10 +101,17 @@ async function runMaterialize(
 
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
   const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
+  const progress = startProgressSession({
+    show: showProgress,
+    overallLabel: "materializing",
+    overallUnit: "entries",
+  });
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
     const objectsRepo = new ObjectsRepository(stateDb);
+    progress.setOverallTotal(Math.max(cacheRepo.count(), 1));
     return await materializeGlob(
       root,
       glob,
@@ -102,8 +121,18 @@ async function runMaterialize(
       opts.requestRetrieval ?? false,
       { client, bucket: remoteConfig.bucket, location },
       logger,
+      pools.s3,
+      pools.s3.concurrency * 2,
+      pools.stream,
+      pools.stream.concurrency * 2,
+      (n) => {
+        progress.setOverallTotal(n);
+        progress.advanceOverall(1);
+      },
     );
   } finally {
+    progress.stop();
+    await pools.hash.close();
     cacheDb.close();
     stateDb.close();
   }
