@@ -179,16 +179,18 @@ function detectCaseCollisions(
     }
   }
 
-  // Bounded the same way the whole staging table already is (by what
-  // changed this run, not by tree size) -- materializing it here is not a
-  // new memory concern, just a second pass over an already-bounded set.
-  const allStaged = [...staging.iterateAll()];
-  const deletedInBatch = new Set(allStaged.filter((r) => r.state === "deleted").map((r) => r.path));
-
-  for (const row of allStaged) {
+  // Streamed, not materialized: this run's changeset can be as large as
+  // the whole tree (a first-ever scan), so neither the staged rows nor a
+  // "which paths are tombstoned this batch" set are held in memory --
+  // `isDeletedInBatch` queries the (disk-backed) staging table directly
+  // per row instead. Safe to run mid-stream because `staging.iterateAll()`
+  // is keyset-paginated: each page is fully fetched (connection free)
+  // before any of its rows are yielded, so this per-row query never runs
+  // while a cursor is paused.
+  for (const row of staging.iterateAll()) {
     if (row.state === "deleted" || excludedPaths.has(row.path)) continue;
     const hit = cacheRepo.findByNormalizedPath(toCollisionKey(row.path), row.path);
-    if (hit && !deletedInBatch.has(hit.path)) {
+    if (hit && !staging.isDeletedInBatch(hit.path)) {
       excludedPaths.add(row.path);
       collisions.push({ path: row.path, collidesWith: hit.path });
     }

@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import type { CacheEntryRow } from "./cache-entries-repository.js";
 import { toCollisionKey } from "../../fs/case-collision.js";
+import { paginateKeyset } from "../keyset-pagination.js";
 
 const SCHEMA = `
 CREATE TABLE pending (
@@ -52,12 +53,32 @@ export class StagingRepository {
       );
   }
 
+  /**
+   * Keyset-paginated (not `.iterate()`) by `path` (this table's own
+   * `PRIMARY KEY`) so the connection is free between pages -- needed
+   * because `detectCaseCollisions` (src/fs/update-cache.ts) runs another
+   * query (`isDeletedInBatch`) on this same connection for each yielded
+   * row, which a live `.iterate()` cursor would forbid. See
+   * src/db/keyset-pagination.ts.
+   */
   iterateAll(): IterableIterator<CacheEntryRow> {
-    return this.db
-      .prepare<[], CacheEntryRow>(
-        "SELECT path, type, mtime, hash, state, parent_state_version FROM pending",
-      )
-      .iterate();
+    return paginateKeyset<CacheEntryRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, number], CacheEntryRow>(
+            "SELECT path, type, mtime, hash, state, parent_state_version FROM pending WHERE path > ? ORDER BY path ASC LIMIT ?",
+          )
+          .all(after ?? "", limit),
+      (row) => row.path,
+    );
+  }
+
+  /** Whether `path` is staged as a tombstone ('deleted') in this same run's batch. */
+  isDeletedInBatch(path: string): boolean {
+    const row = this.db
+      .prepare<[string], { state: string }>("SELECT state FROM pending WHERE path = ?")
+      .get(path);
+    return row?.state === "deleted";
   }
 
   /** Normalized-path groups with more than one currently-live (non-'deleted') row in this same batch. */
