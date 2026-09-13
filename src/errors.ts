@@ -12,3 +12,16 @@ export class CorruptionError extends Error {
     this.name = "CorruptionError";
   }
 }
+
+/**
+ * Another sync1 process already holds the per-vault lock (`.sync1/lock`)
+ * for this root -- see src/vault/lock.ts. Conceptually the same class of
+ * thing as a CAS-detected remote divergence (another actor doing something
+ * incompatible), not a generic operational failure or a corruption.
+ */
+export class VaultLockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VaultLockedError";
+  }
+}

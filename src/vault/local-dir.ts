@@ -23,3 +23,7 @@ export function localVaultJsonPath(root: string): string {
 export function localRemoteConfigPath(root: string): string {
   return path.join(sync1Dir(root), "remote.json");
 }
+
+export function localLockPath(root: string): string {
+  return path.join(sync1Dir(root), "lock");
+}

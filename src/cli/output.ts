@@ -1,4 +1,4 @@
-import { CorruptionError } from "../errors.js";
+import { CorruptionError, VaultLockedError } from "../errors.js";
 
 /** All --json output goes to stdout as a single line; logs stay on stderr (see src/logger.ts). */
 export function emitJson(data: unknown): void {
@@ -18,6 +18,7 @@ export const EXIT_CORRUPTION = 3;
  */
 export function exitCodeForError(err: unknown): number | undefined {
   if (err instanceof CorruptionError) return EXIT_CORRUPTION;
+  if (err instanceof VaultLockedError) return EXIT_CONFLICT;
   return undefined;
 }
 
