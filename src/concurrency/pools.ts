@@ -35,32 +35,49 @@ export async function waitForRoom(pool: PQueue, limit: number): Promise<void> {
   }
 }
 
-// Same backpressure discipline for the piscina hash pool, which has no
-// onSizeLessThan equivalent: track submitted-but-not-yet-settled runs in a
-// bounded set, capped at `limit`, and await room before submitting more.
-export class BoundedHashRunner {
+/**
+ * Same backpressure discipline as `waitForRoom`, for a pool with no
+ * `onSizeLessThan`-style primitive of its own (the piscina hash pool, in
+ * particular): tracks dispatched-but-not-yet-settled tasks in a bounded set,
+ * capped at `limit`. `dispatch()` resolves once a task has been *started*
+ * (after waiting for room if needed), not once it *completes* -- that's what
+ * lets a producer (a merge-join loop, say) fire a task and immediately move
+ * on to the next item, while still never getting more than `limit` jobs
+ * ahead of what's actually running. `onIdle()` is the join step: it resolves
+ * once every dispatched task has settled, and rejects if any of them did.
+ */
+export class BoundedTaskTracker {
   private readonly inFlight = new Set<Promise<unknown>>();
+  private hasError = false;
+  private firstError: unknown;
 
-  constructor(
-    private readonly pool: Pick<Piscina, "run">,
-    private readonly limit: number,
-  ) {}
+  constructor(private readonly limit: number) {}
 
   get size(): number {
     return this.inFlight.size;
   }
 
-  async run(absolutePath: string): Promise<string> {
+  async dispatch(task: () => Promise<unknown>): Promise<void> {
     while (this.inFlight.size >= this.limit) {
       await Promise.race(this.inFlight);
     }
-    const promise = this.pool.run(absolutePath) as Promise<string>;
-    const tracked = promise.finally(() => this.inFlight.delete(tracked));
+    // Caught here, not left to reject `tracked` itself: a task can settle
+    // (and get removed from `inFlight`, below) well before anyone calls
+    // onIdle() to observe it, which would otherwise surface as an unhandled
+    // rejection -- the error is stashed and re-thrown from onIdle() instead.
+    const tracked: Promise<unknown> = task()
+      .catch((err: unknown) => {
+        if (!this.hasError) {
+          this.hasError = true;
+          this.firstError = err;
+        }
+      })
+      .finally(() => this.inFlight.delete(tracked));
     this.inFlight.add(tracked);
-    return promise;
   }
 
   async onIdle(): Promise<void> {
     await Promise.all(this.inFlight);
+    if (this.hasError) throw this.firstError;
   }
 }

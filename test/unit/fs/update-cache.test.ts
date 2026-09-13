@@ -7,7 +7,12 @@ import { CacheEntriesRepository } from "../../../src/db/repositories/cache-entri
 import { ObjectsRepository } from "../../../src/db/repositories/objects-repository.js";
 import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
 import { hashFile } from "../../../src/fs/hash-file.js";
-import { performUpdateCache, UnknownStubContentError } from "../../../src/fs/update-cache.js";
+import {
+  performUpdateCache,
+  UnknownStubContentError,
+  type UpdateCacheStats,
+} from "../../../src/fs/update-cache.js";
+import type { HashRunner } from "../../../src/concurrency/hash-runner.js";
 import { hashBufferHex } from "../../../src/crypto/hash.js";
 import { writeStubAtomic } from "../../../src/fs/stub.js";
 
@@ -23,11 +28,44 @@ const silentLogger = {
   warn: () => {},
 } as unknown as import("../../../src/logger.js").Logger;
 
+// The default HashRunner used by most tests below just delegates to the
+// (mockable) hashFile function -- this is what lets every test that only
+// cares about *whether/when* a file gets hashed, not the concurrency
+// mechanics themselves, keep asserting against `hashFileMock` exactly as
+// before. Dedicated concurrency-specific tests further down inject their own
+// fake HashRunner instead, per the plan's "never through a real Piscina pool
+// in tests" note.
+const defaultHashRunner: HashRunner = { run: (absolutePath) => hashFile(absolutePath) };
+const DEFAULT_MAX_IN_FLIGHT = 4;
+
 let root: string;
 let cacheDbPath: string;
 let cacheDbDir: string;
 let objectsRepo: ObjectsRepository;
 let ignorePoliciesRepo: IgnorePoliciesRepository;
+
+function run(
+  repo: CacheEntriesRepository,
+  options: {
+    version?: string;
+    onProgress?: (scanned: number) => void;
+    hashRunner?: HashRunner;
+    maxInFlightHashes?: number;
+  } = {},
+): Promise<UpdateCacheStats> {
+  return performUpdateCache(
+    root,
+    cacheDbPath,
+    repo,
+    objectsRepo,
+    ignorePoliciesRepo,
+    options.version ?? "v0",
+    silentLogger,
+    options.hashRunner ?? defaultHashRunner,
+    options.maxInFlightHashes ?? DEFAULT_MAX_IN_FLIGHT,
+    options.onProgress,
+  );
+}
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-update-cache-test-"));
@@ -73,15 +111,7 @@ describe("performUpdateCache", () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
 
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 1,
       modified: 0,
@@ -100,27 +130,11 @@ describe("performUpdateCache", () => {
   it("does not rehash a file whose mtime hasn't changed", async () => {
     touch("a.txt", "hello", 1_700_000_000_000);
     const repo = makeRepo();
-    await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    await run(repo);
     expect(hashFileMock).toHaveBeenCalledTimes(1);
 
     hashFileMock.mockClear();
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 0,
       modified: 0,
@@ -148,15 +162,7 @@ describe("performUpdateCache", () => {
     });
 
     touch("a.txt", "goodbye", 1_700_000_001_000);
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v1",
-      silentLogger,
-    );
+    const stats = await run(repo, { version: "v1" });
     expect(stats).toEqual({
       created: 0,
       modified: 1,
@@ -183,15 +189,7 @@ describe("performUpdateCache", () => {
     });
 
     touch("a.txt", "hello", 1_700_000_005_000); // mtime bumped, content identical
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 0,
       modified: 0,
@@ -207,26 +205,10 @@ describe("performUpdateCache", () => {
   it("detects a deleted file and clears its hash/mtime", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
-    await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    await run(repo);
 
     fs.rmSync(path.join(root, "a.txt"));
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 0,
       modified: 0,
@@ -244,35 +226,11 @@ describe("performUpdateCache", () => {
   it("is idempotent for an already-deleted tombstone", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
-    await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    await run(repo);
     fs.rmSync(path.join(root, "a.txt"));
-    await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    await run(repo);
 
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 0,
       modified: 0,
@@ -286,36 +244,12 @@ describe("performUpdateCache", () => {
   it("treats a file recreated at a previously-deleted path as a fresh creation", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
-    await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    await run(repo);
     fs.rmSync(path.join(root, "a.txt"));
-    await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    await run(repo);
 
     touch("a.txt", "brand new content");
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 1,
       modified: 0,
@@ -330,28 +264,12 @@ describe("performUpdateCache", () => {
   it("keeps the original baseline when a still-pending change is edited again", async () => {
     touch("a.txt", "hello", 1_700_000_000_000);
     const repo = makeRepo();
-    await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    ); // -> created, baseline v0
+    await run(repo); // -> created, baseline v0
 
     // a sync would normally happen here and bump last_synced_version, but
     // suppose the user edits the file again before running sync
     touch("a.txt", "hello again", 1_700_000_001_000);
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 1,
       modified: 0,
@@ -369,15 +287,7 @@ describe("performUpdateCache", () => {
     fs.mkdirSync(path.join(root, "photos"));
     touch("photos/img.jpg", "data");
     const repo = makeRepo();
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 2,
       modified: 0,
@@ -397,15 +307,7 @@ describe("performUpdateCache: ignore policies", () => {
     touch("scratch.tmp", "throwaway");
     const repo = makeRepo();
 
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 0,
       modified: 0,
@@ -423,15 +325,7 @@ describe("performUpdateCache: ignore policies", () => {
     touch("keep.txt", "hello");
     const repo = makeRepo();
 
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 1,
       modified: 0,
@@ -452,15 +346,7 @@ describe("performUpdateCache: stub files", () => {
     writeStubAtomic(path.join(root, "img.jpg.stub"), knownHash);
 
     const repo = makeRepo();
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 1,
       modified: 0,
@@ -478,34 +364,14 @@ describe("performUpdateCache: stub files", () => {
   it("rejects a stub with malformed content", async () => {
     fs.writeFileSync(path.join(root, "bad.jpg.stub"), "not-a-valid-tagged-hash");
     const repo = makeRepo();
-    await expect(
-      performUpdateCache(
-        root,
-        cacheDbPath,
-        repo,
-        objectsRepo,
-        ignorePoliciesRepo,
-        "v0",
-        silentLogger,
-      ),
-    ).rejects.toThrow(/corrupt stub/);
+    await expect(run(repo)).rejects.toThrow(/corrupt stub/);
   });
 
   it("rejects a stub whose declared hash isn't known to this vault", async () => {
     const unknownHash = "b".repeat(64);
     writeStubAtomic(path.join(root, "img.jpg.stub"), unknownHash);
     const repo = makeRepo();
-    await expect(
-      performUpdateCache(
-        root,
-        cacheDbPath,
-        repo,
-        objectsRepo,
-        ignorePoliciesRepo,
-        "v0",
-        silentLogger,
-      ),
-    ).rejects.toThrow(UnknownStubContentError);
+    await expect(run(repo)).rejects.toThrow(UnknownStubContentError);
   });
 
   it("auto-cleans a dangling stub when both it and the real file exist, treating the real file as canonical", async () => {
@@ -515,15 +381,7 @@ describe("performUpdateCache: stub files", () => {
     writeStubAtomic(path.join(root, "img.jpg.stub"), "c".repeat(64));
 
     const repo = makeRepo();
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 1,
       modified: 0,
@@ -553,15 +411,7 @@ describe("performUpdateCache: stub files", () => {
       parent_state_version: "v0",
     });
 
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats).toEqual({
       created: 0,
       modified: 0,
@@ -577,32 +427,14 @@ describe("performUpdateCache: staging file lifecycle", () => {
   it("leaves no staging file behind after a successful run", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
-    await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    await run(repo);
     expect(fs.readdirSync(cacheDbDir)).toEqual([]);
   });
 
   it("leaves no staging file behind after a run that throws", async () => {
     fs.writeFileSync(path.join(root, "bad.jpg.stub"), "not-a-valid-tagged-hash");
     const repo = makeRepo();
-    await expect(
-      performUpdateCache(
-        root,
-        cacheDbPath,
-        repo,
-        objectsRepo,
-        ignorePoliciesRepo,
-        "v0",
-        silentLogger,
-      ),
-    ).rejects.toThrow(/corrupt stub/);
+    await expect(run(repo)).rejects.toThrow(/corrupt stub/);
     expect(fs.readdirSync(cacheDbDir)).toEqual([]);
   });
 });
@@ -623,15 +455,7 @@ describe("performUpdateCache: case-insensitive collision detection", () => {
     });
     touch("FILE.txt", "hello");
 
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
     expect(stats.caseCollisions).toEqual([]);
     expect(repo.get("file.txt")?.state).toBe("deleted");
     expect(repo.get("FILE.txt")?.state).toBe("created");
@@ -643,15 +467,7 @@ describe("performUpdateCache: case-insensitive collision detection", () => {
     touch("other.txt", "unrelated");
     const repo = makeRepo();
 
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
 
     expect(stats.caseCollisions).toHaveLength(2);
     const collidingPaths = stats.caseCollisions.map((c) => c.path).sort();
@@ -681,18 +497,149 @@ describe("performUpdateCache: case-insensitive collision detection", () => {
     touch("FILE.txt", "new content"); // collides with the existing "file.txt" row
     touch("other.txt", "unrelated");
 
-    const stats = await performUpdateCache(
-      root,
-      cacheDbPath,
-      repo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      "v0",
-      silentLogger,
-    );
+    const stats = await run(repo);
 
     expect(stats.caseCollisions).toEqual([{ path: "FILE.txt", collidesWith: "file.txt" }]);
     expect(repo.get("FILE.txt")).toBeUndefined();
     expect(repo.get("other.txt")?.state).toBe("created");
+  });
+});
+
+describe("performUpdateCache: hash dispatch concurrency", () => {
+  // A controllable fake HashRunner -- never a real Piscina pool in a unit
+  // test (slow, and defeats the point of a fast unit suite). Tracks how many
+  // calls are concurrently unresolved, and lets the test resolve them in
+  // whatever order it chooses, to prove the final result doesn't depend on
+  // completion order.
+  function makeControllableHashRunner() {
+    let inFlight = 0;
+    let maxObservedInFlight = 0;
+    const pending: { absolutePath: string; resolve: (hash: string) => void }[] = [];
+
+    const hashRunner: HashRunner = {
+      run(absolutePath: string) {
+        inFlight++;
+        maxObservedInFlight = Math.max(maxObservedInFlight, inFlight);
+        return new Promise<string>((resolve) => {
+          pending.push({
+            absolutePath,
+            resolve: (hash) => {
+              inFlight--;
+              resolve(hash);
+            },
+          });
+        });
+      },
+    };
+
+    return {
+      hashRunner,
+      get maxObservedInFlight() {
+        return maxObservedInFlight;
+      },
+      get inFlight() {
+        return inFlight;
+      },
+      resolveOldestFirst(hashFor: (absolutePath: string) => string) {
+        const job = pending.shift();
+        if (!job) throw new Error("no pending hash job to resolve");
+        job.resolve(hashFor(job.absolutePath));
+      },
+      resolveNewestFirst(hashFor: (absolutePath: string) => string) {
+        const job = pending.pop();
+        if (!job) throw new Error("no pending hash job to resolve");
+        job.resolve(hashFor(job.absolutePath));
+      },
+      get pendingCount() {
+        return pending.length;
+      },
+    };
+  }
+
+  it("never dispatches more than maxInFlightHashes hash jobs at once", async () => {
+    for (let i = 0; i < 6; i++) touch(`f${i}.txt`, `content ${i}`);
+    const repo = makeRepo();
+    const controllable = makeControllableHashRunner();
+
+    const statsPromise = run(repo, {
+      hashRunner: controllable.hashRunner,
+      maxInFlightHashes: 2,
+    });
+    let settled = false;
+    void statsPromise.finally(() => {
+      settled = true;
+    });
+
+    // Confirm concurrency actually reaches the limit *before* resolving
+    // anything -- resolving too eagerly (the instant any job is seen
+    // pending) would race the second dispatch and artificially cap what
+    // this test can observe at 1, even though the real limit is 2.
+    await vi.waitFor(() => expect(controllable.pendingCount).toBe(2));
+    expect(controllable.maxObservedInFlight).toBe(2);
+
+    // From here, resolve one job per tick (a real macrotask yield, not
+    // `await Promise.resolve()` -- the merge-join loop's own filesystem walk
+    // is real async I/O, which needs an actual event-loop turn to progress)
+    // until the whole run settles. `settled`, not pendingCount, is the
+    // loop's exit condition -- the tail end of the batch legitimately has
+    // fewer than `limit` jobs pending at once, which would otherwise
+    // deadlock a pendingCount-based wait.
+    while (!settled) {
+      if (controllable.pendingCount > 0) {
+        controllable.resolveOldestFirst((absolutePath) => hashBufferHex(Buffer.from(absolutePath)));
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    const stats = await statsPromise;
+    expect(controllable.maxObservedInFlight).toBeLessThanOrEqual(2);
+    expect(stats.created).toBe(6);
+  });
+
+  it("produces correct, deterministic per-file results regardless of hash-job completion order", async () => {
+    touch("a.txt", "content a");
+    touch("b.txt", "content b");
+    touch("c.txt", "content c");
+    const repo = makeRepo();
+    const controllable = makeControllableHashRunner();
+
+    const statsPromise = run(repo, {
+      hashRunner: controllable.hashRunner,
+      maxInFlightHashes: 3,
+    });
+
+    // Let all three dispatch, then resolve them newest-first -- the exact
+    // reverse of dispatch order -- to prove per-file row correctness doesn't
+    // depend on completion order.
+    await vi.waitFor(() => expect(controllable.pendingCount).toBe(3));
+    while (controllable.pendingCount > 0) {
+      controllable.resolveNewestFirst((absolutePath) => hashBufferHex(Buffer.from(absolutePath)));
+    }
+
+    const stats = await statsPromise;
+    expect(stats.created).toBe(3);
+    for (const name of ["a.txt", "b.txt", "c.txt"]) {
+      const row = repo.get(name);
+      const absolutePath = path.join(root, name);
+      expect(row?.hash).toBe(hashBufferHex(Buffer.from(absolutePath)));
+    }
+  });
+
+  it("propagates a hash job's rejection as a real command failure", async () => {
+    touch("good.txt", "fine");
+    touch("bad.txt", "also fine on disk, but the hash runner will fail it");
+    const repo = makeRepo();
+    const hashRunner: HashRunner = {
+      run(absolutePath: string) {
+        if (absolutePath.endsWith("bad.txt")) {
+          return Promise.reject(new Error("simulated ENOENT"));
+        }
+        return hashFile(absolutePath);
+      },
+    };
+
+    await expect(run(repo, { hashRunner, maxInFlightHashes: 4 })).rejects.toThrow(
+      "simulated ENOENT",
+    );
   });
 });

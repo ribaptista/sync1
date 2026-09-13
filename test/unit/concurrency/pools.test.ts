@@ -17,7 +17,7 @@ vi.mock("piscina", () => ({
   }),
 }));
 
-const { createConcurrencyPools, waitForRoom, BoundedHashRunner } =
+const { createConcurrencyPools, waitForRoom, BoundedTaskTracker } =
   await import("../../../src/concurrency/pools.js");
 
 describe("createConcurrencyPools", () => {
@@ -66,53 +66,52 @@ describe("waitForRoom", () => {
   });
 });
 
-describe("BoundedHashRunner", () => {
-  it("never has more than `limit` runs in flight at once", async () => {
+describe("BoundedTaskTracker", () => {
+  it("never has more than `limit` tasks in flight, and dispatch() resolves on start, not completion", async () => {
     const releases: (() => void)[] = [];
-    const fakePool = {
-      run: vi.fn(
-        () =>
-          new Promise<string>((resolve) => {
-            releases.push(() => resolve("hash"));
-          }),
-      ),
-    };
-    const runner = new BoundedHashRunner(fakePool, 2);
+    const taskFn = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          releases.push(() => resolve("done"));
+        }),
+    );
+    const tracker = new BoundedTaskTracker(2);
 
-    const p1 = runner.run("/a");
-    const p2 = runner.run("/b");
-    await Promise.resolve();
-    expect(runner.size).toBe(2);
+    await tracker.dispatch(taskFn);
+    await tracker.dispatch(taskFn);
+    expect(tracker.size).toBe(2);
+    expect(taskFn).toHaveBeenCalledTimes(2);
 
     let thirdDispatched = false;
-    const p3 = runner.run("/c").then((r) => {
+    const dispatchingThird = tracker.dispatch(taskFn).then(() => {
       thirdDispatched = true;
-      return r;
     });
     await Promise.resolve();
-    expect(fakePool.run).toHaveBeenCalledTimes(2);
+    expect(taskFn).toHaveBeenCalledTimes(2); // still waiting for room
     expect(thirdDispatched).toBe(false);
 
     releases[0]!();
-    await p1;
-    // Only after "/a" settles does room open up for "/c" to actually dispatch.
-    await vi.waitFor(() => expect(fakePool.run).toHaveBeenCalledTimes(3));
-    expect(thirdDispatched).toBe(false);
-
-    releases[2]!();
-    await p3;
+    // Only after the first task settles does room open up for the third to dispatch.
+    await dispatchingThird;
     expect(thirdDispatched).toBe(true);
+    expect(taskFn).toHaveBeenCalledTimes(3);
 
     releases[1]!();
-    await p2;
+    releases[2]!();
+    await tracker.onIdle();
   });
 
-  it("onIdle resolves only once every dispatched run has settled", async () => {
-    const fakePool = { run: vi.fn(() => Promise.resolve("hash")) };
-    const runner = new BoundedHashRunner(fakePool, 4);
-    await runner.run("/a");
-    await runner.run("/b");
-    await expect(runner.onIdle()).resolves.toBeUndefined();
-    expect(runner.size).toBe(0);
+  it("onIdle resolves only once every dispatched task has settled", async () => {
+    const tracker = new BoundedTaskTracker(4);
+    await tracker.dispatch(() => Promise.resolve("a"));
+    await tracker.dispatch(() => Promise.resolve("b"));
+    await expect(tracker.onIdle()).resolves.toBeUndefined();
+    expect(tracker.size).toBe(0);
+  });
+
+  it("onIdle propagates a rejection from any dispatched task", async () => {
+    const tracker = new BoundedTaskTracker(4);
+    await tracker.dispatch(() => Promise.reject(new Error("hash failed: ENOENT")));
+    await expect(tracker.onIdle()).rejects.toThrow("hash failed: ENOENT");
   });
 });

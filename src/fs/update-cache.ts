@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../logger.js";
 import { walk, type WalkEntry } from "./walker.js";
-import { hashFile } from "./hash-file.js";
 import { readStubHash, stubPathFor, StubFormatError } from "./stub.js";
 import { CorruptionError } from "../errors.js";
 import { tempSiblingPath } from "./temp-path.js";
@@ -15,6 +14,8 @@ import { StagingRepository } from "../db/repositories/staging-repository.js";
 import { toCollisionKey } from "./case-collision.js";
 import { matchesAnyGlob } from "./glob-match.js";
 import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
+import { BoundedTaskTracker } from "../concurrency/pools.js";
+import type { HashRunner } from "../concurrency/hash-runner.js";
 
 export interface CaseCollision {
   path: string;
@@ -46,12 +47,29 @@ export class UnknownStubContentError extends CorruptionError {
  * cache-and-filesystem-scanning.md for the full state-machine writeup, and
  * docs/architecture/stub-files.md for how stub-backed paths are resolved.
  *
- * Writes are deferred to a second pass after the comparison loop finishes:
- * better-sqlite3 refuses to run another statement on the same connection
- * while a `.iterate()` cursor is still open, so `cacheRepo.upsert()` can't
- * be called mid-loop. The array of pending writes is bounded by how much
- * actually *changed*, not by the size of the tree — a scan over a huge,
- * mostly-untouched library still only buffers a handful of rows.
+ * A real/dangling-stub file needing a content hash is *dispatched* to
+ * `hashRunner` rather than awaited inline: the merge-join loop advances to
+ * the next path immediately, while up to `maxInFlightHashes` hash jobs run
+ * concurrently in the background (see src/concurrency/pools.ts's
+ * BoundedTaskTracker for the backpressure discipline this relies on — the
+ * merge-join loop is the producer, and it never gets more than that many
+ * jobs ahead of what the hash pool can actually run). Each job's own
+ * completion builds its row and inserts it into the staging table directly
+ * — see below for why that table's role doesn't change here.
+ *
+ * Writes are deferred to a second pass after the comparison loop (and every
+ * dispatched hash job) finishes: better-sqlite3 refuses to run another
+ * statement on the same connection while a `.iterate()` cursor is still
+ * open, so `cacheRepo.upsert()` can't be called mid-loop. But that's not
+ * actually why staging exists — case-collision detection needs to see the
+ * *whole* batch before any row is safely committed (a row later found to
+ * collide must never have been written at all), so the deferred-write role
+ * would be required even without that connection constraint. The staging
+ * table itself is bounded by how much actually *changed*, not by the size
+ * of the tree — a scan over a huge, mostly-untouched library still only
+ * buffers a handful of rows — and is itself keyset-paginated when read back
+ * (src/db/repositories/staging-repository.ts), so it's never materialized
+ * into memory either.
  */
 export async function performUpdateCache(
   root: string,
@@ -61,6 +79,8 @@ export async function performUpdateCache(
   ignorePoliciesRepo: IgnorePoliciesRepository,
   lastSyncedVersion: string,
   logger: Logger,
+  hashRunner: HashRunner,
+  maxInFlightHashes: number,
   onProgress?: (scanned: number) => void,
 ): Promise<UpdateCacheStats> {
   const stats: UpdateCacheStats = {
@@ -81,6 +101,7 @@ export async function performUpdateCache(
 
   const stagingPath = tempSiblingPath(cacheDbPath, "update-cache-staging");
   const staging = new StagingRepository(stagingPath);
+  const hashJobs = new BoundedTaskTracker(maxInFlightHashes);
 
   try {
     const fsIter = walk(root);
@@ -103,8 +124,16 @@ export async function performUpdateCache(
             "path matches an ignore policy -- skipping",
           );
         } else {
-          staging.insert(
-            await buildCreatedRow(fsEntry, root, lastSyncedVersion, objectsRepo, stats, logger),
+          await dispatchCreatedRow(
+            fsEntry,
+            root,
+            lastSyncedVersion,
+            objectsRepo,
+            stats,
+            logger,
+            hashRunner,
+            hashJobs,
+            staging,
           );
         }
         fsNext = await fsIter.next();
@@ -113,7 +142,7 @@ export async function performUpdateCache(
         if (row) staging.insert(row);
         cacheNext = cacheIter.next();
       } else if (fsEntry !== null && cacheEntry !== null) {
-        const row = await buildExistingRow(
+        await dispatchExistingRow(
           fsEntry,
           cacheEntry,
           root,
@@ -121,8 +150,10 @@ export async function performUpdateCache(
           objectsRepo,
           stats,
           logger,
+          hashRunner,
+          hashJobs,
+          staging,
         );
-        if (row) staging.insert(row);
         fsNext = await fsIter.next();
         cacheNext = cacheIter.next();
       }
@@ -130,6 +161,10 @@ export async function performUpdateCache(
       scanned++;
       onProgress?.(scanned);
     }
+
+    // Every dispatched hash job must have inserted its row (or thrown) before
+    // case-collision detection can trust the staging table's contents.
+    await hashJobs.onIdle();
 
     const { excludedPaths, collisions } = detectCaseCollisions(staging, cacheRepo);
     stats.caseCollisions = collisions;
@@ -199,35 +234,33 @@ function detectCaseCollisions(
   return { excludedPaths, collisions };
 }
 
-interface ResolvedContent {
-  hash: string | null;
-  mtime: number;
-}
+type ContentResolution =
+  { kind: "resolved"; hash: string | null } | { kind: "needs-hash"; absolutePath: string };
 
 /**
- * Resolves a walked file/dir entry to its logical (hash, mtime), handling
- * all three representations uniformly so the create/modify/delete decision
- * logic below never needs to know which one it's looking at:
- *  - "real": hash the actual bytes, as always.
+ * Synchronously classifies a walked file/dir entry, handling all three
+ * representations uniformly:
+ *  - "real": needs an actual content hash -- dispatched to hashRunner by the
+ *    caller, never computed here.
  *  - "stub": read the stub's self-declared hash -- never hash the stub's
  *    own (contentless) bytes -- and validate it against known objects, so
  *    a stub can never silently reference content this vault has never
- *    actually backed up.
+ *    actually backed up. Resolved immediately, no hash job needed.
  *  - "both" (a dangling stub next to its now-materialized real file, e.g.
- *    from an interrupted `materialize`): the real file always wins: hash
- *    it normally, and clean up the stray stub as a side effect so this
- *    doesn't keep resurfacing on every future scan.
+ *    from an interrupted `materialize`): the real file always wins: clean
+ *    up the stray stub as a side effect (so this doesn't keep resurfacing
+ *    on every future scan), then needs a hash of the real file like any
+ *    other real file.
  */
-async function resolveFileContent(
+function classifyContent(
   fsEntry: WalkEntry,
   root: string,
   objectsRepo: ObjectsRepository,
   logger: Logger,
-): Promise<ResolvedContent> {
+): ContentResolution {
   const absolutePath = path.join(root, fsEntry.path);
-  const mtime = Math.round(fsEntry.mtimeMs);
 
-  if (fsEntry.type === "dir") return { hash: null, mtime };
+  if (fsEntry.type === "dir") return { kind: "resolved", hash: null };
 
   if (fsEntry.representation === "both") {
     const stubAbsolutePath = stubPathFor(absolutePath);
@@ -240,7 +273,7 @@ async function resolveFileContent(
     } catch {
       // already gone by the time we got here -- fine
     }
-    return { hash: await hashFile(absolutePath), mtime };
+    return { kind: "needs-hash", absolutePath };
   }
 
   if (fsEntry.representation === "stub") {
@@ -256,31 +289,67 @@ async function resolveFileContent(
     if (!objectsRepo.has(hash)) {
       throw new UnknownStubContentError(fsEntry.path, hash);
     }
-    return { hash, mtime };
+    return { kind: "resolved", hash };
   }
 
-  return { hash: await hashFile(absolutePath), mtime };
+  return { kind: "needs-hash", absolutePath };
 }
 
-async function buildCreatedRow(
+/**
+ * Dispatches one file's hash job through `hashJobs`, logging its dispatch
+ * and completion with the pool's current occupancy -- this is what lets an
+ * e2e test observe real concurrency (via --verbose's structured stderr
+ * output) rather than only final correctness, which can't distinguish a
+ * correctly-bounded pool from an accidentally-sequential one.
+ */
+async function dispatchHash(
+  hashJobs: BoundedTaskTracker,
+  hashRunner: HashRunner,
+  absolutePath: string,
+  logger: Logger,
+  onResolved: (hash: string) => void,
+): Promise<void> {
+  await hashJobs.dispatch(async () => {
+    const hash = await hashRunner.run(absolutePath);
+    onResolved(hash);
+    logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
+  });
+  logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
+}
+
+async function dispatchCreatedRow(
   fsEntry: WalkEntry,
   root: string,
   lastSyncedVersion: string,
   objectsRepo: ObjectsRepository,
   stats: UpdateCacheStats,
   logger: Logger,
-): Promise<CacheEntryRow> {
-  const { hash, mtime } = await resolveFileContent(fsEntry, root, objectsRepo, logger);
-  stats.created++;
-  logger.debug({ path: fsEntry.path, type: fsEntry.type }, "new path detected");
-  return {
-    path: fsEntry.path,
-    type: fsEntry.type,
-    mtime,
-    hash,
-    state: "created",
-    parent_state_version: lastSyncedVersion,
+  hashRunner: HashRunner,
+  hashJobs: BoundedTaskTracker,
+  staging: StagingRepository,
+): Promise<void> {
+  const mtime = Math.round(fsEntry.mtimeMs);
+  const resolution = classifyContent(fsEntry, root, objectsRepo, logger);
+
+  const finalize = (hash: string | null): void => {
+    stats.created++;
+    logger.debug({ path: fsEntry.path, type: fsEntry.type }, "new path detected");
+    staging.insert({
+      path: fsEntry.path,
+      type: fsEntry.type,
+      mtime,
+      hash,
+      state: "created",
+      parent_state_version: lastSyncedVersion,
+    });
   };
+
+  if (resolution.kind === "resolved") {
+    finalize(resolution.hash);
+    return;
+  }
+
+  await dispatchHash(hashJobs, hashRunner, resolution.absolutePath, logger, finalize);
 }
 
 function buildMissingFromFsRow(
@@ -305,7 +374,7 @@ function buildMissingFromFsRow(
   };
 }
 
-async function buildExistingRow(
+async function dispatchExistingRow(
   fsEntry: WalkEntry,
   cacheEntry: CacheEntryRow,
   root: string,
@@ -313,7 +382,10 @@ async function buildExistingRow(
   objectsRepo: ObjectsRepository,
   stats: UpdateCacheStats,
   logger: Logger,
-): Promise<CacheEntryRow | null> {
+  hashRunner: HashRunner,
+  hashJobs: BoundedTaskTracker,
+  staging: StagingRepository,
+): Promise<void> {
   const newMtime = Math.round(fsEntry.mtimeMs);
 
   if (fsEntry.type === "dir") {
@@ -324,17 +396,18 @@ async function buildExistingRow(
     if (cacheEntry.state === "deleted") {
       stats.created++;
       logger.debug({ path: fsEntry.path }, "directory recreated after deletion");
-      return {
+      staging.insert({
         path: fsEntry.path,
         type: "dir",
         mtime: newMtime,
         hash: null,
         state: "created",
         parent_state_version: lastSyncedVersion,
-      };
+      });
+      return;
     }
     stats.unchanged++;
-    return null;
+    return;
   }
 
   // A dangling stub is always worth resolving (and cleaning up) even if
@@ -348,37 +421,48 @@ async function buildExistingRow(
   // re-read, and a steady-state stub is never re-validated, on every scan.
   if (!danglingStub && cacheEntry.mtime === newMtime) {
     stats.unchanged++;
-    return null;
+    return;
   }
 
-  const { hash: newHash } = await resolveFileContent(fsEntry, root, objectsRepo, logger);
+  const resolution = classifyContent(fsEntry, root, objectsRepo, logger);
 
-  if (newHash === cacheEntry.hash) {
-    // mtime noise only (e.g. a bare touch, or a cleaned-up dangling stub
-    // that referenced the same content) -- refresh the baseline mtime, no
-    // real content change, so don't disturb whatever state it already had
-    stats.unchanged++;
-    return { ...cacheEntry, mtime: newMtime };
+  const finalize = (newHash: string | null): void => {
+    if (newHash === cacheEntry.hash) {
+      // mtime noise only (e.g. a bare touch, or a cleaned-up dangling stub
+      // that referenced the same content) -- refresh the baseline mtime, no
+      // real content change, so don't disturb whatever state it already had
+      stats.unchanged++;
+      staging.insert({ ...cacheEntry, mtime: newMtime });
+      return;
+    }
+
+    logger.debug({ path: fsEntry.path, oldHash: cacheEntry.hash, newHash }, "file content changed");
+
+    if (cacheEntry.state === "unchanged" || cacheEntry.state === "deleted") {
+      // establishing a brand-new pending change: fresh baseline
+      const newState = cacheEntry.state === "deleted" ? "created" : "modified";
+      stats[newState]++;
+      staging.insert({
+        path: fsEntry.path,
+        type: "file",
+        mtime: newMtime,
+        hash: newHash,
+        state: newState,
+        parent_state_version: lastSyncedVersion,
+      });
+      return;
+    }
+
+    // already pending (created/modified): content changed again before
+    // syncing -- keep the original baseline, just refresh hash/mtime
+    stats[cacheEntry.state]++;
+    staging.insert({ ...cacheEntry, mtime: newMtime, hash: newHash });
+  };
+
+  if (resolution.kind === "resolved") {
+    finalize(resolution.hash);
+    return;
   }
 
-  logger.debug({ path: fsEntry.path, oldHash: cacheEntry.hash, newHash }, "file content changed");
-
-  if (cacheEntry.state === "unchanged" || cacheEntry.state === "deleted") {
-    // establishing a brand-new pending change: fresh baseline
-    const newState = cacheEntry.state === "deleted" ? "created" : "modified";
-    stats[newState]++;
-    return {
-      path: fsEntry.path,
-      type: "file",
-      mtime: newMtime,
-      hash: newHash,
-      state: newState,
-      parent_state_version: lastSyncedVersion,
-    };
-  }
-
-  // already pending (created/modified): content changed again before
-  // syncing -- keep the original baseline, just refresh hash/mtime
-  stats[cacheEntry.state]++;
-  return { ...cacheEntry, mtime: newMtime, hash: newHash };
+  await dispatchHash(hashJobs, hashRunner, resolution.absolutePath, logger, finalize);
 }

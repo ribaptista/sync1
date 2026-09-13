@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
-import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
 import {
   sync1Dir,
@@ -15,14 +14,21 @@ import { CacheEntriesRepository } from "../db/repositories/cache-entries-reposit
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { performUpdateCache, type UpdateCacheStats } from "../fs/update-cache.js";
+import { createConcurrencyPools } from "../concurrency/pools.js";
+import {
+  resolveConcurrencyOptions,
+  type GlobalConcurrencyOptions,
+} from "../cli/concurrency-options.js";
+import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
 
 interface UpdateCacheOptions extends OptionValues {
   root: string;
 }
 
-interface GlobalOptions extends OptionValues {
+interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
+  progress?: boolean;
 }
 
 export function registerUpdateCacheCommand(program: Command): void {
@@ -33,10 +39,14 @@ export function registerUpdateCacheCommand(program: Command): void {
     .action(async (opts: UpdateCacheOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
-      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "update_cache" });
+      const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
+      const logger = createLoggerForRun({
+        verbose: globalOpts.verbose ?? false,
+        showProgress,
+      }).child({ command: "update_cache" });
 
       try {
-        const stats = await runUpdateCache(opts, logger, json);
+        const stats = await runUpdateCache(opts, globalOpts, logger, showProgress);
         const ok = stats.caseCollisions.length === 0;
         if (json) {
           emitJson({
@@ -72,8 +82,9 @@ export function registerUpdateCacheCommand(program: Command): void {
 
 async function runUpdateCache(
   opts: UpdateCacheOptions,
-  logger: Logger,
-  json: boolean,
+  globalOpts: GlobalOptions,
+  logger: import("../logger.js").Logger,
+  showProgress: boolean,
 ): Promise<UpdateCacheStats> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
@@ -91,31 +102,35 @@ async function runUpdateCache(
   const objectsRepo = new ObjectsRepository(stateDb);
   const ignorePoliciesRepo = new IgnorePoliciesRepository(stateDb);
 
-  let bar: import("cli-progress").SingleBar | undefined;
-  if (!json) {
-    const { SingleBar, Presets } = await import("cli-progress");
-    bar = new SingleBar({ format: "scanning |{bar}| {value} entries" }, Presets.shades_classic);
-    bar.start(Math.max(cacheRepo.count(), 1), 0);
+  const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
+  const progress = startProgressSession({
+    show: showProgress,
+    overallLabel: "scanning",
+    overallUnit: "entries",
+  });
+  progress.setOverallTotal(Math.max(cacheRepo.count(), 1));
+
+  try {
+    const stats = await performUpdateCache(
+      root,
+      localCacheDbPath(root),
+      cacheRepo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      lastSyncedVersion,
+      logger,
+      pools.hash,
+      pools.hash.maxThreads,
+      (n) => {
+        progress.setOverallTotal(n);
+        progress.advanceOverall(1);
+      },
+    );
+    return stats;
+  } finally {
+    progress.stop();
+    await pools.hash.close();
+    db.close();
+    stateDb.close();
   }
-
-  const stats = await performUpdateCache(
-    root,
-    localCacheDbPath(root),
-    cacheRepo,
-    objectsRepo,
-    ignorePoliciesRepo,
-    lastSyncedVersion,
-    logger,
-    (n) => {
-      if (bar) {
-        if (n > bar.getTotal()) bar.setTotal(n);
-        bar.update(n);
-      }
-    },
-  );
-
-  bar?.stop();
-  db.close();
-  stateDb.close();
-  return stats;
 }

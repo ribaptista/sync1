@@ -12,6 +12,8 @@ export interface WalkEntry {
   representation: WalkRepresentation;
   /** mtime of the canonical representation: the real file/dir when present, else the stub */
   mtimeMs: number;
+  /** size of the canonical representation, from the same stat() call -- used for progress bars' cumulative-bytes metric */
+  size: number;
 }
 
 const STUB_SUFFIX = ".stub";
@@ -111,7 +113,13 @@ async function* walkDir(
 
     if (item.isDir) {
       const stats = await fsp.stat(absolutePath);
-      yield { path: relativePath, type: "dir", representation: "real", mtimeMs: stats.mtimeMs };
+      yield {
+        path: relativePath,
+        type: "dir",
+        representation: "real",
+        mtimeMs: stats.mtimeMs,
+        size: stats.size,
+      };
       continue;
     }
 
@@ -126,6 +134,7 @@ async function* walkDir(
         type: "file",
         representation: info.hasStub ? "both" : "real",
         mtimeMs: stats.mtimeMs,
+        size: stats.size,
       };
     } else {
       const stubStats = await fsp.stat(`${absolutePath}${STUB_SUFFIX}`);
@@ -134,6 +143,7 @@ async function* walkDir(
         type: "file",
         representation: "stub",
         mtimeMs: stubStats.mtimeMs,
+        size: stubStats.size,
       };
     }
   }
