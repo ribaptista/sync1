@@ -5,6 +5,7 @@ export interface GlobalConcurrencyOptions extends OptionValues {
   s3MetadataParallelism?: string;
   hashParallelism?: string;
   fileStreamParallelism?: string;
+  thumbnailParallelism?: string;
 }
 
 function parsePositiveInt(raw: string, flagName: string): number {
@@ -31,6 +32,12 @@ export function resolveConcurrencyOptions(opts: GlobalConcurrencyOptions): Concu
     resolved.fileStreamParallelism = parsePositiveInt(
       opts.fileStreamParallelism,
       "--file-stream-parallelism",
+    );
+  }
+  if (opts.thumbnailParallelism !== undefined) {
+    resolved.thumbnailParallelism = parsePositiveInt(
+      opts.thumbnailParallelism,
+      "--thumbnail-parallelism",
     );
   }
   return resolved;

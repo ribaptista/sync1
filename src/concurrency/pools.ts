@@ -7,12 +7,14 @@ export interface ConcurrencyPools {
   s3: PQueue;
   hash: Piscina;
   stream: PQueue;
+  thumbnail: PQueue;
 }
 
 export interface ConcurrencyPoolOptions {
   s3MetadataParallelism?: number;
   hashParallelism?: number;
   fileStreamParallelism?: number;
+  thumbnailParallelism?: number;
 }
 
 export function createConcurrencyPools(opts: ConcurrencyPoolOptions): ConcurrencyPools {
@@ -23,6 +25,7 @@ export function createConcurrencyPools(opts: ConcurrencyPoolOptions): Concurrenc
       maxThreads: opts.hashParallelism ?? os.cpus().length,
     }),
     stream: new PQueue({ concurrency: opts.fileStreamParallelism ?? 4 }),
+    thumbnail: new PQueue({ concurrency: opts.thumbnailParallelism ?? 4 }),
   };
 }
 

@@ -76,6 +76,10 @@ program
     "--file-stream-parallelism <n>",
     "max concurrent encrypt+upload / download+decrypt pipelines -- default 4",
   )
+  .option(
+    "--thumbnail-parallelism <n>",
+    "max concurrent thumbnail/mosaic generation jobs -- default 4",
+  )
   .option("--no-progress", "disable progress bars even on a real terminal");
 
 registerInitRemoteCommand(program);

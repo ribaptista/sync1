@@ -12,14 +12,21 @@ describe("resolveConcurrencyOptions", () => {
         s3MetadataParallelism: "2",
         hashParallelism: "16",
         fileStreamParallelism: "3",
+        thumbnailParallelism: "6",
       }),
-    ).toEqual({ s3MetadataParallelism: 2, hashParallelism: 16, fileStreamParallelism: 3 });
+    ).toEqual({
+      s3MetadataParallelism: 2,
+      hashParallelism: 16,
+      fileStreamParallelism: 3,
+      thumbnailParallelism: 6,
+    });
   });
 
   it.each([
     ["s3MetadataParallelism", "--s3-metadata-parallelism"],
     ["hashParallelism", "--hash-parallelism"],
     ["fileStreamParallelism", "--file-stream-parallelism"],
+    ["thumbnailParallelism", "--thumbnail-parallelism"],
   ] as const)("rejects a non-integer value for %s", (key, flagName) => {
     expect(() => resolveConcurrencyOptions({ [key]: "abc" })).toThrow(flagName);
   });

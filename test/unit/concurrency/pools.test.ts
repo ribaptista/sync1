@@ -21,10 +21,11 @@ const { createConcurrencyPools, waitForRoom, BoundedTaskTracker } =
   await import("../../../src/concurrency/pools.js");
 
 describe("createConcurrencyPools", () => {
-  it("defaults s3 and stream concurrency, and hash maxThreads, when no options given", () => {
+  it("defaults s3, stream, and thumbnail concurrency, and hash maxThreads, when no options given", () => {
     const pools = createConcurrencyPools({});
     expect(pools.s3.concurrency).toBe(8);
     expect(pools.stream.concurrency).toBe(4);
+    expect(pools.thumbnail.concurrency).toBe(4);
     expect(pools.hash.maxThreads).toBe(os.cpus().length);
   });
 
@@ -33,9 +34,11 @@ describe("createConcurrencyPools", () => {
       s3MetadataParallelism: 2,
       fileStreamParallelism: 3,
       hashParallelism: 5,
+      thumbnailParallelism: 6,
     });
     expect(pools.s3.concurrency).toBe(2);
     expect(pools.stream.concurrency).toBe(3);
+    expect(pools.thumbnail.concurrency).toBe(6);
     expect(pools.hash.maxThreads).toBe(5);
   });
 });
