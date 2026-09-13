@@ -12,6 +12,7 @@ import {
   type StorageClass,
   type Tier,
 } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
 
 export interface S3ClientOptions {
   /** Required-but-nullable rather than optional: sidesteps exactOptionalPropertyTypes
@@ -91,12 +92,26 @@ export async function putObject(
 }
 
 /**
+ * Below this size, a plain single-shot PutObject is strictly better (one
+ * request, no part-numbering/completion overhead) -- matches S3's own
+ * sweet-spot guidance. Comfortably above `Upload`'s enforced 5 MiB minimum
+ * part size (so an object just over the threshold isn't needlessly split
+ * into many tiny parts) and comfortably below the point where a failed
+ * single-PUT retry becomes expensive on a flaky connection.
+ */
+export const MULTIPART_THRESHOLD_BYTES = 32 * 1024 * 1024;
+
+/**
  * Streaming counterpart to `putObject` -- content-object uploads have no
  * CAS/conditional semantics to preserve (dedup is already checked before any
- * upload is attempted), so a plain PutObjectCommand with a precomputed
- * `contentLength` (the chunked codec's fixed per-chunk overhead makes this
- * exact, computed upfront by the caller via `encryptedSize`) is enough --
- * no multipart upload machinery needed.
+ * upload is attempted). Below `MULTIPART_THRESHOLD_BYTES`, a plain
+ * PutObjectCommand with a precomputed `contentLength` (the chunked codec's
+ * fixed per-chunk overhead makes this exact, computed upfront by the
+ * caller via `encryptedSize`) is enough. At or above it, S3's ~5GiB
+ * single-PUT limit means a real backup file (this vault exists specifically
+ * to hold multi-GB/100GB files) needs multipart upload -- `@aws-sdk/
+ * lib-storage`'s `Upload` class accepts the same streamed body directly (no
+ * local temp-file staging) and manages the part uploads internally.
  */
 export async function putObjectStream(
   client: S3Client,
@@ -105,9 +120,18 @@ export async function putObjectStream(
   body: Readable,
   contentLength: number,
 ): Promise<void> {
-  await client.send(
-    new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentLength: contentLength }),
-  );
+  if (contentLength < MULTIPART_THRESHOLD_BYTES) {
+    await client.send(
+      new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentLength: contentLength }),
+    );
+    return;
+  }
+
+  const upload = new Upload({
+    client,
+    params: { Bucket: bucket, Key: key, Body: body },
+  });
+  await upload.done();
 }
 
 export async function getObject(
