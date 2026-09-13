@@ -15,6 +15,7 @@ import { registerIgnoreCommand } from "./commands/ignore.js";
 import { registerSanityCheckCommand } from "./commands/sanity_check.js";
 import { registerStoragePolicyCommand } from "./commands/storage_policy.js";
 import { registerThumbnailPolicyCommand } from "./commands/thumbnail_policy.js";
+import { registerThumbnailCommand } from "./commands/thumbnail.js";
 import { registerStatusCommand } from "./commands/status.js";
 import { registerConvergeCommand } from "./commands/converge.js";
 import { acquireLock, forceReleaseActiveLockSync, type LockHandle } from "./vault/lock.js";
@@ -95,6 +96,7 @@ registerIgnoreCommand(program);
 registerSanityCheckCommand(program);
 registerStoragePolicyCommand(program);
 registerThumbnailPolicyCommand(program);
+registerThumbnailCommand(program);
 registerStatusCommand(program);
 registerConvergeCommand(program);
 // Further commands are registered here as they're implemented, task by task.
