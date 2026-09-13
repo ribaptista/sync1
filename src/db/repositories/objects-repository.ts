@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { paginateKeyset } from "../keyset-pagination.js";
 
 export interface ObjectRow {
   hash: string;
@@ -93,9 +94,22 @@ export class ObjectsRepository {
     this.db.exec("DELETE FROM objects WHERE hash IN (SELECT hash FROM gc_pending_deletes)");
   }
 
+  /**
+   * Keyset-paginated (not `.iterate()`) -- `gc --apply`'s delete loop feeds
+   * this into a bounded concurrency pool, so nothing may hold this
+   * connection's statement open across concurrent work. `hash` is
+   * `gc_pending_deletes`' own `PRIMARY KEY`, already indexed. See
+   * src/db/keyset-pagination.ts.
+   */
   iterateStagedOrphans(): IterableIterator<ObjectRow> {
-    return this.db
-      .prepare<[], ObjectRow>("SELECT hash, s3_key, size FROM gc_pending_deletes")
-      .iterate();
+    return paginateKeyset<ObjectRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, number], ObjectRow>(
+            "SELECT hash, s3_key, size FROM gc_pending_deletes WHERE hash > ? ORDER BY hash ASC LIMIT ?",
+          )
+          .all(after ?? "", limit),
+      (row) => row.hash,
+    );
   }
 }

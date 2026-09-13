@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { toCollisionKey } from "../../fs/case-collision.js";
+import { paginateKeyset } from "../keyset-pagination.js";
 
 export type EntryType = "file" | "dir";
 
@@ -43,10 +44,23 @@ export class EntriesRepository {
     this.db.prepare<[string]>("DELETE FROM entries WHERE path = ?").run(path);
   }
 
+  /**
+   * Keyset-paginated (not `.iterate()`): a live cursor would hold this
+   * connection's statement open between `.next()` calls, forbidding any
+   * other statement on it -- exactly the constraint AGENTS.md's pagination
+   * rule exists to avoid. `path` is `entries`' own `PRIMARY KEY`, already
+   * indexed. See src/db/keyset-pagination.ts.
+   */
   iterateAllSortedByPath(): IterableIterator<EntryRow> {
-    return this.db
-      .prepare<[], EntryRow>(`SELECT ${ROW_COLUMNS} FROM entries ORDER BY path ASC`)
-      .iterate();
+    return paginateKeyset<EntryRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, number], EntryRow>(
+            `SELECT ${ROW_COLUMNS} FROM entries WHERE path > ? ORDER BY path ASC LIMIT ?`,
+          )
+          .all(after ?? "", limit),
+      (row) => row.path,
+    );
   }
 
   iterateByHash(hash: string): IterableIterator<EntryRow> {
@@ -55,13 +69,17 @@ export class EntriesRepository {
       .iterate(hash);
   }
 
-  /** SQLite's native GLOB operator against `path` -- used by `inspect`. */
+  /** SQLite's native GLOB operator against `path` -- used by `inspect`. Keyset-paginated, same reasoning as iterateAllSortedByPath. */
   iterateByGlobSortedByPath(pattern: string): IterableIterator<EntryRow> {
-    return this.db
-      .prepare<[string], EntryRow>(
-        `SELECT ${ROW_COLUMNS} FROM entries WHERE path GLOB ? ORDER BY path ASC`,
-      )
-      .iterate(pattern);
+    return paginateKeyset<EntryRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, string, number], EntryRow>(
+            `SELECT ${ROW_COLUMNS} FROM entries WHERE path GLOB ? AND path > ? ORDER BY path ASC LIMIT ?`,
+          )
+          .all(pattern, after ?? "", limit),
+      (row) => row.path,
+    );
   }
 
   /** Every hash currently referenced by a live entry — the GC "keep" set. */
@@ -76,13 +94,21 @@ export class EntriesRepository {
    * excluded, since they have no hash/storage class). One row per
    * *content*, not per path, since operations like `status`/`converge`
    * act on the underlying object, which may be referenced by several paths.
+   * Keyset-paginated by `hash` (uses `idx_entries_hash`) -- not a
+   * correctness hazard today (the nested `iterateByHash` read this feeds
+   * stays synchronous throughout, see converge-storage-policies.ts),
+   * converted for consistency with the rest of this codebase's queries.
    */
   iterateDistinctHashesMatchingGlob(pattern: string): IterableIterator<HashRow> {
-    return this.db
-      .prepare<[string], HashRow>(
-        "SELECT DISTINCT hash FROM entries WHERE hash IS NOT NULL AND path GLOB ?",
-      )
-      .iterate(pattern);
+    return paginateKeyset<HashRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, string, number], HashRow>(
+            "SELECT DISTINCT hash FROM entries WHERE hash IS NOT NULL AND path GLOB ? AND hash > ? ORDER BY hash ASC LIMIT ?",
+          )
+          .all(pattern, after ?? "", limit),
+      (row) => row.hash,
+    );
   }
 
   /**

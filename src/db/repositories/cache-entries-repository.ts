@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { EntryType } from "./entries-repository.js";
 import { toCollisionKey } from "../../fs/case-collision.js";
+import { paginateKeyset } from "../keyset-pagination.js";
 
 export type CacheState = "created" | "modified" | "deleted" | "unchanged";
 
@@ -51,40 +52,75 @@ export class CacheEntriesRepository {
     this.db.prepare<[string]>("DELETE FROM entries WHERE path = ?").run(path);
   }
 
+  /** Keyset-paginated (not `.iterate()`) -- see src/db/keyset-pagination.ts. `path` is `entries`' own `PRIMARY KEY`, already indexed. */
   iterateAllSortedByPath(): IterableIterator<CacheEntryRow> {
-    return this.db
-      .prepare<[], CacheEntryRow>(`SELECT ${ROW_COLUMNS} FROM entries ORDER BY path ASC`)
-      .iterate();
+    return paginateKeyset<CacheEntryRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, number], CacheEntryRow>(
+            `SELECT ${ROW_COLUMNS} FROM entries WHERE path > ? ORDER BY path ASC LIMIT ?`,
+          )
+          .all(after ?? "", limit),
+      (row) => row.path,
+    );
   }
 
   /**
-   * Uses the partial idx_cache_state index — rows with pending local
-   * changes. Ordered so every 'deleted' row comes before any
-   * 'created'/'modified' row (then by path within each group) — this
-   * matters for a same-machine rename (update_cache always resolves it as
-   * an independent delete+create, since there's no rename primitive
-   * anywhere in this system): folding the delete half into the candidate
-   * before the create half is checked means a case-insensitive collision
-   * check never sees the old path as still "live" merely because it hasn't
-   * been processed yet. Without this, whether a rename happened to trigger
-   * a false collision would depend on which way the casing changed sorted
-   * alphabetically — see docs/architecture/cross-platform-filesystem.md.
+   * Every 'deleted' row before any 'created'/'modified' row (then by path
+   * within each group) — this matters for a same-machine rename
+   * (update_cache always resolves it as an independent delete+create,
+   * since there's no rename primitive anywhere in this system): folding
+   * the delete half into the candidate before the create half is checked
+   * means a case-insensitive collision check never sees the old path as
+   * still "live" merely because it hasn't been processed yet. Without
+   * this, whether a rename happened to trigger a false collision would
+   * depend on which way the casing changed sorted alphabetically — see
+   * docs/architecture/cross-platform-filesystem.md.
+   *
+   * Implemented as two concatenated single-column keyset-paginated
+   * queries (deleted-by-path, then the rest-by-path) rather than a
+   * row-value keyset comparison on the compound sort key — simpler, and
+   * preserves the exact same "deleted group entirely before the rest"
+   * guarantee. Both use the composite idx_cache_state_path index (state,
+   * path), which covers this filter+ordering exactly.
    */
   iterateDirty(): IterableIterator<CacheEntryRow> {
-    return this.db
-      .prepare<[], CacheEntryRow>(
-        `SELECT ${ROW_COLUMNS} FROM entries WHERE state != 'unchanged' ORDER BY (state != 'deleted'), path ASC`,
-      )
-      .iterate();
+    const deleted = paginateKeyset<CacheEntryRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, number], CacheEntryRow>(
+            `SELECT ${ROW_COLUMNS} FROM entries WHERE state = 'deleted' AND path > ? ORDER BY path ASC LIMIT ?`,
+          )
+          .all(after ?? "", limit),
+      (row) => row.path,
+    );
+    const rest = paginateKeyset<CacheEntryRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, number], CacheEntryRow>(
+            `SELECT ${ROW_COLUMNS} FROM entries WHERE state != 'unchanged' AND state != 'deleted' AND path > ? ORDER BY path ASC LIMIT ?`,
+          )
+          .all(after ?? "", limit),
+      (row) => row.path,
+    );
+    function* concatenated(): Generator<CacheEntryRow> {
+      yield* deleted;
+      yield* rest;
+    }
+    return concatenated();
   }
 
-  /** SQLite's native GLOB operator against `path` -- used by materialize/stubify. */
+  /** SQLite's native GLOB operator against `path` -- used by materialize/stubify. Keyset-paginated, same reasoning as iterateAllSortedByPath. */
   iterateByGlobSortedByPath(pattern: string): IterableIterator<CacheEntryRow> {
-    return this.db
-      .prepare<[string], CacheEntryRow>(
-        `SELECT ${ROW_COLUMNS} FROM entries WHERE path GLOB ? ORDER BY path ASC`,
-      )
-      .iterate(pattern);
+    return paginateKeyset<CacheEntryRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, string, number], CacheEntryRow>(
+            `SELECT ${ROW_COLUMNS} FROM entries WHERE path GLOB ? AND path > ? ORDER BY path ASC LIMIT ?`,
+          )
+          .all(pattern, after ?? "", limit),
+      (row) => row.path,
+    );
   }
 
   /**

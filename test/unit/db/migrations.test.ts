@@ -81,4 +81,17 @@ describe("migration runner", () => {
       "idx_entries_state_version",
     ]);
   });
+
+  it("creates the indexes named in cache.db's schema (idx_cache_state replaced by a composite)", () => {
+    const db = new Database(":memory:");
+    runMigrations(db, CACHE_MIGRATIONS_DIR);
+    const indexes = db
+      .prepare<[], { name: string }>(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'",
+      )
+      .all()
+      .map((r) => r.name)
+      .sort();
+    expect(indexes).toEqual(["idx_cache_normalized_path", "idx_cache_state_path"]);
+  });
 });
