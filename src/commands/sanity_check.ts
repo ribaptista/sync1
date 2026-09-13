@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
-import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
 import { createS3Client, headObject } from "../s3/client.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
@@ -12,15 +11,22 @@ import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { performSanityCheck, type SanityCheckResult } from "../fs/sanity-check.js";
+import { createConcurrencyPools } from "../concurrency/pools.js";
+import {
+  resolveConcurrencyOptions,
+  type GlobalConcurrencyOptions,
+} from "../cli/concurrency-options.js";
+import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
 
 interface SanityCheckOptions extends OptionValues {
   root: string;
   filter?: string;
 }
 
-interface GlobalOptions extends OptionValues {
+interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
+  progress?: boolean;
 }
 
 function problemCount(result: SanityCheckResult): number {
@@ -45,10 +51,14 @@ export function registerSanityCheckCommand(program: Command): void {
     .action(async (opts: SanityCheckOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
-      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "sanity_check" });
+      const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
+      const logger = createLoggerForRun({
+        verbose: globalOpts.verbose ?? false,
+        showProgress,
+      }).child({ command: "sanity_check" });
 
       try {
-        const result = await runSanityCheck(opts, logger);
+        const result = await runSanityCheck(opts, globalOpts, logger, showProgress);
         const problems = problemCount(result);
         const ok = problems === 0;
 
@@ -116,7 +126,9 @@ export function registerSanityCheckCommand(program: Command): void {
 
 async function runSanityCheck(
   opts: SanityCheckOptions,
-  logger: Logger,
+  globalOpts: GlobalOptions,
+  logger: import("../logger.js").Logger,
+  showProgress: boolean,
 ): Promise<SanityCheckResult> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
@@ -135,6 +147,12 @@ async function runSanityCheck(
   // ignorePoliciesRepo can safely be queried mid-loop on the same
   // connection now, unlike when this held a real cursor open throughout.
   const db = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
+  const progress = startProgressSession({
+    show: showProgress,
+    overallLabel: "checking",
+    overallUnit: "entries",
+  });
 
   try {
     const entriesRepo = new EntriesRepository(db);
@@ -153,9 +171,19 @@ async function runSanityCheck(
       ignorePoliciesRepo,
       objectExists,
       logger,
+      pools.hash,
+      pools.hash.maxThreads,
+      pools.s3,
+      pools.s3.concurrency * 2,
       opts.filter,
+      (n) => {
+        progress.setOverallTotal(n);
+        progress.advanceOverall(1);
+      },
     );
   } finally {
+    progress.stop();
+    await pools.hash.close();
     db.close();
   }
 }
