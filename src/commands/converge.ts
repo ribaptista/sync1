@@ -1,22 +1,28 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Command, OptionValues } from "commander";
-import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { createS3Client } from "../s3/client.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
 import { sync1Dir, localRemoteConfigPath } from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { convergeStoragePolicies, type ConvergeResult } from "../sync/converge-storage-policies.js";
+import { createConcurrencyPools } from "../concurrency/pools.js";
+import {
+  resolveConcurrencyOptions,
+  type GlobalConcurrencyOptions,
+} from "../cli/concurrency-options.js";
+import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
 
 interface ConvergeOptions extends OptionValues {
   root: string;
   filter?: string;
 }
 
-interface GlobalOptions extends OptionValues {
+interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
+  progress?: boolean;
 }
 
 export function registerConvergeCommand(program: Command): void {
@@ -30,10 +36,14 @@ export function registerConvergeCommand(program: Command): void {
     .action(async (opts: ConvergeOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
-      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "converge" });
+      const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
+      const logger = createLoggerForRun({
+        verbose: globalOpts.verbose ?? false,
+        showProgress,
+      }).child({ command: "converge" });
 
       try {
-        const result = await runConverge(opts, logger);
+        const result = await runConverge(opts, globalOpts, logger, showProgress);
         if (json) {
           emitJson({
             ok: true,
@@ -71,7 +81,12 @@ export function registerConvergeCommand(program: Command): void {
     });
 }
 
-async function runConverge(opts: ConvergeOptions, logger: Logger): Promise<ConvergeResult> {
+async function runConverge(
+  opts: ConvergeOptions,
+  globalOpts: GlobalOptions,
+  logger: import("../logger.js").Logger,
+  showProgress: boolean,
+): Promise<ConvergeResult> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
   if (!fs.existsSync(sync1DirPath)) {
@@ -84,11 +99,29 @@ async function runConverge(opts: ConvergeOptions, logger: Logger): Promise<Conve
   const prefix = normalizePrefix(remoteConfig.prefix);
   const location: RemoteLocation = { bucket: remoteConfig.bucket, prefix };
 
-  return convergeStoragePolicies(
-    root,
-    filter,
-    true,
-    { client, bucket: remoteConfig.bucket, location },
-    logger,
-  );
+  const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
+  const progress = startProgressSession({
+    show: showProgress,
+    overallLabel: "converging",
+    overallUnit: "objects",
+  });
+
+  try {
+    return await convergeStoragePolicies(
+      root,
+      filter,
+      true,
+      { client, bucket: remoteConfig.bucket, location },
+      logger,
+      pools.s3,
+      pools.s3.concurrency * 2,
+      (n) => {
+        progress.setOverallTotal(n);
+        progress.advanceOverall(1);
+      },
+    );
+  } finally {
+    progress.stop();
+    await pools.hash.close();
+  }
 }

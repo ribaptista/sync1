@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import type PQueue from "p-queue";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
 import { headObject, copyObjectStorageClass, restoreObject } from "../s3/client.js";
@@ -15,6 +16,7 @@ import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { StoragePoliciesRepository } from "../db/repositories/storage-policies-repository.js";
 import { CorruptionError } from "../errors.js";
+import { waitForRoom } from "../concurrency/pools.js";
 
 // Not exposed as flags -- a reasonable default balance of cost/latency for
 // the temporary restore window.
@@ -47,6 +49,15 @@ export interface ConvergeResult {
  * decided action is actually issued to S3. Read-only against state.db
  * either way (HEAD/copy/restore don't decrypt anything, and policies are
  * read from the already-locally-decrypted state.db); no password needed.
+ *
+ * The outer loop's own work (resolving every path sharing a hash, warmest-
+ * wins conflict detection, the objects-table lookup) is synchronous SQL and
+ * stays that way -- it never spans an await, so nothing here needs
+ * pagination-style care. Only the tail per hash -- HEAD, classify, and the
+ * conditional copy/restore -- is genuine network I/O, and is *dispatched*
+ * to `s3Pool` rather than awaited inline: the outer loop advances to the
+ * next hash immediately, with up to `s3QueueLimit` such tails in flight at
+ * once, joined via `s3Pool.onIdle()` before this returns.
  */
 export async function convergeStoragePolicies(
   root: string,
@@ -54,6 +65,9 @@ export async function convergeStoragePolicies(
   apply: boolean,
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
+  s3Pool: PQueue,
+  s3QueueLimit: number,
+  onProgress?: (scanned: number) => void,
 ): Promise<ConvergeResult> {
   const db = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
   const counts: ConvergeCounts = {
@@ -77,7 +91,10 @@ export async function convergeStoragePolicies(
     // resolved from *every* path referencing it (below), regardless of
     // --filter scope, since warmest-wins has to see the whole picture.
     // See docs/architecture/ignore-and-storage-policies.md.
+    let scanned = 0;
     for (const { hash } of entriesRepo.iterateDistinctHashesMatchingGlob(filter)) {
+      scanned++;
+      onProgress?.(scanned);
       const paths = [...entriesRepo.iterateByHash(hash)].map((e) => e.path);
       const { targetClass, conflicted } = resolveHashTargetClass(
         paths,
@@ -93,48 +110,56 @@ export async function convergeStoragePolicies(
         );
       }
       const key = remoteKey(s3.location, objectRow.s3_key);
-      const head = await headObject(s3.client, s3.bucket, key);
-      if (!head) {
-        throw new CorruptionError(`object ${hash} is missing in S3 at "${key}" (corrupt vault?)`);
-      }
-      const currentClass = head.storageClass ?? "STANDARD";
-      if (!isSupportedStorageClass(currentClass)) {
-        throw new Error(`object ${hash} has an unsupported storage class "${currentClass}"`);
-      }
 
-      const archiveStatus = classifyArchiveStatus(head);
-      const action = decideStorageClassAction(currentClass, targetClass, archiveStatus);
-      logger.debug(
-        { hash, currentClass, targetClass, archiveStatus, action: action.kind, apply },
-        "classified object against storage policy",
-      );
+      await waitForRoom(s3Pool, s3QueueLimit);
+      void s3Pool.add(async () => {
+        const head = await headObject(s3.client, s3.bucket, key);
+        if (!head) {
+          throw new CorruptionError(`object ${hash} is missing in S3 at "${key}" (corrupt vault?)`);
+        }
+        const currentClass = head.storageClass ?? "STANDARD";
+        if (!isSupportedStorageClass(currentClass)) {
+          throw new Error(`object ${hash} has an unsupported storage class "${currentClass}"`);
+        }
 
-      switch (action.kind) {
-        case "already-correct":
-          counts.alreadyCorrect++;
-          break;
-        case "immediate-copy":
-          counts.changedImmediate++;
-          if (apply) await copyObjectStorageClass(s3.client, s3.bucket, key, targetClass);
-          break;
-        case "needs-restore-request":
-          counts.restoreRequested++;
-          if (apply) {
-            await restoreObject(s3.client, s3.bucket, key, {
-              days: RESTORE_DAYS,
-              tier: RESTORE_TIER,
-            });
-          }
-          break;
-        case "restore-ongoing":
-          counts.restorePending++;
-          break;
-        case "finalize-copy":
-          counts.finalized++;
-          if (apply) await copyObjectStorageClass(s3.client, s3.bucket, key, targetClass);
-          break;
-      }
+        const archiveStatus = classifyArchiveStatus(head);
+        const action = decideStorageClassAction(currentClass, targetClass, archiveStatus);
+        logger.debug(
+          { hash, currentClass, targetClass, archiveStatus, action: action.kind, apply },
+          "classified object against storage policy",
+        );
+
+        switch (action.kind) {
+          case "already-correct":
+            counts.alreadyCorrect++;
+            break;
+          case "immediate-copy":
+            counts.changedImmediate++;
+            if (apply) await copyObjectStorageClass(s3.client, s3.bucket, key, targetClass);
+            break;
+          case "needs-restore-request":
+            counts.restoreRequested++;
+            if (apply) {
+              await restoreObject(s3.client, s3.bucket, key, {
+                days: RESTORE_DAYS,
+                tier: RESTORE_TIER,
+              });
+            }
+            break;
+          case "restore-ongoing":
+            counts.restorePending++;
+            break;
+          case "finalize-copy":
+            counts.finalized++;
+            if (apply) await copyObjectStorageClass(s3.client, s3.bucket, key, targetClass);
+            break;
+        }
+        logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "completed");
+      });
+      logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "dispatched");
     }
+
+    await s3Pool.onIdle();
   } finally {
     db.close();
   }

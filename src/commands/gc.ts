@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Command, OptionValues } from "commander";
-import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
@@ -10,15 +9,22 @@ import { parseRemoteConfig } from "../vault/remote-config.js";
 import { sync1Dir, localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { performGc, type GcResult } from "../sync/gc.js";
+import { createConcurrencyPools } from "../concurrency/pools.js";
+import {
+  resolveConcurrencyOptions,
+  type GlobalConcurrencyOptions,
+} from "../cli/concurrency-options.js";
+import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
 
 interface GcOptions extends OptionValues {
   root: string;
   apply?: boolean;
 }
 
-interface GlobalOptions extends OptionValues {
+interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
+  progress?: boolean;
 }
 
 export function registerGcCommand(program: Command): void {
@@ -30,10 +36,14 @@ export function registerGcCommand(program: Command): void {
     .action(async (opts: GcOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
-      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "gc" });
+      const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
+      const logger = createLoggerForRun({
+        verbose: globalOpts.verbose ?? false,
+        showProgress,
+      }).child({ command: "gc" });
 
       try {
-        const result = await runGc(opts, logger);
+        const result = await runGc(opts, globalOpts, logger);
         if (json) {
           emitJson({
             ok: true,
@@ -55,7 +65,11 @@ export function registerGcCommand(program: Command): void {
     });
 }
 
-async function runGc(opts: GcOptions, logger: Logger): Promise<GcResult> {
+async function runGc(
+  opts: GcOptions,
+  globalOpts: GlobalOptions,
+  logger: import("../logger.js").Logger,
+): Promise<GcResult> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
   if (!fs.existsSync(sync1DirPath)) {
@@ -71,11 +85,34 @@ async function runGc(opts: GcOptions, logger: Logger): Promise<GcResult> {
   const prefix = normalizePrefix(remoteConfig.prefix);
   const location: RemoteLocation = { bucket: remoteConfig.bucket, prefix };
 
-  return performGc(
-    root,
-    masterKey,
-    { client, bucket: remoteConfig.bucket, location },
-    opts.apply ?? false,
-    logger,
-  );
+  const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
+  const showProgress = shouldShowProgress({
+    json: globalOpts.json ?? false,
+    progress: globalOpts.progress ?? true,
+  });
+  const progress = startProgressSession({
+    show: showProgress && (opts.apply ?? false),
+    overallLabel: "removing orphans",
+    overallUnit: "objects",
+  });
+
+  try {
+    return await performGc(
+      root,
+      masterKey,
+      { client, bucket: remoteConfig.bucket, location },
+      opts.apply ?? false,
+      logger,
+      pools.s3,
+      pools.s3.concurrency * 2,
+      undefined,
+      (n) => {
+        progress.setOverallTotal(n);
+        progress.advanceOverall(1);
+      },
+    );
+  } finally {
+    progress.stop();
+    await pools.hash.close();
+  }
 }

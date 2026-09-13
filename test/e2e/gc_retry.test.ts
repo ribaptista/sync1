@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ListObjectsV2Command, HeadObjectCommand } from "@aws-sdk/client-s3";
+import PQueue from "p-queue";
 import {
   startLocalStack,
   createTestS3Client,
@@ -107,6 +108,8 @@ describe("gc: CAS-conflict retry", () => {
       { client, bucket: remoteConfig.bucket, location },
       true,
       logger,
+      new PQueue({ concurrency: 8 }),
+      16,
       async () => {
         if (competingCommitDone) return; // only race on the first attempt
         competingCommitDone = true;
