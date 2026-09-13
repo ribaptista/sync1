@@ -7,15 +7,16 @@ of just counting it — `status` is the count-only, always-safe-to-run half.
 ## Usage
 
 ```bash
-sync1 status --root <local-path> [--filter <glob>] [--json]
+sync1 status --root <local-path> [--filter <glob>] [--json] [--s3-metadata-parallelism <n>]
 ```
 
 ## Options
 
-| Flag              | Required | Description                                                                                          |
-| ----------------- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `--root <path>`   | yes      | Local directory whose vault to inspect.                                                              |
-| `--filter <glob>` | no       | SQLite `GLOB` pattern scoping which tracked paths' objects are considered (default `*`, everything). |
+| Flag                            | Required | Description                                                                                          |
+| ------------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `--root <path>`                 | yes      | Local directory whose vault to inspect.                                                              |
+| `--filter <glob>`               | no       | SQLite `GLOB` pattern scoping which tracked paths' objects are considered (default `*`, everything). |
+| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` calls, one dispatched per distinct hash. Default 8.                            |
 
 No password needed — `HEAD` requests don't decrypt anything, and policies are read from the
 already-locally-decrypted `state.db`.
@@ -34,6 +35,9 @@ For every distinct object (hash) with at least one path matching `--filter`:
    comparison into one of five categories: already correct, needs an immediate copy (colder target),
    needs a restore request issued, a restore already in progress, or a restore that's ready to finalize
    with a copy.
+
+Step 1-2 (per-hash evaluation) is synchronous SQL; only the `HEAD` in step 3 is dispatched to a pool —
+see [concurrency-and-progress.md](../architecture/concurrency-and-progress.md).
 
 ## Output
 

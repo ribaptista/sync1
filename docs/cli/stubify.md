@@ -6,15 +6,16 @@ for content you don't need materialized right now. The counterpart to `materiali
 ## Usage
 
 ```bash
-sync1 stubify <glob> --root <local-path> [--json] [--verbose]
+sync1 stubify <glob> --root <local-path> [--json] [--verbose] [--hash-parallelism <n>]
 ```
 
 ## Arguments and options
 
-| Argument/Flag   | Required | Description                                          |
-| --------------- | -------- | ---------------------------------------------------- |
-| `<glob>`        | yes      | SQLite `GLOB` pattern matched against tracked paths. |
-| `--root <path>` | yes      | Local directory to operate on.                       |
+| Argument/Flag            | Required | Description                                                                                           |
+| ------------------------ | -------- | ----------------------------------------------------------------------------------------------------- |
+| `<glob>`                 | yes      | SQLite `GLOB` pattern matched against tracked paths.                                                  |
+| `--root <path>`          | yes      | Local directory to operate on.                                                                        |
+| `--hash-parallelism <n>` | no       | Max concurrent rehashing worker threads, only used for paths whose mtime changed. Default: CPU count. |
 
 No password needed — this never touches encrypted content, it only replaces local bytes with a stub
 referencing an already-known hash.
@@ -26,7 +27,10 @@ actual current content still matches what was last synced. To avoid rehashing po
 every call, the mtime check from `update_cache` is reused: if the file's mtime still matches the
 recorded baseline, the recorded hash is trusted; if it doesn't, the file is rehashed and the result must
 still match before proceeding. Either check failing means the file is skipped (not stubbed) with a
-reason — this is what stops `stubify` from silently discarding an edit that was never synced.
+reason — this is what stops `stubify` from silently discarding an edit that was never synced. A needed
+rehash dispatches to a worker-thread pool rather than blocking the scan (see
+[concurrency-and-progress.md](../architecture/concurrency-and-progress.md)); the common case (mtime
+unchanged) never touches it at all.
 
 ## Crash safety
 

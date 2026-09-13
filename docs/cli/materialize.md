@@ -6,18 +6,22 @@ you get real content back after a stub-only restore (`attach_remote` + `sync`).
 ## Usage
 
 ```bash
-sync1 materialize <glob> --root <local-path> [--request-retrieval] [--json] [--verbose]
+sync1 materialize <glob> --root <local-path> [--request-retrieval] [--json] [--verbose] [--s3-metadata-parallelism <n>] [--file-stream-parallelism <n>]
 ```
 
 ## Arguments and options
 
-| Argument/Flag         | Required | Description                                                                                                                                                           |
-| --------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<glob>`              | yes      | SQLite `GLOB` pattern matched against tracked paths (e.g. `photos/2024/*`).                                                                                           |
-| `--root <path>`       | yes      | Local directory to operate on.                                                                                                                                        |
-| `--request-retrieval` | no       | Request a temporary S3 restore for matched content that's currently archived (`GLACIER`/`DEEP_ARCHIVE`). Without it, archived content is just counted, not requested. |
+| Argument/Flag                   | Required | Description                                                                                                                                                           |
+| ------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<glob>`                        | yes      | SQLite `GLOB` pattern matched against tracked paths (e.g. `photos/2024/*`).                                                                                           |
+| `--root <path>`                 | yes      | Local directory to operate on.                                                                                                                                        |
+| `--request-retrieval`           | no       | Request a temporary S3 restore for matched content that's currently archived (`GLACIER`/`DEEP_ARCHIVE`). Without it, archived content is just counted, not requested. |
+| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` archive-status checks. Default 8.                                                                                                               |
+| `--file-stream-parallelism <n>` | no       | Max concurrent download+decrypt+verify+rename pipelines. Default 4.                                                                                                   |
 
-The vault password is required (materializing decrypts content).
+The vault password is required (materializing decrypts content). A matched stub's `HEAD` check and its
+eventual download each dispatch to their own pool — see
+[concurrency-and-progress.md](../architecture/concurrency-and-progress.md).
 
 ## What it does
 

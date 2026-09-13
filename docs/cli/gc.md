@@ -8,15 +8,16 @@ implies for old, retained `/states/<version>` snapshots.
 ## Usage
 
 ```bash
-sync1 gc --root <local-path> [--apply] [--json] [--verbose]
+sync1 gc --root <local-path> [--apply] [--json] [--verbose] [--s3-metadata-parallelism <n>]
 ```
 
 ## Options
 
-| Flag            | Required | Description                                                                        |
-| --------------- | -------- | ---------------------------------------------------------------------------------- |
-| `--root <path>` | yes      | Local directory whose vault to clean up.                                           |
-| `--apply`       | no       | Actually delete orphaned objects. Without it, only counts what _would_ be removed. |
+| Flag                            | Required | Description                                                                        |
+| ------------------------------- | -------- | ---------------------------------------------------------------------------------- |
+| `--root <path>`                 | yes      | Local directory whose vault to clean up.                                           |
+| `--apply`                       | no       | Actually delete orphaned objects. Without it, only counts what _would_ be removed. |
+| `--s3-metadata-parallelism <n>` | no       | With `--apply`, max concurrent `DeleteObject` calls. Default 8.                    |
 
 The vault password is required (gc reads and re-encrypts state.db).
 
@@ -28,9 +29,10 @@ The vault password is required (gc reads and re-encrypts state.db).
 3. In count-only mode (the default), just reports the numbers.
 4. With `--apply`: removes the orphaned rows from a candidate copy of state.db, commits it via the same
    CAS-guarded `/current` write `sync` uses, and only **after** that commit succeeds does it delete the
-   actual S3 object bytes — this ordering means a crash between committing the metadata change and
-   deleting the bytes just leaves harmless orphaned bytes for the next `gc` run to catch, never a
-   dangling reference to bytes that no longer exist.
+   actual S3 object bytes (dispatched concurrently, see
+   [concurrency-and-progress.md](../architecture/concurrency-and-progress.md)) — this ordering means a
+   crash between committing the metadata change and deleting the bytes just leaves harmless orphaned
+   bytes for the next `gc` run to catch, never a dangling reference to bytes that no longer exist.
 5. If another commit lands between gc's read of `/current` and its own CAS attempt, gc automatically
    refetches and recomputes rather than failing — unlike `sync`'s conflicts, removing orphans is a pure
    recomputation with no human judgment involved, so retrying on its own is safe. (Bounded to 5 attempts

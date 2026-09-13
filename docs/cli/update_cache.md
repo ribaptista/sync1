@@ -10,14 +10,20 @@ what's changed without pushing anything.
 ## Usage
 
 ```bash
-sync1 update_cache --root <local-path> [--json] [--verbose]
+sync1 update_cache --root <local-path> [--json] [--verbose] [--hash-parallelism <n>] [--no-progress]
 ```
 
 ## Options
 
-| Flag            | Required | Description                                                                                         |
-| --------------- | -------- | --------------------------------------------------------------------------------------------------- |
-| `--root <path>` | yes      | Local directory to scan. Must already be initialized (`init_remote`) or attached (`attach_remote`). |
+| Flag                     | Required | Description                                                                                         |
+| ------------------------ | -------- | --------------------------------------------------------------------------------------------------- |
+| `--root <path>`          | yes      | Local directory to scan. Must already be initialized (`init_remote`) or attached (`attach_remote`). |
+| `--hash-parallelism <n>` | no       | Max concurrent file-hashing worker threads. Default: CPU count.                                     |
+
+Hashing runs on real worker threads (see
+[concurrency-and-progress.md](../architecture/concurrency-and-progress.md)), since it's the one
+CPU-bound, embarrassingly-parallel-across-files step in the scan; everything else in the merge-join
+stays on the main thread.
 
 ## What it does
 

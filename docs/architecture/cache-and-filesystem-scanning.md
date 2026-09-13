@@ -42,14 +42,24 @@ case above as a regression test.
 
 ## Why writes are deferred to a second pass
 
-`better-sqlite3` refuses to run another statement on a connection while a `.iterate()` cursor from
-that same connection is still open — so `cacheRepo.upsert()` can't be called in the middle of the
-merge-join loop while `iterateAllSortedByPath()`'s cursor is active. `performUpdateCache` handles this
-by building up a small array of pending row writes during the (read-only) comparison loop, and only
-applying them via `cacheRepo.upsert()` after that loop finishes and the cursor is exhausted. This still
-honors "don't load the full dataset into memory" in the sense that matters: the pending-writes array is
-bounded by how much actually _changed_, not by the size of the tree — scanning a huge, mostly-untouched
-library still only buffers a handful of rows, not the whole cache.db table.
+Both sides of the merge-join (`iterateAllSortedByPath()` on the walker's output and on `cache.db`) are
+**keyset-paginated** (`src/db/keyset-pagination.ts`), not a live `.iterate()` cursor — each page is a
+plain `.all()` that runs to completion and frees the connection before any of its rows are yielded, so
+a write (`cacheRepo.upsert()`) could actually interleave safely with the comparison loop as far as
+`better-sqlite3` is concerned (a write only ever conflicts with _another_ statement's cursor left
+_paused_ mid-generator, which pagination never does — see
+[concurrency-and-progress.md](concurrency-and-progress.md) for the precise, empirically-verified
+constraint).
+
+Writes are still staged into a temp table and applied in a second pass regardless, but for a different
+reason: case-collision detection (see
+[cross-platform-filesystem.md](cross-platform-filesystem.md)) needs to see the **whole** decided batch
+before any row is safely committed to `cache.db` — a row later found to collide must never have been
+written at all, and undoing an already-written row by deleting it would be wrong for a _modified_ row
+specifically (it would erase pre-existing content rather than reverting to it). The staging table
+itself is bounded by how much actually _changed_, not by the size of the tree, and is itself
+keyset-paginated when read back — a scan over a huge, mostly-untouched library still only buffers a
+handful of rows, never the whole `cache.db` table.
 
 ## Directories carry no content
 

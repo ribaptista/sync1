@@ -12,15 +12,21 @@ matching fits in.
 ## Usage
 
 ```bash
-sync1 sanity_check --root <local-path> [--filter <glob>] [--json]
+sync1 sanity_check --root <local-path> [--filter <glob>] [--json] [--hash-parallelism <n>] [--s3-metadata-parallelism <n>]
 ```
 
 ## Options
 
-| Flag              | Required | Description                                                               |
-| ----------------- | -------- | ------------------------------------------------------------------------- |
-| `--root <path>`   | yes      | Local directory to check. Must already be initialized or attached.        |
-| `--filter <glob>` | no       | SQLite `GLOB` pattern scoping which tracked/untracked paths are reported. |
+| Flag                            | Required | Description                                                               |
+| ------------------------------- | -------- | ------------------------------------------------------------------------- |
+| `--root <path>`                 | yes      | Local directory to check. Must already be initialized or attached.        |
+| `--filter <glob>`               | no       | SQLite `GLOB` pattern scoping which tracked/untracked paths are reported. |
+| `--hash-parallelism <n>`        | no       | Max concurrent file-hashing worker threads. Default: CPU count.           |
+| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` existence checks. Default 8.                        |
+
+Rehashing and `HEAD` checks each dispatch to their own pool (see
+[concurrency-and-progress.md](../architecture/concurrency-and-progress.md)) — a file needing both runs
+its `HEAD` check only once rehashing confirms the content still matches.
 
 ## What it checks
 
