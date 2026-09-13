@@ -10,12 +10,17 @@ import { parseRemoteConfig } from "../vault/remote-config.js";
 import { sync1Dir, localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { performSync, RemoteDivergedError, type SyncResult } from "../sync/commit.js";
+import { createConcurrencyPools } from "../concurrency/pools.js";
+import {
+  resolveConcurrencyOptions,
+  type GlobalConcurrencyOptions,
+} from "../cli/concurrency-options.js";
 
 interface SyncOptions extends OptionValues {
   root: string;
 }
 
-interface GlobalOptions extends OptionValues {
+interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
 }
@@ -28,10 +33,13 @@ export function registerSyncCommand(program: Command): void {
     .action(async (opts: SyncOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
+      // sync's progress-bar/fd-3 wiring lands with the rest of its own
+      // restructuring (its remote-apply pass isn't dispatch/join-based yet)
+      // -- plain stderr logging for now, same as before this plan.
       const logger = createLogger(globalOpts.verbose ?? false).child({ command: "sync" });
 
       try {
-        const result = await runSync(opts, logger);
+        const result = await runSync(opts, globalOpts, logger);
         const hasConflicts = result.conflicts.length > 0;
         const hasCaseCollisions = result.caseCollisions.length > 0;
         const hasIssues = hasConflicts || hasCaseCollisions;
@@ -95,7 +103,11 @@ export function registerSyncCommand(program: Command): void {
     });
 }
 
-async function runSync(opts: SyncOptions, logger: Logger): Promise<SyncResult> {
+async function runSync(
+  opts: SyncOptions,
+  globalOpts: GlobalOptions,
+  logger: Logger,
+): Promise<SyncResult> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
   if (!fs.existsSync(sync1DirPath)) {
@@ -111,5 +123,16 @@ async function runSync(opts: SyncOptions, logger: Logger): Promise<SyncResult> {
   const prefix = normalizePrefix(remoteConfig.prefix);
   const location: RemoteLocation = { bucket: remoteConfig.bucket, prefix };
 
-  return performSync(root, masterKey, { client, bucket: remoteConfig.bucket, location }, logger);
+  const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
+  try {
+    return await performSync(
+      root,
+      masterKey,
+      { client, bucket: remoteConfig.bucket, location },
+      logger,
+      pools,
+    );
+  } finally {
+    await pools.hash.close();
+  }
 }

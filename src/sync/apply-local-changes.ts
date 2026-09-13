@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
+import type PQueue from "p-queue";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
 import type { CacheEntryRow } from "../db/repositories/cache-entries-repository.js";
@@ -12,6 +13,7 @@ import { putObjectStream } from "../s3/client.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
+import { waitForRoom } from "../concurrency/pools.js";
 
 export interface ApplyLocalChangesResult {
   uploadedObjects: number;
@@ -30,13 +32,42 @@ export interface ApplyLocalChangesResult {
   conflicts: Array<{ path: string; reason: string }>;
 }
 
+interface InFlightUpload {
+  sourceRows: { path: string; type: CacheEntryRow["type"] }[];
+}
+
 /**
  * Folds a snapshot of cache.db's dirty rows into the candidate state.db,
  * applying the create/modified/deleted conflict matrix (src/sync/
- * conflict-rules.ts) against whatever entry currently exists there. Any not-
- * yet-known object content is uploaded (checking `objects` for the hash is
- * the dedup check) before the entry that references it is written -- never
- * the other way around, so a crash never leaves a dangling reference.
+ * conflict-rules.ts) against whatever entry currently exists there.
+ *
+ * Runs as **two passes**, not one, over `dirtyRows` (which
+ * `CacheEntriesRepository.iterateDirty()` already yields with every
+ * `'deleted'` row first, then everything else -- see src/db/repositories/
+ * cache-entries-repository.ts):
+ *
+ * - **Pass 1 — deletes**, fully sequential (no I/O, no pool). Runs to
+ *   complete before Pass 2 even starts reading, which is what lets Pass 2's
+ *   collision/existence checks trust a plain read of the live candidate db
+ *   again, without needing an in-memory ledger of "what Pass 1 already did".
+ * - **Pass 2 — creates/modifies**, decide-then-dispatch. Only the actual
+ *   object upload (network I/O) is dispatched to `streamPool` rather than
+ *   awaited inline -- the loop advances to the next row immediately, and up
+ *   to `streamQueueLimit` uploads run concurrently in the background. Since
+ *   `entriesRepo.upsert()` for an uploading row's path only happens once its
+ *   upload actually completes, a *later* row in this same pass needs two
+ *   small in-flight maps to see what an ordinary DB read can't yet:
+ *   `inFlightByHash` lets a same-batch duplicate (two paths uploaded in one
+ *   run sharing identical content) attach to the already-in-flight upload
+ *   instead of uploading twice; `inFlightByNormalizedPath` extends the
+ *   case-collision check the same way. Both are bounded by construction --
+ *   an entry only exists while its row's upload is genuinely in flight,
+ *   which `streamPool`'s own concurrency limit already caps.
+ *
+ * Any not-yet-known object content is uploaded (checking `objects` for the
+ * hash is the dedup check) before the entry that references it is written
+ * -- never the other way around, so a crash never leaves a dangling
+ * reference.
  *
  * Conflicting rows are left completely untouched here (and therefore stay
  * dirty in cache.db, since only a caller with the full dirty-rows list can
@@ -51,6 +82,8 @@ export async function applyLocalChangesToCandidate(
   versionStamp: string,
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
+  streamPool: PQueue,
+  streamQueueLimit: number,
 ): Promise<ApplyLocalChangesResult> {
   const objectsRepo = new ObjectsRepository(candidateDb);
   const entriesRepo = new EntriesRepository(candidateDb);
@@ -68,31 +101,62 @@ export async function applyLocalChangesToCandidate(
   const handledPaths = new Set<string>();
   const conflicts: Array<{ path: string; reason: string }> = [];
 
-  for (const row of dirtyRows) {
-    const existingEntry = entriesRepo.get(row.path);
+  const iter = dirtyRows[Symbol.iterator]();
+  let next = iter.next();
 
-    // Only a genuinely new path can newly collide -- "modified"/"deleted"
-    // target a path that already exists, so decideLocalChange's own
-    // exact-path matching already handles those (e.g. "modified locally,
-    // deleted remotely" conflicts regardless of casing). An exact-path
-    // lookup like `existingEntry` above can't see a *different*-cased
-    // entry, which is exactly the gap this check closes: without it, a
-    // local create colliding with an already-remote-committed case
-    // variant would be folded into the candidate and permanently
-    // committed. See docs/architecture/cross-platform-filesystem.md.
+  // Pass 1: deletes only. iterateDirty() guarantees these come first, so
+  // this loop naturally stops the moment it reaches the first non-deleted
+  // row, handing off to Pass 2 below without consuming it.
+  while (!next.done && next.value.state === "deleted") {
+    const row = next.value;
+    const existingEntry = entriesRepo.get(row.path);
+    const decision = decideLocalChange(row, existingEntry);
+
+    if (decision.kind === "conflict") {
+      conflicts.push({ path: row.path, reason: decision.reason });
+      logger.debug({ path: row.path, reason: decision.reason }, "local change conflicts, skipping");
+    } else {
+      handledPaths.add(row.path);
+      if (decision.kind === "apply") {
+        appliedCount++;
+        entriesRepo.delete(row.path);
+        logger.debug({ path: row.path }, "removing entry (deleted locally)");
+      } else {
+        logger.debug({ path: row.path }, "local change already reconciled remotely (no-op)");
+      }
+    }
+
+    next = iter.next();
+  }
+
+  // Pass 2: creates/modifies.
+  const inFlightByHash = new Map<string, InFlightUpload>();
+  const inFlightByNormalizedPath = new Map<string, string>();
+  const pendingUploads: Promise<void>[] = [];
+
+  while (!next.done) {
+    const row = next.value;
+    next = iter.next();
+
+    // Only a genuinely new path can newly collide -- "modified" targets a
+    // path that already exists, so decideLocalChange's own exact-path
+    // matching already handles those. See docs/architecture/
+    // cross-platform-filesystem.md.
     if (row.state === "created") {
-      const collision = entriesRepo.findByNormalizedPath(toCollisionKey(row.path), row.path);
-      if (collision) {
-        const reason = `case-insensitive collision with existing entry "${collision.path}" -- rename or remove one of them and sync again`;
+      const normalizedKey = toCollisionKey(row.path);
+      const dbCollision = entriesRepo.findByNormalizedPath(normalizedKey, row.path);
+      const inFlightCollision = inFlightByNormalizedPath.get(normalizedKey);
+      const collidesWith =
+        dbCollision?.path ?? (inFlightCollision !== row.path ? inFlightCollision : undefined);
+      if (collidesWith) {
+        const reason = `case-insensitive collision with existing entry "${collidesWith}" -- rename or remove one of them and sync again`;
         conflicts.push({ path: row.path, reason });
-        logger.debug(
-          { path: row.path, collidesWith: collision.path },
-          "case-insensitive collision, skipping",
-        );
+        logger.debug({ path: row.path, collidesWith }, "case-insensitive collision, skipping");
         continue;
       }
     }
 
+    const existingEntry = entriesRepo.get(row.path);
     const decision = decideLocalChange(row, existingEntry);
 
     if (decision.kind === "conflict") {
@@ -111,44 +175,88 @@ export async function applyLocalChangesToCandidate(
     // decision.kind === "apply"
     appliedCount++;
 
-    if (row.state === "deleted") {
-      entriesRepo.delete(row.path);
-      logger.debug({ path: row.path }, "removing entry (deleted locally)");
+    if (row.type !== "file") {
+      entriesRepo.upsert({
+        path: row.path,
+        type: row.type,
+        hash: null,
+        state_version: versionStamp,
+      });
       continue;
     }
 
-    let hash: string | null = null;
-    if (row.type === "file") {
-      if (!row.hash) {
-        throw new Error(`cache row for "${row.path}" is a file with no recorded hash`);
-      }
-      hash = row.hash;
+    if (!row.hash) {
+      throw new Error(`cache row for "${row.path}" is a file with no recorded hash`);
+    }
+    const hash = row.hash;
 
-      if (objectsRepo.has(hash)) {
-        dedupedObjects++;
-        logger.debug({ path: row.path, hash }, "content already known, skipping upload (dedup)");
-      } else {
-        const absolutePath = path.join(root, row.path);
-        const context = Buffer.from(hash, "hex");
-        const size = fs.statSync(absolutePath).size;
-        const sourceStream = fs.createReadStream(absolutePath);
-        const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
-        const key = objectKey(hash);
-        await putObjectStream(
-          s3.client,
-          s3.bucket,
-          remoteKey(s3.location, key),
-          encryptedStream,
-          encryptedSize(size, context.length),
-        );
-        objectsRepo.upsert({ hash, s3_key: key, size });
-        uploadedObjects++;
-        logger.debug({ path: row.path, hash, size }, "uploaded new object");
-      }
+    if (row.state === "created") {
+      inFlightByNormalizedPath.set(toCollisionKey(row.path), row.path);
     }
 
-    entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
+    const existingJob = inFlightByHash.get(hash);
+    if (existingJob) {
+      existingJob.sourceRows.push({ path: row.path, type: row.type });
+      dedupedObjects++;
+      logger.debug(
+        { path: row.path, hash },
+        "content already in flight this batch, attaching (dedup)",
+      );
+      continue;
+    }
+
+    if (objectsRepo.has(hash)) {
+      dedupedObjects++;
+      logger.debug({ path: row.path, hash }, "content already known, skipping upload (dedup)");
+      entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
+      continue;
+    }
+
+    const job: InFlightUpload = { sourceRows: [{ path: row.path, type: row.type }] };
+    inFlightByHash.set(hash, job);
+
+    await waitForRoom(streamPool, streamQueueLimit);
+    const uploadDone = streamPool.add(async () => {
+      const absolutePath = path.join(root, row.path);
+      const context = Buffer.from(hash, "hex");
+      const size = fs.statSync(absolutePath).size;
+      const sourceStream = fs.createReadStream(absolutePath);
+      const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
+      const key = objectKey(hash);
+      await putObjectStream(
+        s3.client,
+        s3.bucket,
+        remoteKey(s3.location, key),
+        encryptedStream,
+        encryptedSize(size, context.length),
+      );
+      objectsRepo.upsert({ hash, s3_key: key, size });
+      uploadedObjects++;
+      for (const sourceRow of job.sourceRows) {
+        entriesRepo.upsert({
+          path: sourceRow.path,
+          type: sourceRow.type,
+          hash,
+          state_version: versionStamp,
+        });
+      }
+      inFlightByHash.delete(hash);
+      logger.debug(
+        { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+        "completed",
+      );
+    }) as Promise<void>;
+    // Logged after add(), not before -- add() synchronously starts the task
+    // (if capacity allows) before returning, so this reflects occupancy
+    // *including* the job just dispatched.
+    logger.debug(
+      { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+      "dispatched",
+    );
+    pendingUploads.push(uploadDone);
   }
+
+  await Promise.all(pendingUploads);
 
   return { uploadedObjects, dedupedObjects, handledPaths, appliedCount, conflicts };
 }

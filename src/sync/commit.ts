@@ -12,7 +12,7 @@ import {
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { performUpdateCache, type CaseCollision } from "../fs/update-cache.js";
-import { hashFile } from "../fs/hash-file.js";
+import type { ConcurrencyPools } from "../concurrency/pools.js";
 import { applyLocalChangesToCandidate } from "./apply-local-changes.js";
 import { applyRemoteChangesToLocal, type IgnoredButSyncedEntry } from "./apply-remote-changes.js";
 import { reconcileCacheAfterCommit } from "./reconcile-cache.js";
@@ -108,6 +108,7 @@ export async function performSync(
   masterKey: Buffer,
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
+  pools: ConcurrencyPools,
 ): Promise<SyncResult> {
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
@@ -131,9 +132,6 @@ export async function performSync(
         fileMustExist: true,
       });
       try {
-        // Sync's internal scan phase doesn't yet thread the real concurrency
-        // pools through (that lands with the rest of sync's own restructuring);
-        // this keeps its current sequential-hashing behavior in the meantime.
         updateCacheStats = await performUpdateCache(
           root,
           localCacheDbPath(root),
@@ -142,8 +140,8 @@ export async function performSync(
           new IgnorePoliciesRepository(stateDbForScan),
           lastSyncedVersion,
           logger,
-          { run: hashFile },
-          4,
+          pools.hash,
+          pools.hash.maxThreads,
         );
       } finally {
         stateDbForScan.close();
@@ -222,6 +220,8 @@ export async function performSync(
           versionStamp,
           s3,
           logger,
+          pools.stream,
+          pools.stream.concurrency * 2,
         );
 
         // A version is only worth committing if something *actually*
