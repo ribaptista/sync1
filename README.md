@@ -1,6 +1,6 @@
 # sync1
 
-A simple, end-to-end encrypted backup tool for S3.
+A powerful, end-to-end encrypted backup tool for S3.
 
 sync1 backs up a local directory to any S3-compatible bucket, encrypting everything on your own
 machine before it ever leaves. It deduplicates identical content, works safely from more than one
