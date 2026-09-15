@@ -19,7 +19,11 @@ import {
   resolveConcurrencyOptions,
   type GlobalConcurrencyOptions,
 } from "../cli/concurrency-options.js";
-import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
+import {
+  shouldShowProgress,
+  startBytesProgressSession,
+  createLoggerForRun,
+} from "../cli/progress.js";
 
 interface UpdateCacheOptions extends OptionValues {
   root: string;
@@ -103,12 +107,8 @@ async function runUpdateCache(
   const ignorePoliciesRepo = new IgnorePoliciesRepository(stateDb);
 
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
-  const progress = startProgressSession({
-    show: showProgress,
-    overallLabel: "scanning",
-    overallUnit: "entries",
-  });
-  progress.setOverallTotal(Math.max(cacheRepo.count(), 1));
+  const progress = startBytesProgressSession({ show: showProgress, overallLabel: "scanning" });
+  progress.setOverallTotals({ files: Math.max(cacheRepo.count(), 1) });
 
   try {
     const stats = await performUpdateCache(
@@ -121,9 +121,9 @@ async function runUpdateCache(
       logger,
       pools.hash,
       pools.hash.maxThreads,
-      (n) => {
-        progress.setOverallTotal(n);
-        progress.advanceOverall(1);
+      (u) => {
+        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
+        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
       },
     );
     return stats;

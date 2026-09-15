@@ -15,6 +15,7 @@ import {
 import type { HashRunner } from "../../../src/concurrency/hash-runner.js";
 import { hashBufferHex } from "../../../src/crypto/hash.js";
 import { writeStubAtomic } from "../../../src/fs/stub.js";
+import type { OnProgress } from "../../../src/progress-types.js";
 
 vi.mock("../../../src/fs/hash-file.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../../src/fs/hash-file.js")>();
@@ -48,7 +49,7 @@ function run(
   repo: CacheEntriesRepository,
   options: {
     version?: string;
-    onProgress?: (scanned: number) => void;
+    onProgress?: OnProgress;
     hashRunner?: HashRunner;
     maxInFlightHashes?: number;
   } = {},
@@ -646,5 +647,67 @@ describe("performUpdateCache: hash dispatch concurrency", () => {
     await expect(run(repo, { hashRunner, maxInFlightHashes: 4 })).rejects.toThrow(
       "simulated ENOENT",
     );
+  });
+});
+
+describe("performUpdateCache: byte progress", () => {
+  it("grows bytesTotal on dispatch, and only advances bytesDone once the hash resolves", async () => {
+    touch("a.txt", "hello"); // 5 bytes
+    const repo = makeRepo();
+
+    let resolveHash!: (hash: string) => void;
+    const hashRunner: HashRunner = {
+      run: () => new Promise<string>((resolve) => (resolveHash = resolve)),
+    };
+
+    const updates: {
+      filesDone: number;
+      filesTotal: number;
+      bytesDone: number;
+      bytesTotal: number;
+    }[] = [];
+    const statsPromise = run(repo, {
+      hashRunner,
+      maxInFlightHashes: 4,
+      onProgress: (u) => updates.push({ ...u }),
+    });
+
+    // Dispatch happens synchronously within the merge-join tick, before the
+    // hash job's own promise ever settles -- bytesTotal reflects the file's
+    // size immediately, bytesDone stays 0 until resolveHash() is called.
+    await vi.waitFor(() => expect(resolveHash).toBeDefined());
+    expect(updates.some((u) => u.bytesTotal === 5 && u.bytesDone === 0)).toBe(true);
+    expect(updates.every((u) => u.bytesDone === 0)).toBe(true);
+
+    resolveHash(hashBufferHex(Buffer.from("hello")));
+    const stats = await statsPromise;
+
+    expect(stats.created).toBe(1);
+    expect(updates.at(-1)).toMatchObject({ bytesDone: 5, bytesTotal: 5 });
+  });
+
+  it("a directory contributes 0 bytes", async () => {
+    fs.mkdirSync(path.join(root, "a-dir"));
+    const repo = makeRepo();
+
+    const updates: { bytesDone: number; bytesTotal: number }[] = [];
+    const stats = await run(repo, { onProgress: (u) => updates.push({ ...u }) });
+
+    expect(stats.created).toBe(1);
+    expect(updates.every((u) => u.bytesDone === 0 && u.bytesTotal === 0)).toBe(true);
+  });
+
+  it("an already-resolved stub contributes 0 bytes (never hashed)", async () => {
+    const knownHash = hashBufferHex(Buffer.from("stub content"));
+    objectsRepo.upsert({ hash: knownHash, s3_key: `objects/${knownHash}`, size: 12 });
+    writeStubAtomic(path.join(root, "img.jpg.stub"), knownHash);
+    const repo = makeRepo();
+
+    const updates: { bytesDone: number; bytesTotal: number }[] = [];
+    const stats = await run(repo, { onProgress: (u) => updates.push({ ...u }) });
+
+    expect(stats.created).toBe(1);
+    expect(repo.get("img.jpg")?.size).toBe(12); // the referenced object's size, not the stub file's own
+    expect(updates.every((u) => u.bytesDone === 0 && u.bytesTotal === 0)).toBe(true);
   });
 });

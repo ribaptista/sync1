@@ -16,6 +16,7 @@ import { matchesAnyGlob } from "./glob-match.js";
 import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { BoundedTaskTracker } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
+import type { OnProgress } from "../progress-types.js";
 
 export interface CaseCollision {
   path: string;
@@ -38,6 +39,18 @@ export class UnknownStubContentError extends CorruptionError {
     );
     this.name = "UnknownStubContentError";
   }
+}
+
+/**
+ * Byte accounting for the one kind of work in this scan that's actually
+ * worth tracking bytes for -- an actual hash of real file content. A
+ * directory, an already-resolved stub (hash read from the stub file
+ * itself, never hashed), and a no-op row all contribute 0, per the
+ * universal counting rule in src/progress-types.ts.
+ */
+interface ByteTracking {
+  trackDispatched(size: number): void;
+  trackCompleted(size: number): void;
 }
 
 /**
@@ -81,7 +94,7 @@ export async function performUpdateCache(
   logger: Logger,
   hashRunner: HashRunner,
   maxInFlightHashes: number,
-  onProgress?: (scanned: number) => void,
+  onProgress?: OnProgress,
 ): Promise<UpdateCacheStats> {
   const stats: UpdateCacheStats = {
     created: 0,
@@ -103,13 +116,34 @@ export async function performUpdateCache(
   const staging = new StagingRepository(stagingPath);
   const hashJobs = new BoundedTaskTracker(maxInFlightHashes);
 
+  // filesDone/filesTotal track every row the merge-join consumes (work-
+  // needing or not, mirroring this scan's pre-existing "scanned" counter);
+  // bytesDone/bytesTotal track only content actually hashed this run --
+  // see the ByteTracking interface above and progress-types.ts's own
+  // doc comment for the full rule.
+  let scanned = 0;
+  let bytesTotal = 0;
+  let bytesDone = 0;
+  const report = (): void => {
+    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
+  };
+  const byteTracking: ByteTracking = {
+    trackDispatched(size) {
+      bytesTotal += size;
+      report();
+    },
+    trackCompleted(size) {
+      bytesDone += size;
+      report();
+    },
+  };
+
   try {
     const fsIter = walk(root);
     const cacheIter = cacheRepo.iterateAllSortedByPath();
 
     let fsNext = await fsIter.next();
     let cacheNext = cacheIter.next();
-    let scanned = 0;
 
     while (!fsNext.done || !cacheNext.done) {
       const fsEntry = fsNext.done ? null : fsNext.value;
@@ -134,6 +168,7 @@ export async function performUpdateCache(
             hashRunner,
             hashJobs,
             staging,
+            byteTracking,
           );
         }
         fsNext = await fsIter.next();
@@ -153,13 +188,14 @@ export async function performUpdateCache(
           hashRunner,
           hashJobs,
           staging,
+          byteTracking,
         );
         fsNext = await fsIter.next();
         cacheNext = cacheIter.next();
       }
 
       scanned++;
-      onProgress?.(scanned);
+      report();
     }
 
     // Every dispatched hash job must have inserted its row (or thrown) before
@@ -311,12 +347,16 @@ async function dispatchHash(
   hashJobs: BoundedTaskTracker,
   hashRunner: HashRunner,
   absolutePath: string,
+  size: number,
   logger: Logger,
+  byteTracking: ByteTracking,
   onResolved: (hash: string) => void,
 ): Promise<void> {
+  byteTracking.trackDispatched(size);
   await hashJobs.dispatch(async () => {
     const hash = await hashRunner.run(absolutePath);
     onResolved(hash);
+    byteTracking.trackCompleted(size);
     logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
   });
   logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
@@ -332,6 +372,7 @@ async function dispatchCreatedRow(
   hashRunner: HashRunner,
   hashJobs: BoundedTaskTracker,
   staging: StagingRepository,
+  byteTracking: ByteTracking,
 ): Promise<void> {
   const mtime = Math.round(fsEntry.mtimeMs);
   const resolution = classifyContent(fsEntry, root, objectsRepo, logger);
@@ -358,8 +399,14 @@ async function dispatchCreatedRow(
   // needs-hash only ever happens for a real (or dangling-both) file, where
   // the walker's own stat targeted that real file -- fsEntry.size is
   // correct here, unlike the stub-resolved case above.
-  await dispatchHash(hashJobs, hashRunner, resolution.absolutePath, logger, (hash) =>
-    finalize(hash, fsEntry.size),
+  await dispatchHash(
+    hashJobs,
+    hashRunner,
+    resolution.absolutePath,
+    fsEntry.size,
+    logger,
+    byteTracking,
+    (hash) => finalize(hash, fsEntry.size),
   );
 }
 
@@ -397,6 +444,7 @@ async function dispatchExistingRow(
   hashRunner: HashRunner,
   hashJobs: BoundedTaskTracker,
   staging: StagingRepository,
+  byteTracking: ByteTracking,
 ): Promise<void> {
   const newMtime = Math.round(fsEntry.mtimeMs);
 
@@ -482,7 +530,13 @@ async function dispatchExistingRow(
   // needs-hash only ever happens for a real (or dangling-both) file, where
   // the walker's own stat targeted that real file -- fsEntry.size is
   // correct here, unlike the stub-resolved case above.
-  await dispatchHash(hashJobs, hashRunner, resolution.absolutePath, logger, (hash) =>
-    finalize(hash, fsEntry.size),
+  await dispatchHash(
+    hashJobs,
+    hashRunner,
+    resolution.absolutePath,
+    fsEntry.size,
+    logger,
+    byteTracking,
+    (hash) => finalize(hash, fsEntry.size),
   );
 }
