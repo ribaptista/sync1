@@ -16,9 +16,9 @@ sync1 inspect <path-or-glob> --root <local-path> [--json]
 
 ## Arguments
 
-| Argument         | Description                                                                                       |
-| ---------------- | ------------------------------------------------------------------------------------------------- |
-| `<path-or-glob>` | An exact tracked path, or a SQLite `GLOB` pattern (detected by the presence of `*`, `?`, or `[`). |
+| Argument         | Description                                                                                                          |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `<path-or-glob>` | An exact tracked path, or a [glob pattern](../README.md#glob-syntax) (detected by the presence of `*`, `?`, or `[`). |
 
 ## Exact path vs. glob pattern
 

@@ -14,11 +14,11 @@ sync1 converge --root <local-path> [--filter <glob>] [--json] [--s3-metadata-par
 
 ## Options
 
-| Flag                            | Required | Description                                                                             |
-| ------------------------------- | -------- | --------------------------------------------------------------------------------------- |
-| `--root <path>`                 | yes      | Local directory whose vault to operate on.                                              |
-| `--filter <glob>`               | no       | SQLite `GLOB` pattern scoping which tracked paths' objects are converged (default `*`). |
-| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD`/copy/restore calls, one dispatched per distinct hash. Default 8.  |
+| Flag                            | Required | Description                                                                                                |
+| ------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
+| `--root <path>`                 | yes      | Local directory whose vault to operate on.                                                                 |
+| `--filter <glob>`               | no       | [Glob pattern](../README.md#glob-syntax) scoping which tracked paths' objects are converged (default `*`). |
+| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD`/copy/restore calls, one dispatched per distinct hash. Default 8.                     |
 
 See [concurrency-and-progress.md](../architecture/concurrency-and-progress.md) for how each hash's
 `HEAD` + classify + conditional copy/restore dispatches as one unit of work.

@@ -1,6 +1,6 @@
 # `sync1 storage_policy`
 
-Manages **global storage-class policies**: SQLite `GLOB` patterns mapped to a target S3 storage class,
+Manages **global storage-class policies**: [glob patterns](../README.md#glob-syntax) mapped to a target S3 storage class,
 with an explicit priority resolving which policy wins when more than one non-default glob matches the
 same path. Like `ignore` policies, these live in `state.db` — shared and versioned, so every machine
 agrees on the same rules. `status`/`converge` (a later task) apply these policies; `storage_policy` only

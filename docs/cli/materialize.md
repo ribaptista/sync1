@@ -13,7 +13,7 @@ sync1 materialize <glob> --root <local-path> [--request-retrieval] [--json] [--v
 
 | Argument/Flag                   | Required | Description                                                                                                                                                           |
 | ------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<glob>`                        | yes      | SQLite `GLOB` pattern matched against tracked paths (e.g. `photos/2024/*`).                                                                                           |
+| `<glob>`                        | yes      | [Glob pattern](../README.md#glob-syntax) matched against tracked paths (e.g. `photos/2024/*`).                                                                        |
 | `--root <path>`                 | yes      | Local directory to operate on.                                                                                                                                        |
 | `--request-retrieval`           | no       | Request a temporary S3 restore for matched content that's currently archived (`GLACIER`/`DEEP_ARCHIVE`). Without it, archived content is just counted, not requested. |
 | `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` archive-status checks. Default 8.                                                                                                               |

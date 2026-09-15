@@ -17,28 +17,21 @@ also use. See `src/sync/mutate-state-db.ts`.
 
 ## No priority, unlike storage-class policies
 
-Ignore policies are a monotonic OR: any matching `GLOB` pattern means the path is ignored, full stop.
+Ignore policies are a monotonic OR: any matching glob pattern means the path is ignored, full stop.
 There's no precedence/priority column, because there's no conflict to resolve — two overlapping ignore
 patterns matching the same path agree with each other by construction (both say "ignore it"). This is
 what keeps `ignore` a much simpler CRUD than storage-class policies, which fundamentally need an explicit
 priority to decide between overlapping globs implying _different_ target classes.
 
-## Why matching happens in memory, never via SQL `GLOB`
+## Why matching happens in memory
 
-Two call sites need to check a path against every ignore policy: `update_cache`'s merge-join (local
-creations) and `apply-remote-changes.ts`'s merge-join (remote arrivals). Both hold an open
-`.iterate()` cursor on a connection for their entire duration, and better-sqlite3 refuses to run any
-other statement on that same connection while a cursor from it is open (see
-[cache-and-filesystem-scanning.md](cache-and-filesystem-scanning.md) for the general shape of this
-constraint). A per-path `SELECT ... WHERE path GLOB ?` mid-loop isn't an option there.
-
-Since the ignore-policy list itself is expected to stay small, the fix is to load every policy's glob
-into memory once, before the loop starts (`IgnorePoliciesRepository.listGlobs()`), and match against that
-in-memory list from then on. `src/fs/glob-match.ts` hand-implements SQLite's `GLOB` semantics (`*`, `?`,
-`[...]`/`[^...]` character classes, case-sensitive, literal otherwise) in pure JS — verified in
-`test/unit/fs/glob-match.test.ts` against real SQLite `GLOB` output rather than trusted blindly, since a
-silent divergence here would mean paths get ignored (or not) differently than what `ignore list`/direct
-SQL queries would say.
+No call site anywhere in this codebase uses SQL `GLOB` — every glob match, for every command and every
+policy type, happens in memory via `matchesAnyGlob` (`src/fs/glob-match.ts`, wrapping `minimatch`; see
+[the README's "Glob syntax" section](../README.md#glob-syntax) for the full dialect). Two call
+sites check a path against every ignore policy: `update_cache`'s merge-join (local creations) and
+`apply-remote-changes.ts`'s merge-join (remote arrivals) — both preload the (expected-small) policy list
+once via `IgnorePoliciesRepository.listGlobs()` before the loop starts, rather than re-querying it per
+path, since one side of each merge-join (a filesystem walk) was never SQL rows to begin with.
 
 ## What matching actually gates
 

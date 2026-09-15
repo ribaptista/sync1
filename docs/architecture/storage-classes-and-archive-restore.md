@@ -50,8 +50,10 @@ itself does not.
 ## Dedup interaction
 
 `status`/`converge` resolve `--filter` against **distinct content hashes**
-(`EntriesRepository.iterateDistinctHashesMatchingGlob`), not paths, using SQLite's native `GLOB`
-operator directly against `entries.path` — no separate pattern-matching library needed. Since storage
+(`EntriesRepository.iterateDistinctHashesMatchingGlob`), not paths — matched in memory via `matchesAnyGlob`
+(see [ignore-and-storage-policies.md](ignore-and-storage-policies.md)) over a `path`-ordered,
+literal-prefix-seeded scan of `entries` (`src/db/glob-scan.ts`), deduped into distinct hashes via an
+in-memory `Set` as the scan runs. Since storage
 class is a property of the object, not any individual path, its resolved target affects every path that
 references that hash, including ones outside `--filter`'s scope, if they happen to share identical
 content. Unlike the single-glob-target model this replaced (the removed `ensure_storage_class`, where

@@ -31,26 +31,17 @@ A `generate` row also carries the actual generation parameters: `image_width`/`i
 enforces that all six generate-only columns are `NULL` for a `skip` row and all non-`NULL` for a
 `generate` row.
 
-## Glob matching: real `**` support, opt-in and additive
+## Walk-scoping via `literalPrefixOf`
 
-Thumbnail policies (and `thumbnail`'s own `--glob`) are the first thing in this codebase to need
-segment-aware `**` ("any number of directory levels, including zero"). Neither the hand-rolled JS glob
-matcher (`src/fs/glob-match.ts`) nor SQLite's native `GLOB` operator had this before — both previously
-treated a bare `*` as "any characters including `/`," deliberately kept identical to real SQLite `GLOB`
-output for every existing call site (`ignore_policies`, `storage_policies`, every `--filter` flag).
+Thumbnail-policy matching and `thumbnail`'s own `--glob` use the same glob syntax as every other command
+in this CLI — see [the README's "Glob syntax" section](../README.md#glob-syntax) for the full dialect
+(`*`/`?` segment-bound, native `**`, `{a,b}` brace expansion). Nothing here is thumbnail-specific anymore.
 
-Rather than changing that shared default (which every other feature depends on), `**` support was added
-as a separate, additive, opt-in code path: `globToRegExp`/`matchesAnyGlob` take an optional
-`{ allowDoubleStar: true }`, used only by thumbnail-policy evaluation and `thumbnail`'s own `--glob`. Every
-existing call site, which never passes the option, is byte-for-byte unaffected. See
-`test/unit/fs/glob-match.test.ts`'s `allowDoubleStar` block for exact semantics (`**/xyz/*` matches both
-`xyz/foo` and `a/b/xyz/foo`; a plain `*` still never crosses a `/`, even in double-star mode).
-
-`literalPrefixOf` (`src/fs/glob-prefix.ts`) extracts a glob's longest leading wildcard-free directory
-run, purely as a walk-scoping optimization: `thumbnail`'s `--glob "Photos/**"` can root its filesystem
-walk at `<root>/Photos` instead of `<root>`, pruning whole subtrees the pattern can never match. This
-never affects correctness (a glob starting with a wildcard just walks everything, same as before), only
-how much of the tree needs visiting.
+What _is_ still specific to `thumbnail` is `literalPrefixOf` (`src/fs/glob-match.ts`), used purely as a
+walk-scoping optimization: `thumbnail`'s `--glob "Photos/**"` can root its filesystem walk at
+`<root>/Photos` instead of `<root>`, pruning whole subtrees the pattern can never match. This never
+affects correctness (a glob starting with a wildcard just walks everything, same as before), only how
+much of the tree needs visiting.
 
 ## Naming convention and where thumbnails live
 

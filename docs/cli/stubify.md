@@ -13,7 +13,7 @@ sync1 stubify <glob> --root <local-path> [--json] [--verbose] [--hash-parallelis
 
 | Argument/Flag            | Required | Description                                                                                           |
 | ------------------------ | -------- | ----------------------------------------------------------------------------------------------------- |
-| `<glob>`                 | yes      | SQLite `GLOB` pattern matched against tracked paths.                                                  |
+| `<glob>`                 | yes      | [Glob pattern](../README.md#glob-syntax) matched against tracked paths.                               |
 | `--root <path>`          | yes      | Local directory to operate on.                                                                        |
 | `--hash-parallelism <n>` | no       | Max concurrent rehashing worker threads, only used for paths whose mtime changed. Default: CPU count. |
 

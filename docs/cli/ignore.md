@@ -1,7 +1,7 @@
 # `sync1 ignore`
 
-Manages **global ignore policies**: SQLite `GLOB` patterns for paths that should never enter the vault
-at all. Unlike `cache.db`, ignore policies live in `state.db` — shared and versioned, so every machine
+Manages **global ignore policies**: [glob patterns](../README.md#glob-syntax) for paths that should never
+enter the vault at all. Unlike `cache.db`, ignore policies live in `state.db` — shared and versioned, so every machine
 backing up the same vault agrees on the same rules. See
 [ignore-and-storage-policies.md](../architecture/ignore-and-storage-policies.md) for the full design.
 

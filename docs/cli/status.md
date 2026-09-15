@@ -12,11 +12,11 @@ sync1 status --root <local-path> [--filter <glob>] [--json] [--s3-metadata-paral
 
 ## Options
 
-| Flag                            | Required | Description                                                                                          |
-| ------------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `--root <path>`                 | yes      | Local directory whose vault to inspect.                                                              |
-| `--filter <glob>`               | no       | SQLite `GLOB` pattern scoping which tracked paths' objects are considered (default `*`, everything). |
-| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` calls, one dispatched per distinct hash. Default 8.                            |
+| Flag                            | Required | Description                                                                                                             |
+| ------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `--root <path>`                 | yes      | Local directory whose vault to inspect.                                                                                 |
+| `--filter <glob>`               | no       | [Glob pattern](../README.md#glob-syntax) scoping which tracked paths' objects are considered (default `*`, everything). |
+| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` calls, one dispatched per distinct hash. Default 8.                                               |
 
 No password needed — `HEAD` requests don't decrypt anything, and policies are read from the
 already-locally-decrypted `state.db`.

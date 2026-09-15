@@ -5,24 +5,45 @@ Windows.
 
 ## CLI commands
 
-| Command                                       | Description                                                                              |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| [`init_remote`](cli/init_remote.md)           | Create a brand-new vault in S3 for a local root directory.                               |
-| [`attach_remote`](cli/attach_remote.md)       | Attach a local root to an existing vault (join from a new machine, or restore).          |
-| [`update_cache`](cli/update_cache.md)         | Rescan the local root and refresh `cache.db` to match what's on disk.                    |
-| [`sync`](cli/sync.md)                         | Reconcile local changes with the remote vault, in both directions.                       |
-| [`fetch_remote`](cli/fetch_remote.md)         | Pull the latest state.db snapshot without touching the filesystem or cache.db.           |
-| [`materialize`](cli/materialize.md)           | Download and materialize stub files matching a glob into real content.                   |
-| [`stubify`](cli/stubify.md)                   | Replace real files matching a glob with stubs, freeing local disk space.                 |
-| [`inspect`](cli/inspect.md)                   | Read-only JSON query over cache.db/state.db for a path or glob, for tooling.             |
-| [`gc`](cli/gc.md)                             | Remove S3 objects no longer referenced by the vault's current live state.                |
-| [`ignore`](cli/ignore.md)                     | Manage global (shared) ignore policies -- GLOB patterns kept out of the vault.           |
-| [`sanity_check`](cli/sanity_check.md)         | Read-only diagnostic cross-checking state.db against S3 and the filesystem.              |
-| [`storage_policy`](cli/storage_policy.md)     | Manage global storage-class policies -- GLOB patterns mapped to an S3 class.             |
-| [`status`](cli/status.md)                     | Read-only report: actual S3 storage class vs. what storage_policy implies.               |
-| [`converge`](cli/converge.md)                 | Apply storage_policy: move objects' actual S3 storage class to match it.                 |
-| [`thumbnail_policy`](cli/thumbnail_policy.md) | Manage global thumbnail-generation policies -- glob + mime type mapped to skip/generate. |
-| [`thumbnail`](cli/thumbnail.md)               | Generate/report/clean up thumbnails and video mosaics per thumbnail_policy.              |
+| Command                                       | Description                                                                                    |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| [`init_remote`](cli/init_remote.md)           | Create a brand-new vault in S3 for a local root directory.                                     |
+| [`attach_remote`](cli/attach_remote.md)       | Attach a local root to an existing vault (join from a new machine, or restore).                |
+| [`update_cache`](cli/update_cache.md)         | Rescan the local root and refresh `cache.db` to match what's on disk.                          |
+| [`sync`](cli/sync.md)                         | Reconcile local changes with the remote vault, in both directions.                             |
+| [`fetch_remote`](cli/fetch_remote.md)         | Pull the latest state.db snapshot without touching the filesystem or cache.db.                 |
+| [`materialize`](cli/materialize.md)           | Download and materialize stub files matching a glob into real content.                         |
+| [`stubify`](cli/stubify.md)                   | Replace real files matching a glob with stubs, freeing local disk space.                       |
+| [`inspect`](cli/inspect.md)                   | Read-only JSON query over cache.db/state.db for a path or glob, for tooling.                   |
+| [`gc`](cli/gc.md)                             | Remove S3 objects no longer referenced by the vault's current live state.                      |
+| [`ignore`](cli/ignore.md)                     | Manage global (shared) ignore policies -- [glob patterns](#glob-syntax) kept out of the vault. |
+| [`sanity_check`](cli/sanity_check.md)         | Read-only diagnostic cross-checking state.db against S3 and the filesystem.                    |
+| [`storage_policy`](cli/storage_policy.md)     | Manage global storage-class policies -- [glob patterns](#glob-syntax) mapped to an S3 class.   |
+| [`status`](cli/status.md)                     | Read-only report: actual S3 storage class vs. what storage_policy implies.                     |
+| [`converge`](cli/converge.md)                 | Apply storage_policy: move objects' actual S3 storage class to match it.                       |
+| [`thumbnail_policy`](cli/thumbnail_policy.md) | Manage global thumbnail-generation policies -- glob + mime type mapped to skip/generate.       |
+| [`thumbnail`](cli/thumbnail.md)               | Generate/report/clean up thumbnails and video mosaics per thumbnail_policy.                    |
+
+## Glob syntax
+
+Every glob-taking argument in this CLI -- `materialize`/`stubify`'s positional glob, `inspect`'s
+path-or-glob, `status`/`converge`/`sanity_check`'s `--filter`, `thumbnail`'s `--glob`, and every
+`ignore`/`storage_policy`/`thumbnail_policy` pattern stored in state.db -- shares one matching dialect,
+implemented by wrapping [`minimatch`](https://www.npmjs.com/package/minimatch) (`src/fs/glob-match.ts`):
+
+- **`*`** matches zero or more characters, but never crosses a `/` -- `photos/*` matches `photos/img.jpg`,
+  not `photos/sub/img.jpg`.
+- **`**`** matches any number of directory levels, including zero -- `photos/**/*.jpg` matches both
+  `photos/img.jpg` and `photos/a/b/img.jpg`.
+- **`?`** matches exactly one character (also never crossing `/`).
+- **`[abc]`** / **`[^abc]`** / **`[!abc]`** character classes.
+- **`{a,b,c}`** brace expansion -- `*.{jpg,png}` matches either extension.
+- Matching is **case-sensitive**, and dotfiles/dot-directories are matched like any other name (a bare
+  `*` matches `.hidden` too).
+
+There's no SQL `GLOB` involved anywhere -- every match happens in memory, whether the candidate paths come
+from a database scan or directly from a filesystem walk. See
+[ignore-and-storage-policies.md](architecture/ignore-and-storage-policies.md) for why.
 
 ## Architecture
 
