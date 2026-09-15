@@ -19,6 +19,9 @@ placeholder instead of the full bytes. It's a single CLI binary with no server c
   safely backed up, without the actual bytes taking up local disk space. This is what makes restoring
   a huge backup onto a new machine instant instead of downloading everything: files show up as stubs,
   and you fetch the real content only for what you actually need, whenever you need it.
+- **Thumbnails** — generate low-resolution image thumbnails and video mosaics for browsing a vault's
+  actual content, governed by simple glob + mime-type policies (skip vs. generate), without
+  materializing full-size originals.
 - **S3 storage-class policies** — simple glob-pattern rules ("archive everything under `old/`") to
   move backed-up content into cheaper cold storage (Glacier, Deep Archive), with sync1 handling the
   copy/restore mechanics for you.
@@ -140,6 +143,37 @@ materialize: 1 materialized, 0 already real, 0 need retrieval (pass --request-re
 
 `hello.txt` is now a real file on disk on machine B, downloaded, decrypted, and verified against its
 recorded hash.
+
+### Generate thumbnails
+
+Add a photo, then tell sync1 to generate a thumbnail for any JPEG:
+
+```bash
+cp ~/Pictures/sunset.jpg ~/backups/photos/sunset.jpg
+SYNC1_PASSWORD='correct horse battery staple' \
+  sync1 thumbnail_policy create "*.jpg" generate --root ~/backups/photos \
+  --mime-types image/jpeg --image-width 320 --image-height 240 \
+  --tile-rows 1 --tile-columns 1 --tile-width 320 --tile-height 240 --jpeg-quality 80
+```
+
+```
+thumbnail policy 1 created (version 20260101T021200000Z-c3d4e5f6): *.jpg -> generate
+```
+
+Sync the new file so its content hash is recorded, then generate thumbnails for everything the policy
+covers:
+
+```bash
+SYNC1_PASSWORD='correct horse battery staple' sync1 sync --root ~/backups/photos
+sync1 thumbnail ensure --root ~/backups/photos
+```
+
+```
+thumbnail ensure: 0 up to date, 1 to generate, 0 to regenerate, 0 to delete, 0 missing cache entry, 0 stubbed original, 0 error(s)
+```
+
+A small `sunset.jpg.<hash>.jpg` now sits in `_thumbnail/` next to the original — a preview you can
+browse without materializing (or downloading) the full-size photo.
 
 ### Manage S3 storage classes
 
