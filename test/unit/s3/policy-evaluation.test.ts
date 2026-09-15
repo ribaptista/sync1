@@ -36,7 +36,7 @@ describe("evaluatePathTargetClass", () => {
 
   it("resolves overlapping policies by priority order (lower first), not glob specificity", () => {
     const policies = [
-      policy(1, "archive/*", "GLACIER", 0), // checked first
+      policy(1, "archive/**", "GLACIER", 0), // checked first
       policy(2, "archive/keep-warm/*", "STANDARD", 1), // more specific, but lower priority
     ];
     // Both globs match this path; priority 0 wins even though the other
@@ -49,7 +49,7 @@ describe("evaluatePathTargetClass", () => {
   it("respects priority ordering regardless of array order passed in", () => {
     const policies = [
       policy(2, "archive/keep-warm/*", "STANDARD", 1),
-      policy(1, "archive/*", "GLACIER", 0),
+      policy(1, "archive/**", "GLACIER", 0),
     ];
     // caller is responsible for pre-sorting (as
     // listNonDefaultByPriority does) -- this just walks in the given order

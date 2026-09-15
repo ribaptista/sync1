@@ -1,53 +1,132 @@
 import { describe, it, expect } from "vitest";
-import Database from "better-sqlite3";
-import { globToRegExp, matchesAnyGlob } from "../../../src/fs/glob-match.js";
+import { matchesAnyGlob } from "../../../src/fs/glob-match.js";
 
-function realSqliteGlob(pattern: string, testPath: string): boolean {
-  const db = new Database(":memory:");
-  try {
-    const row = db.prepare("SELECT ? GLOB ? AS m").get(testPath, pattern) as { m: number };
-    return row.m === 1;
-  } finally {
-    db.close();
-  }
+function matches(pattern: string, path: string): boolean {
+  return matchesAnyGlob(path, [pattern]).matched;
 }
 
-const CASES: Array<[pattern: string, path: string]> = [
-  ["*.txt", "a.txt"],
-  ["*.txt", "a.txt.bak"],
-  ["*.txt", ""],
-  ["photos/*", "photos/img.jpg"],
-  ["photos/*", "photos/sub/img.jpg"],
-  ["photos/*", "other/img.jpg"],
-  ["a?c", "abc"],
-  ["a?c", "ac"],
-  ["a?c", "abbc"],
-  ["[abc].txt", "a.txt"],
-  ["[abc].txt", "b.txt"],
-  ["[abc].txt", "d.txt"],
-  ["[a-c].txt", "a.txt"],
-  ["[a-c].txt", "b.txt"],
-  ["[a-c].txt", "z.txt"],
-  ["[^abc].txt", "d.txt"],
-  ["[^abc].txt", "a.txt"],
-  ["ABC", "abc"],
-  ["abc", "abc"],
-  ["*", "anything/at/all.ext"],
-  ["*", ""],
-  ["exact.txt", "exact.txt"],
-  ["exact.txt", "Exact.txt"],
-  ["file.[ch]", "file.c"],
-  ["file.[ch]", "file.h"],
-  ["file.[ch]", "file.o"],
-];
+describe("matchesAnyGlob: basic pattern syntax", () => {
+  it("'*' matches zero or more characters within one segment", () => {
+    expect(matches("*.txt", "a.txt")).toBe(true);
+    expect(matches("*.txt", "a.txt.bak")).toBe(false);
+    expect(matches("*", "anything.ext")).toBe(true);
+  });
 
-describe("globToRegExp matches real SQLite GLOB semantics", () => {
-  it.each(CASES)("pattern %j vs path %j", (pattern, path) => {
-    expect(globToRegExp(pattern).test(path)).toBe(realSqliteGlob(pattern, path));
+  it("'?' matches exactly one character", () => {
+    expect(matches("a?c", "abc")).toBe(true);
+    expect(matches("a?c", "ac")).toBe(false);
+    expect(matches("a?c", "abbc")).toBe(false);
+  });
+
+  it("'[...]'/'[^...]'/'[!...]' character classes", () => {
+    expect(matches("[abc].txt", "a.txt")).toBe(true);
+    expect(matches("[abc].txt", "d.txt")).toBe(false);
+    expect(matches("[a-c].txt", "b.txt")).toBe(true);
+    expect(matches("[a-c].txt", "z.txt")).toBe(false);
+    expect(matches("[^abc].txt", "d.txt")).toBe(true);
+    expect(matches("[^abc].txt", "a.txt")).toBe(false);
+    expect(matches("[!abc].txt", "d.txt")).toBe(true);
+  });
+
+  it("matching is case-sensitive", () => {
+    expect(matches("ABC", "abc")).toBe(false);
+    expect(matches("abc", "abc")).toBe(true);
+  });
+
+  it("dotfiles/dot-directories are matched like any other name (dot: true)", () => {
+    expect(matches("*", ".hidden")).toBe(true);
+    expect(matches("**", ".hidden/deep/.dot")).toBe(true);
   });
 });
 
-describe("matchesAnyGlob", () => {
+describe("matchesAnyGlob: segment-bound '*'/'?' (the accepted behavior change)", () => {
+  it("'*' does not cross '/' -- unlike the old SQLite-GLOB-compatible matcher", () => {
+    expect(matches("*.txt", "sub/a.txt")).toBe(false);
+    expect(matches("photos/*", "photos/img.jpg")).toBe(true);
+    expect(matches("photos/*", "photos/sub/img.jpg")).toBe(false);
+  });
+});
+
+describe("matchesAnyGlob: '**' (native, always on for every call site)", () => {
+  it("a lone '**' matches everything, including an empty path", () => {
+    expect(matches("**", "")).toBe(true);
+    expect(matches("**", "a")).toBe(true);
+    expect(matches("**", "a/b/c.txt")).toBe(true);
+  });
+
+  it("'**/xyz/*' matches xyz/ at the root and nested under any number of levels", () => {
+    expect(matches("**/xyz/*", "xyz/foo.txt")).toBe(true);
+    expect(matches("**/xyz/*", "a/b/xyz/foo.txt")).toBe(true);
+    expect(matches("**/xyz/*", "xyz/sub/foo.txt")).toBe(false);
+    expect(matches("**/xyz/*", "notxyz/foo.txt")).toBe(false);
+  });
+
+  it("'xyz/**/*.jpg' matches directly inside xyz/ and under any number of nested levels", () => {
+    expect(matches("xyz/**/*.jpg", "xyz/foo.jpg")).toBe(true);
+    expect(matches("xyz/**/*.jpg", "xyz/a/b/foo.jpg")).toBe(true);
+    expect(matches("xyz/**/*.jpg", "other/foo.jpg")).toBe(false);
+    expect(matches("xyz/**/*.jpg", "xyz/foo.png")).toBe(false);
+  });
+
+  it("'**' at the end matches anything nested under the prefix (but not the bare prefix itself)", () => {
+    expect(matches("photos/**", "photos/img.jpg")).toBe(true);
+    expect(matches("photos/**", "photos/sub/img.jpg")).toBe(true);
+    expect(matches("photos/**", "photos")).toBe(false);
+    expect(matches("photos/**", "other/img.jpg")).toBe(false);
+  });
+
+  it("consecutive '**' segments collapse to one", () => {
+    expect(matches("a/**/**/b", "a/b")).toBe(true);
+    expect(matches("a/**/**/b", "a/x/y/b")).toBe(true);
+    expect(matches("a/**/**/b", "a/c")).toBe(false);
+  });
+
+  it("character classes and '?' still work per-segment alongside '**'", () => {
+    expect(matches("**/file.[ch]", "file.c")).toBe(true);
+    expect(matches("**/file.[ch]", "a/b/file.h")).toBe(true);
+    expect(matches("**/file.[ch]", "file.o")).toBe(false);
+  });
+});
+
+describe("matchesAnyGlob: brace expansion (new capability)", () => {
+  it("'{a,b}' expands to alternatives", () => {
+    expect(matches("*.{jpg,png}", "a.jpg")).toBe(true);
+    expect(matches("*.{jpg,png}", "a.png")).toBe(true);
+    expect(matches("*.{jpg,png}", "a.gif")).toBe(false);
+  });
+
+  it("combines with '**'", () => {
+    expect(matches("**/*.{jpg,png}", "a/b/c.png")).toBe(true);
+    expect(matches("**/*.{jpg,png}", "a/b/c.gif")).toBe(false);
+  });
+});
+
+describe("matchesAnyGlob: negation, comments, and extglob are all disabled", () => {
+  it("a leading '!' is matched literally, never treated as whole-pattern negation", () => {
+    expect(matches("!foo", "!foo")).toBe(true);
+    expect(matches("!foo", "foo")).toBe(false);
+  });
+
+  it("a leading '#' is matched literally, never treated as a comment line", () => {
+    expect(matches("#foo", "#foo")).toBe(true);
+    expect(matches("#foo", "foo")).toBe(false);
+  });
+
+  it("extglob syntax is inert -- parens/pipe are literal characters", () => {
+    expect(matches("+(a|b).txt", "+(a|b).txt")).toBe(true);
+    expect(matches("+(a|b).txt", "a.txt")).toBe(false);
+  });
+});
+
+describe("matchesAnyGlob: escaped literal wildcard characters", () => {
+  it("'\\*' and '\\?' match a filename that actually contains '*'/'?'", () => {
+    expect(matches("file\\*.txt", "file*.txt")).toBe(true);
+    expect(matches("file\\*.txt", "fileX.txt")).toBe(false);
+    expect(matches("file\\?.txt", "file?.txt")).toBe(true);
+  });
+});
+
+describe("matchesAnyGlob: list semantics", () => {
   it("returns the first matching pattern", () => {
     const result = matchesAnyGlob("photos/img.jpg", ["*.log", "photos/*", "*.tmp"]);
     expect(result).toEqual({ matched: true, pattern: "photos/*" });
@@ -60,76 +139,5 @@ describe("matchesAnyGlob", () => {
 
   it("returns matched:false for an empty pattern list", () => {
     expect(matchesAnyGlob("anything.txt", [])).toEqual({ matched: false });
-  });
-});
-
-describe("allowDoubleStar", () => {
-  it("without the option, '**' behaves exactly like the existing single-'*' semantics", () => {
-    // Untouched default behavior: each '*' independently matches any run of
-    // characters including '/', so "**/xyz/*" is just "require a literal
-    // '/xyz/' substring somewhere" -- it does NOT match a root-level
-    // "xyz/foo.txt" (no leading '/' before "xyz"), unlike double-star mode.
-    expect(globToRegExp("**/xyz/*").test("xyz/foo.txt")).toBe(false);
-    expect(globToRegExp("**/xyz/*").test("a/b/xyz/foo.txt")).toBe(true);
-  });
-
-  it("'**/xyz/*' matches xyz/ at the root and nested under any number of levels", () => {
-    const re = globToRegExp("**/xyz/*", { allowDoubleStar: true });
-    expect(re.test("xyz/foo.txt")).toBe(true);
-    expect(re.test("a/b/xyz/foo.txt")).toBe(true);
-    expect(re.test("xyz/sub/foo.txt")).toBe(false);
-    expect(re.test("notxyz/foo.txt")).toBe(false);
-  });
-
-  it("'xyz/**/*.jpg' matches directly inside xyz/ and under any number of nested levels", () => {
-    const re = globToRegExp("xyz/**/*.jpg", { allowDoubleStar: true });
-    expect(re.test("xyz/foo.jpg")).toBe(true);
-    expect(re.test("xyz/a/b/foo.jpg")).toBe(true);
-    expect(re.test("other/foo.jpg")).toBe(false);
-    expect(re.test("xyz/foo.png")).toBe(false);
-  });
-
-  it("a lone '**' matches everything, including an empty path", () => {
-    const re = globToRegExp("**", { allowDoubleStar: true });
-    expect(re.test("")).toBe(true);
-    expect(re.test("a")).toBe(true);
-    expect(re.test("a/b/c.txt")).toBe(true);
-  });
-
-  it("consecutive '**' segments collapse to one", () => {
-    const re = globToRegExp("a/**/**/b", { allowDoubleStar: true });
-    expect(re.test("a/b")).toBe(true);
-    expect(re.test("a/x/y/b")).toBe(true);
-    expect(re.test("a/c")).toBe(false);
-  });
-
-  it("a non-'**' segment never matches across a '/' even in double-star mode", () => {
-    const re = globToRegExp("photos/*", { allowDoubleStar: true });
-    expect(re.test("photos/img.jpg")).toBe(true);
-    expect(re.test("photos/sub/img.jpg")).toBe(false);
-  });
-
-  it("'**' at the very end matches the exact prefix plus anything nested under it", () => {
-    const re = globToRegExp("photos/**", { allowDoubleStar: true });
-    expect(re.test("photos")).toBe(true);
-    expect(re.test("photos/img.jpg")).toBe(true);
-    expect(re.test("photos/sub/img.jpg")).toBe(true);
-    expect(re.test("other/img.jpg")).toBe(false);
-  });
-
-  it("character classes and '?' still work per-segment in double-star mode", () => {
-    const re = globToRegExp("**/file.[ch]", { allowDoubleStar: true });
-    expect(re.test("file.c")).toBe(true);
-    expect(re.test("a/b/file.h")).toBe(true);
-    expect(re.test("file.o")).toBe(false);
-  });
-
-  it("matchesAnyGlob forwards the option through to globToRegExp", () => {
-    const result = matchesAnyGlob("xyz/foo.jpg", ["**/xyz/*"], { allowDoubleStar: true });
-    expect(result).toEqual({ matched: true, pattern: "**/xyz/*" });
-    // Same path/pattern, option omitted -- falls back to the untouched
-    // default semantics, which requires a literal '/xyz/' substring and so
-    // does not match this root-level path.
-    expect(matchesAnyGlob("xyz/foo.jpg", ["**/xyz/*"])).toEqual({ matched: false });
   });
 });

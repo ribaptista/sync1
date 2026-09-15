@@ -97,7 +97,7 @@ function policyMatches(
   relativePath: string,
   mimeType: string,
 ): boolean {
-  if (!matchesAnyGlob(relativePath, [policy.glob], { allowDoubleStar: true }).matched) {
+  if (!matchesAnyGlob(relativePath, [policy.glob]).matched) {
     return false;
   }
   return policy.mimeTypes.some((pattern) => mimeTypeMatches(pattern, mimeType));
@@ -105,9 +105,7 @@ function policyMatches(
 
 /** Cheap, in-memory, zero-I/O pre-filter: only a path whose glob already matches *some* policy is ever worth probing at all. */
 function anyGlobMatches(relativePath: string, policies: readonly ThumbnailPolicyRow[]): boolean {
-  return policies.some(
-    (p) => matchesAnyGlob(relativePath, [p.glob], { allowDoubleStar: true }).matched,
-  );
+  return policies.some((p) => matchesAnyGlob(relativePath, [p.glob]).matched);
 }
 
 type PolicyResolution = { action: "skip" } | { action: "generate"; policy: ThumbnailPolicyRow };
@@ -287,7 +285,7 @@ export async function scanThumbnails(
       continue;
     }
 
-    if (glob && !matchesAnyGlob(relativePath, [glob], { allowDoubleStar: true }).matched) continue;
+    if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
     if (!anyGlobMatches(relativePath, policies)) continue;
 
     await waitForRoom(pool, poolQueueLimit);
