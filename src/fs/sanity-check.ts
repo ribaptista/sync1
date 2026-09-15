@@ -9,6 +9,7 @@ import type { ObjectsRepository } from "../db/repositories/objects-repository.js
 import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { BoundedTaskTracker, waitForRoom } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
+import type { OnProgress } from "../progress-types.js";
 
 export interface HashMismatch {
   path: string;
@@ -47,6 +48,18 @@ export interface SanityCheckResult {
  * unit-tested without a real or mocked S3 client.
  */
 export type ObjectExistsChecker = (s3Key: string) => Promise<boolean>;
+
+/**
+ * Byte accounting for the one kind of work in this scan that's actually
+ * worth tracking bytes for -- an actual hash of real file content. A
+ * directory, a stub (its declared hash is read synchronously, never
+ * hashed), and an out-of-scope (filterGlob) path all contribute 0, per
+ * the universal counting rule in src/progress-types.ts.
+ */
+interface ByteTracking {
+  trackDispatched(size: number): void;
+  trackCompleted(size: number): void;
+}
 
 function emptyResult(): SanityCheckResult {
   return {
@@ -112,7 +125,7 @@ export async function performSanityCheck(
   s3Pool: PQueue,
   s3QueueLimit: number,
   filterGlob?: string,
-  onProgress?: (scanned: number) => void,
+  onProgress?: OnProgress,
 ): Promise<SanityCheckResult> {
   const result = emptyResult();
   const ignoreGlobs = ignorePoliciesRepo.listGlobs();
@@ -120,12 +133,31 @@ export async function performSanityCheck(
     filterGlob === undefined || matchesAnyGlob(p, [filterGlob]).matched;
   const hashJobs = new BoundedTaskTracker(maxInFlightHashes);
 
+  // filesDone/filesTotal track every row the merge-join consumes (mirroring
+  // this scan's pre-existing "scanned" counter); bytesDone/bytesTotal track
+  // only content actually hashed this run -- see ByteTracking above.
+  let scanned = 0;
+  let bytesTotal = 0;
+  let bytesDone = 0;
+  const report = (): void => {
+    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
+  };
+  const byteTracking: ByteTracking = {
+    trackDispatched(size) {
+      bytesTotal += size;
+      report();
+    },
+    trackCompleted(size) {
+      bytesDone += size;
+      report();
+    },
+  };
+
   const fsIter = walk(root);
   const entryIter = entriesRepo.iterateAllSortedByPath();
 
   let fsNext = await fsIter.next();
   let entryNext = entryIter.next();
-  let scanned = 0;
 
   while (!fsNext.done || !entryNext.done) {
     const fsEntry = fsNext.done ? null : fsNext.value;
@@ -161,6 +193,7 @@ export async function performSanityCheck(
           hashJobs,
           s3Pool,
           s3QueueLimit,
+          byteTracking,
         );
       }
       fsNext = await fsIter.next();
@@ -168,7 +201,7 @@ export async function performSanityCheck(
     }
 
     scanned++;
-    onProgress?.(scanned);
+    report();
   }
 
   // Draining order matters: a hash job's own completion is what enqueues
@@ -195,6 +228,7 @@ async function dispatchTrackedEntryCheck(
   hashJobs: BoundedTaskTracker,
   s3Pool: PQueue,
   s3QueueLimit: number,
+  byteTracking: ByteTracking,
 ): Promise<void> {
   if (entry.type === "dir") return; // directories carry no content -- existence is the only signal, already confirmed by reaching here
 
@@ -207,8 +241,10 @@ async function dispatchTrackedEntryCheck(
   const absolutePath = path.join(root, entry.path);
 
   if (fsEntry.representation === "real") {
+    byteTracking.trackDispatched(fsEntry.size);
     await hashJobs.dispatch(async () => {
       const actualHash = await hashRunner.run(absolutePath);
+      byteTracking.trackCompleted(fsEntry.size);
       logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
       if (entry.hash !== null && actualHash !== entry.hash) {
         result.hashMismatch.push({ path: entry.path, expectedHash: entry.hash, actualHash });

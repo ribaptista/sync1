@@ -17,6 +17,7 @@ import {
   type SanityCheckResult,
 } from "../../../src/fs/sanity-check.js";
 import type { HashRunner } from "../../../src/concurrency/hash-runner.js";
+import type { OnProgress } from "../../../src/progress-types.js";
 
 const silentLogger = {
   debug: () => {},
@@ -44,7 +45,7 @@ const alwaysExists: ObjectExistsChecker = (s3Key) => Promise.resolve(existingS3K
 function run(
   objectExists: ObjectExistsChecker,
   filterGlob?: string,
-  options: { hashRunner?: HashRunner } = {},
+  options: { hashRunner?: HashRunner; onProgress?: OnProgress } = {},
 ): Promise<SanityCheckResult> {
   return performSanityCheck(
     root,
@@ -58,6 +59,7 @@ function run(
     new PQueue({ concurrency: 4 }),
     8,
     filterGlob,
+    options.onProgress,
   );
 }
 
@@ -377,5 +379,61 @@ describe("performSanityCheck: concurrency", () => {
 
     const result = await resultPromise;
     expect(result.missingInS3.map((m) => m.path).sort()).toEqual(paths);
+  });
+});
+
+describe("performSanityCheck: byte progress", () => {
+  it("grows bytesTotal on dispatch, and only advances bytesDone once the hash resolves", async () => {
+    const hash = hashBufferHex(Buffer.from("hello")); // 5 bytes
+    touch("a.txt", "hello");
+    seedObject(hash, "objects/a", 5);
+    seedEntry("a.txt", hash);
+
+    let resolveHash!: (hash: string) => void;
+    const hashRunner: HashRunner = {
+      run: () => new Promise<string>((resolve) => (resolveHash = resolve)),
+    };
+
+    const updates: {
+      filesDone: number;
+      filesTotal: number;
+      bytesDone: number;
+      bytesTotal: number;
+    }[] = [];
+    const resultPromise = run(alwaysExists, undefined, {
+      hashRunner,
+      onProgress: (u) => updates.push({ ...u }),
+    });
+
+    await vi.waitFor(() => expect(resolveHash).toBeDefined());
+    expect(updates.some((u) => u.bytesTotal === 5 && u.bytesDone === 0)).toBe(true);
+    expect(updates.every((u) => u.bytesDone === 0)).toBe(true);
+
+    resolveHash(hash);
+    await resultPromise;
+
+    expect(updates.at(-1)).toMatchObject({ bytesDone: 5, bytesTotal: 5 });
+  });
+
+  it("a directory contributes 0 bytes", async () => {
+    fs.mkdirSync(path.join(root, "photos"));
+    seedEntry("photos", null, "dir");
+
+    const updates: { bytesDone: number; bytesTotal: number }[] = [];
+    await run(alwaysExists, undefined, { onProgress: (u) => updates.push({ ...u }) });
+
+    expect(updates.every((u) => u.bytesDone === 0 && u.bytesTotal === 0)).toBe(true);
+  });
+
+  it("a stub contributes 0 bytes (its declared hash is read synchronously, never hashed)", async () => {
+    const hash = hashBufferHex(Buffer.from("steady content"));
+    writeStubAtomic(path.join(root, "img.jpg.stub"), hash);
+    seedObject(hash, "objects/img", 14);
+    seedEntry("img.jpg", hash);
+
+    const updates: { bytesDone: number; bytesTotal: number }[] = [];
+    await run(alwaysExists, undefined, { onProgress: (u) => updates.push({ ...u }) });
+
+    expect(updates.every((u) => u.bytesDone === 0 && u.bytesTotal === 0)).toBe(true);
   });
 });

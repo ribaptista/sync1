@@ -16,7 +16,11 @@ import {
   resolveConcurrencyOptions,
   type GlobalConcurrencyOptions,
 } from "../cli/concurrency-options.js";
-import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
+import {
+  shouldShowProgress,
+  startBytesProgressSession,
+  createLoggerForRun,
+} from "../cli/progress.js";
 
 interface SanityCheckOptions extends OptionValues {
   root: string;
@@ -148,11 +152,7 @@ async function runSanityCheck(
   // connection now, unlike when this held a real cursor open throughout.
   const db = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
-  const progress = startProgressSession({
-    show: showProgress,
-    overallLabel: "checking",
-    overallUnit: "entries",
-  });
+  const progress = startBytesProgressSession({ show: showProgress, overallLabel: "checking" });
 
   try {
     const entriesRepo = new EntriesRepository(db);
@@ -176,9 +176,9 @@ async function runSanityCheck(
       pools.s3,
       pools.s3.concurrency * 2,
       opts.filter,
-      (n) => {
-        progress.setOverallTotal(n);
-        progress.advanceOverall(1);
+      (u) => {
+        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
+        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
       },
     );
   } finally {
