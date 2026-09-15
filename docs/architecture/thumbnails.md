@@ -172,6 +172,8 @@ removed in a `finally`, even when generation fails partway through.
 Classification (filesystem walk + mime probe + policy resolution) and generation both dispatch through
 the same named pool, `pools.thumbnail` (a fourth `PQueue` alongside the existing three — see
 [concurrency-and-progress.md](concurrency-and-progress.md)), sized by the global `--thumbnail-parallelism`
-flag (default 4). One overall progress bar (files processed) is enough here — matching
-`update_cache`/`sanity_check`'s complexity level, not `materialize`'s per-file byte-throughput bars, since
-"files processed" is the natural progress unit for this command.
+flag (default 4). One overall progress bar (files processed) is enough here — this command deliberately
+stays on the plain item-count `ProgressSession` (see concurrency-and-progress.md's "Progress bars and
+`--verbose`" section), not the combined files+bytes+ETA `BytesProgressSession` used by
+`update_cache`/`sync`/`materialize`/`stubify`/`sanity_check`, since thumbnail generation isn't a
+byte-transfer/hash operation -- "files processed" is the natural progress unit for this command.

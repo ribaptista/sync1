@@ -130,9 +130,53 @@ open if the _caller_ redirected it there (`sync1 sync --verbose --root ~/x 3>/tm
 tool never opens a file itself. If fd 3 isn't open, verbose output is silently discarded (after a
 one-time notice explaining why) rather than corrupting the bars or crashing.
 
-`startProgressSession` returns a real `cli-progress` `MultiBar`-backed session when bars should show,
-or a no-op "null object" session otherwise — callers always call the same `setOverallTotal`/
-`advanceOverall`/`addChildBar` methods either way, so a command's own logic never branches on whether
-bars are actually rendering. A bar's total can grow live as a scan discovers more items than an
-initial estimate (the same `setTotal`-on-overflow behavior every such command shares), since the true
-total often isn't known upfront for a glob-scoped or whole-tree scan.
+`src/cli/progress.ts` exposes **two** session types, chosen per command by what that command actually
+measures:
+
+- **`ProgressSession`** (`startProgressSession`) — a plain item-count bar (`{value}/{total} <unit>`),
+  used by `gc`, `converge`, and `status`. None of those transfer or hash file content, so a byte total
+  wouldn't mean anything for them.
+- **`BytesProgressSession`** (`startBytesProgressSession`) — used by every command that actually
+  hashes, uploads, or downloads file content: `update_cache`, `sync`, `materialize`, `stubify`, and
+  `sanity_check`. A single bar shows both a file count and a byte count, but **only bytes ever drive
+  the bar's own internal total/current** — and therefore `{eta_formatted}`'s real math — since an ETA
+  derived from item _count_ alone would be misleading when file sizes vary wildly (hashing one 4GB
+  video vs. ten 1KB text files). File counts ride along purely as custom payload tokens, cosmetic only:
+  ```
+  ${label} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- ETA {eta_formatted}
+  ```
+  `{eta_formatted}` (and `{duration_formatted}`) are `cli-progress`'s own built-in tokens — the bar
+  computes ETA automatically from real `total`/`current` values fed to it. An earlier iteration of this
+  code had a fully-implemented but never-wired-up nested-bar API (`ChildBar`/`addChildBar`) that
+  hand-rolled its own throughput/rate math; it was deleted outright rather than adapted, since its
+  per-file-nested-bar shape didn't fit "one combined overall bar" anyway, and `cli-progress` already
+  does this correctly for free.
+
+Both session types share the same "only grows" convention for totals (`setOverallTotal`/
+`setOverallTotals` never shrinks a total that's already been set, since the true total often isn't
+known upfront for a glob-scoped or whole-tree scan) and the same null-object pattern (a no-op session
+when bars shouldn't show, so a command's own logic never branches on whether bars are actually
+rendering).
+
+Every domain function in `BytesProgressSession`'s scope takes an `onProgress?: OnProgress` parameter
+(`src/progress-types.ts` — kept as its own leaf module, not part of `src/cli/*`, since `src/fs/*` and
+`src/sync/*` never import from `src/cli/*` and this type needs to cross that boundary without inverting
+it) and reports `{ filesDone, filesTotal, bytesDone, bytesTotal }`. The counting rule is the same
+everywhere: **`filesDone`/`filesTotal` count every row a scan/merge-join consumes**, whether or not it
+actually needed work — unchanged from what every command already reported before byte tracking existed.
+**`bytesDone`/`bytesTotal` count only content actually hashed/uploaded/downloaded this run** — a
+directory, an already-resolved stub (hash read from the stub file itself, never hashed), a
+no-op/unchanged/dedup-skip row, and (for `stubify`) the common mtime-unchanged fast path all contribute
+exactly 0 to both. A size is known synchronously (from cache.db's `entries.size` column, or from
+`objects.size` for anything keyed by content hash) at classification time, before a job is dispatched —
+so `bytesTotal` grows at dispatch and `bytesDone` advances at completion, the same decide/dispatch/join
+shape as everything else in this doc.
+
+`sync` is the one command whose progress spans more than one domain function: `performSync` runs three
+phases fully sequentially (`performUpdateCache`, then `applyLocalChangesToCandidate`, then
+`applyRemoteChangesToLocal`), each of which reports its own progress starting from zero. Reporting each
+phase's raw numbers straight through would make the bar visibly reset twice per run. Instead,
+`performSync` keeps a `base: ProgressUpdate` accumulator: the `onProgress` handed to whichever phase is
+currently running adds `base` on top of that phase's own numbers before forwarding outward, and once a
+phase resolves, its last reported update is folded into `base` before the next phase starts. The bar
+the user sees is one running total across the whole sync, not three resets.

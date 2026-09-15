@@ -6,7 +6,7 @@ Internally runs `update_cache` first, so you never need to run that separately b
 ## Usage
 
 ```bash
-sync1 sync --root <local-path> [--json] [--verbose] [--hash-parallelism <n>] [--file-stream-parallelism <n>]
+sync1 sync --root <local-path> [--json] [--verbose] [--hash-parallelism <n>] [--file-stream-parallelism <n>] [--no-progress]
 ```
 
 ## Options
