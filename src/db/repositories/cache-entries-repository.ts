@@ -2,6 +2,8 @@ import type Database from "better-sqlite3";
 import type { EntryType } from "./entries-repository.js";
 import { toCollisionKey } from "../../fs/case-collision.js";
 import { paginateKeyset } from "../keyset-pagination.js";
+import { paginateKeysetFilteredByGlob } from "../glob-scan.js";
+import { literalPrefixOf } from "../../fs/glob-match.js";
 
 export type CacheState = "created" | "modified" | "deleted" | "unchanged";
 
@@ -122,16 +124,32 @@ export class CacheEntriesRepository {
     return concatenated();
   }
 
-  /** SQLite's native GLOB operator against `path` -- used by materialize/stubify. Keyset-paginated, same reasoning as iterateAllSortedByPath. */
+  /**
+   * Matched in memory via `matchesAnyGlob` (see src/fs/glob-match.ts) over
+   * a keyset-paginated scan of `entries` -- no SQL `GLOB` filter, since
+   * minimatch's dialect doesn't correspond to any SQLite operator. See
+   * src/db/glob-scan.ts for how the scan still stays efficient for the
+   * common case (a literal filename, or a well-anchored subtree), seeded
+   * by `pattern`'s literal prefix rather than a true full scan every time.
+   * Used by `materialize`/`stubify`.
+   */
   iterateByGlobSortedByPath(pattern: string): IterableIterator<CacheEntryRow> {
-    return paginateKeyset<CacheEntryRow, string>(
+    const literalPrefix = literalPrefixOf(pattern);
+    return paginateKeysetFilteredByGlob<CacheEntryRow>(
       (after, limit) =>
-        this.db
-          .prepare<[string, string, number], CacheEntryRow>(
-            `SELECT ${ROW_COLUMNS} FROM entries WHERE path GLOB ? AND path > ? ORDER BY path ASC LIMIT ?`,
-          )
-          .all(pattern, after ?? "", limit),
+        after === null
+          ? this.db
+              .prepare<[string, number], CacheEntryRow>(
+                `SELECT ${ROW_COLUMNS} FROM entries WHERE path >= ? ORDER BY path ASC LIMIT ?`,
+              )
+              .all(literalPrefix, limit)
+          : this.db
+              .prepare<[string, number], CacheEntryRow>(
+                `SELECT ${ROW_COLUMNS} FROM entries WHERE path > ? ORDER BY path ASC LIMIT ?`,
+              )
+              .all(after, limit),
       (row) => row.path,
+      pattern,
     );
   }
 

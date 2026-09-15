@@ -3,7 +3,10 @@ import { openStateDb, openCacheDb } from "../../../src/db/connection.js";
 import { VersionsRepository } from "../../../src/db/repositories/versions-repository.js";
 import { ObjectsRepository } from "../../../src/db/repositories/objects-repository.js";
 import { EntriesRepository } from "../../../src/db/repositories/entries-repository.js";
-import { CacheEntriesRepository } from "../../../src/db/repositories/cache-entries-repository.js";
+import {
+  CacheEntriesRepository,
+  type CacheEntryRow,
+} from "../../../src/db/repositories/cache-entries-repository.js";
 import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
 import { StoragePoliciesRepository } from "../../../src/db/repositories/storage-policies-repository.js";
 import { ThumbnailPoliciesRepository } from "../../../src/db/repositories/thumbnail-policies-repository.js";
@@ -423,6 +426,67 @@ describe("CacheEntriesRepository (cache.db)", () => {
     // a tombstone must never block a legitimately different case-variant
     // path from being accepted (e.g. a rename's create half)
     expect(repo.findByNormalizedPath("file.txt", "FILE.txt")).toBeUndefined();
+  });
+
+  describe("iterateByGlobSortedByPath", () => {
+    function row(path: string): CacheEntryRow {
+      return {
+        path,
+        type: "file",
+        mtime: 1,
+        hash: "h1",
+        size: 1,
+        state: "unchanged",
+        parent_state_version: "v0",
+      };
+    }
+
+    it("matches a '**' pattern across nested directories", () => {
+      const db = openCacheDb(":memory:");
+      const repo = new CacheEntriesRepository(db);
+      repo.upsert(row("photos/a.jpg"));
+      repo.upsert(row("photos/sub/b.jpg"));
+      repo.upsert(row("docs/c.txt"));
+
+      const paths = [...repo.iterateByGlobSortedByPath("photos/**/*.jpg")].map((r) => r.path);
+      expect(paths).toEqual(["photos/a.jpg", "photos/sub/b.jpg"]);
+    });
+
+    it("matches dotfiles like any other name", () => {
+      const db = openCacheDb(":memory:");
+      const repo = new CacheEntriesRepository(db);
+      repo.upsert(row(".env"));
+      repo.upsert(row("readme.md"));
+
+      const paths = [...repo.iterateByGlobSortedByPath("*")].map((r) => r.path);
+      expect(paths).toEqual([".env", "readme.md"]);
+    });
+
+    it("still finds every match for a leading-wildcard pattern (no literal prefix to seed from)", () => {
+      const db = openCacheDb(":memory:");
+      const repo = new CacheEntriesRepository(db);
+      repo.upsert(row("a.jpg"));
+      repo.upsert(row("sub/b.jpg"));
+      repo.upsert(row("z.jpg"));
+
+      const paths = [...repo.iterateByGlobSortedByPath("*.jpg")].map((r) => r.path);
+      expect(paths).toEqual(["a.jpg", "z.jpg"]); // segment-bound '*' excludes "sub/b.jpg"
+    });
+
+    it("a literal-prefix-anchored pattern excludes a sibling sharing only a raw string prefix", () => {
+      const db = openCacheDb(":memory:");
+      const repo = new CacheEntriesRepository(db);
+      repo.upsert(row("Photos/2024/a.jpg"));
+      // Shares the raw string prefix "Photos/2024" but is not actually
+      // under that directory -- the seed/stop range in glob-scan.ts is
+      // deliberately loose (a byte-prefix bound, not a path-segment
+      // bound), so this row gets visited; matchesAnyGlob must still
+      // reject it.
+      repo.upsert(row("Photos/20245.txt"));
+
+      const paths = [...repo.iterateByGlobSortedByPath("Photos/2024/*.jpg")].map((r) => r.path);
+      expect(paths).toEqual(["Photos/2024/a.jpg"]);
+    });
   });
 });
 
