@@ -23,7 +23,22 @@ export interface S3ClientOptions {
 }
 
 export function createS3Client(opts: S3ClientOptions): S3Client {
-  const config: S3ClientConfig = { region: opts.region ?? "us-east-1" };
+  const config: S3ClientConfig = {
+    region: opts.region ?? "us-east-1",
+    // Every streamed upload body (encryptStream, see src/crypto/streaming-
+    // codec.ts) yields its ~50-byte chunked-encryption header as its own
+    // first read, ahead of much larger per-chunk data. The SDK's default
+    // flexible-checksums behavior wraps a streamed body in AWS's
+    // "aws-chunked" transfer encoding using the *underlying stream's own*
+    // read sizes as the wire chunk boundaries, and AWS S3 rejects any
+    // non-final chunk under 8192 bytes ("InvalidChunkSizeError") -- hit on
+    // real S3 for every single-PUT (non-multipart) upload, since the tiny
+    // header read is never the last chunk. `requestStreamBufferSize`
+    // (>= 8192) is the SDK's own documented fix: below this size, reads are
+    // buffered together before chunk-encoding. LocalStack doesn't enforce
+    // the minimum, which is why this never surfaced in the e2e suite.
+    requestStreamBufferSize: 65_536,
+  };
   if (opts.endpoint) {
     config.endpoint = opts.endpoint;
     // path-style is required by LocalStack and most S3-compatible backends;
