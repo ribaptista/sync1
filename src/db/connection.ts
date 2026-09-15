@@ -6,10 +6,9 @@ import type { Logger } from "../logger.js";
 
 // NOTE: migrations are loaded from .sql files on disk next to this module.
 // The dev/test flow runs via tsx directly against src/, so this resolves
-// correctly today. If/when `npm run build` (tsc) becomes the real
-// distribution path, the build step will need to also copy
-// src/db/migrations/**/*.sql into dist/db/migrations/ — tsc does not copy
-// non-.ts assets on its own.
+// correctly there. For a real `npm run build`, tsc doesn't copy non-.ts
+// assets on its own -- the "postbuild" script (scripts/copy-migrations.js)
+// copies src/db/migrations/{state,cache}/*.sql into dist/db/migrations/.
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 export function openStateDb(filePath: string, logger?: Logger): Database.Database {
