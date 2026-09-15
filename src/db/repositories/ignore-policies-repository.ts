@@ -45,7 +45,11 @@ export class IgnorePoliciesRepository {
     return result.changes > 0;
   }
 
-  /** Every glob, for preloading before a merge-join that can't query mid-iteration. */
+  /**
+   * Every glob, for preloading before a merge-join -- matching happens in
+   * memory (there's no SQL GLOB anywhere in this codebase), so this avoids
+   * re-evaluating the same small pattern list from scratch per scanned path.
+   */
   listGlobs(): string[] {
     return this.db
       .prepare<[], { glob: string }>("SELECT glob FROM ignore_policies")

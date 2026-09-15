@@ -23,8 +23,7 @@ CREATE INDEX idx_pending_normalized_path ON pending(normalized_path);
  * first-ever scan of a large library, would grow to the size of the whole
  * tree) -- see docs/architecture/cache-and-filesystem-scanning.md. Lives on
  * its own connection/file for the run's duration, entirely separate from
- * cache.db's connection, so it never conflicts with the open `.iterate()`
- * cursor update_cache holds on cache.db while walking the merge-join.
+ * cache.db's connection.
  *
  * `normalized_path` is populated now (rather than added later) because it's
  * needed for case-collision detection -- see docs/architecture/

@@ -105,11 +105,12 @@ export async function performUpdateCache(
     caseCollisions: [],
   };
 
-  // Loaded once, up front: the list itself is expected to be tiny, and both
-  // this loop and apply-remote-changes.ts's hold an open .iterate() cursor
-  // for their whole duration, so a per-path SQL GLOB query against that
-  // same connection isn't an option. See docs/architecture/
-  // ignore-and-storage-policies.md.
+  // Loaded once, up front: the list itself is expected to be tiny, and
+  // matching against it happens in memory either way (there's no SQL GLOB
+  // anywhere in this codebase, see docs/architecture/ignore-and-storage-
+  // policies.md) -- preloading just avoids re-evaluating the same small
+  // pattern list from scratch per path, and this loop's other side (the
+  // filesystem walk) was never SQL rows to begin with.
   const ignoreGlobs = ignorePoliciesRepo.listGlobs();
 
   const stagingPath = tempSiblingPath(cacheDbPath, "update-cache-staging");
