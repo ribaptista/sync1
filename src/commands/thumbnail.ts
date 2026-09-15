@@ -121,7 +121,7 @@ function registerThumbnailSubcommand(
     .command(mode)
     .description(description)
     .requiredOption("--root <path>", "local directory to scan")
-    .option("--glob <pattern>", "glob pattern (supports **) scoping which files to consider")
+    .option("--glob <pattern>", "glob pattern scoping which files to consider")
     .action(async (opts: ThumbnailRunOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;

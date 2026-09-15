@@ -32,7 +32,7 @@ export function registerStatusCommand(program: Command): void {
       "Report how each tracked object's actual S3 storage class compares to what storage_policy implies",
     )
     .requiredOption("--root <path>", "local directory whose vault to inspect")
-    .option("--filter <glob>", "SQLite GLOB pattern scoping which tracked paths to consider", "*")
+    .option("--filter <glob>", "glob pattern scoping which tracked paths to consider", "*")
     .action(async (opts: StatusOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;

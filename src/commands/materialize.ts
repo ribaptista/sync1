@@ -45,7 +45,7 @@ export function registerMaterializeCommand(program: Command): void {
   program
     .command("materialize")
     .description("Download and materialize stub files matching a glob pattern")
-    .argument("<glob>", "SQLite GLOB pattern matched against tracked paths")
+    .argument("<glob>", "glob pattern matched against tracked paths")
     .requiredOption("--root <path>", "local directory to operate on")
     .option("--request-retrieval", "request temporary S3 restore for archived (cold) objects")
     .action(async (glob: string, opts: MaterializeOptions, command: Command) => {

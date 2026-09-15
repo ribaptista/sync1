@@ -119,7 +119,7 @@ async function runDelete(
 export function registerIgnoreCommand(program: Command): void {
   const ignore = program
     .command("ignore")
-    .description("Manage global ignore policies (GLOB patterns kept out of the vault entirely)");
+    .description("Manage global ignore policies (glob patterns kept out of the vault entirely)");
 
   ignore
     .command("list")
@@ -148,7 +148,7 @@ export function registerIgnoreCommand(program: Command): void {
   ignore
     .command("create")
     .description("Create a new ignore policy")
-    .argument("<glob>", "SQLite GLOB pattern to ignore")
+    .argument("<glob>", "glob pattern to ignore")
     .requiredOption("--root <path>", "local directory whose vault to modify")
     .action(async (glob: string, opts: RootOption, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -172,7 +172,7 @@ export function registerIgnoreCommand(program: Command): void {
     .command("edit")
     .description("Edit an existing ignore policy's glob")
     .argument("<id>", "policy id")
-    .argument("<glob>", "new SQLite GLOB pattern")
+    .argument("<glob>", "new glob pattern")
     .requiredOption("--root <path>", "local directory whose vault to modify")
     .action(async (idRaw: string, glob: string, opts: RootOption, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();

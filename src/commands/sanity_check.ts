@@ -51,7 +51,7 @@ export function registerSanityCheckCommand(program: Command): void {
       "Read-only diagnostic: cross-checks state.db against S3 and the local filesystem for bugs (never repairs anything)",
     )
     .requiredOption("--root <path>", "local directory to check")
-    .option("--filter <glob>", "SQLite GLOB pattern scoping which tracked paths to check")
+    .option("--filter <glob>", "glob pattern scoping which tracked paths to check")
     .action(async (opts: SanityCheckOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;

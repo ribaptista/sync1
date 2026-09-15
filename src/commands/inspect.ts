@@ -45,9 +45,9 @@ export function registerInspectCommand(program: Command): void {
   program
     .command("inspect")
     .description(
-      "Query cache.db/state.db for a path or SQLite GLOB pattern, as JSON -- meant for scripting and other tools built on top of this vault",
+      "Query cache.db/state.db for a path or glob pattern, as JSON -- meant for scripting and other tools built on top of this vault",
     )
-    .argument("<path-or-glob>", "an exact tracked path, or a SQLite GLOB pattern")
+    .argument("<path-or-glob>", "an exact tracked path, or a glob pattern")
     .requiredOption("--root <path>", "local directory to inspect")
     .action(async (pathOrGlob: string, opts: InspectOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();

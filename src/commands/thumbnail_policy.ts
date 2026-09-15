@@ -278,7 +278,7 @@ export function registerThumbnailPolicyCommand(program: Command): void {
   const thumbnailPolicy = program
     .command("thumbnail_policy")
     .description(
-      "Manage global thumbnail-generation policies (GLOB + mime-type patterns mapped to skip/generate)",
+      "Manage global thumbnail-generation policies (glob + mime-type patterns mapped to skip/generate)",
     );
 
   thumbnailPolicy
@@ -312,7 +312,7 @@ export function registerThumbnailPolicyCommand(program: Command): void {
   thumbnailPolicy
     .command("create")
     .description("Create a new thumbnail policy")
-    .argument("<glob>", "glob pattern (supports ** across any number of directory levels)")
+    .argument("<glob>", "glob pattern")
     .argument("<action>", "skip or generate")
     .requiredOption("--root <path>", "local directory whose vault to modify")
     .requiredOption("--mime-types <csv>", 'comma-separated mime types, e.g. "image/jpeg,video/*"')

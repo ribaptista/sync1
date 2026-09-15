@@ -170,7 +170,7 @@ export function registerStoragePolicyCommand(program: Command): void {
   const storagePolicy = program
     .command("storage_policy")
     .description(
-      "Manage global storage-class policies (GLOB patterns mapped to a target S3 storage class)",
+      "Manage global storage-class policies (glob patterns mapped to a target S3 storage class)",
     );
 
   storagePolicy
@@ -205,7 +205,7 @@ export function registerStoragePolicyCommand(program: Command): void {
   storagePolicy
     .command("create")
     .description("Create a new storage-class policy")
-    .argument("<glob>", "SQLite GLOB pattern matched against tracked paths")
+    .argument("<glob>", "glob pattern matched against tracked paths")
     .argument("<class>", "target storage class: STANDARD, GLACIER, or DEEP_ARCHIVE")
     .requiredOption("--root <path>", "local directory whose vault to modify")
     .option(
@@ -246,7 +246,7 @@ export function registerStoragePolicyCommand(program: Command): void {
     .description("Edit an existing storage-class policy")
     .argument("<id>", "policy id")
     .requiredOption("--root <path>", "local directory whose vault to modify")
-    .option("--glob <glob>", "new SQLite GLOB pattern (rejected for the default policy)")
+    .option("--glob <glob>", "new glob pattern (rejected for the default policy)")
     .option("--class <class>", "new target storage class")
     .option("--priority <n>", "new priority (rejected for the default policy)")
     .action(async (idRaw: string, opts: EditOptions, command: Command) => {

@@ -31,7 +31,7 @@ export function registerStubifyCommand(program: Command): void {
   program
     .command("stubify")
     .description("Replace fully-committed real files matching a glob pattern with stubs")
-    .argument("<glob>", "SQLite GLOB pattern matched against tracked paths")
+    .argument("<glob>", "glob pattern matched against tracked paths")
     .requiredOption("--root <path>", "local directory to operate on")
     .action(async (glob: string, opts: StubifyOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();

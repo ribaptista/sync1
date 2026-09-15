@@ -32,7 +32,7 @@ export function registerConvergeCommand(program: Command): void {
       "Apply storage_policy: move each tracked object's actual S3 storage class to match what the policies imply",
     )
     .requiredOption("--root <path>", "local directory whose vault to operate on")
-    .option("--filter <glob>", "SQLite GLOB pattern scoping which tracked paths to converge", "*")
+    .option("--filter <glob>", "glob pattern scoping which tracked paths to converge", "*")
     .action(async (opts: ConvergeOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
