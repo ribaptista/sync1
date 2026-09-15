@@ -178,4 +178,99 @@ describe("sync (local-to-remote, single machine)", () => {
 
     fs.rmSync(root, { recursive: true, force: true });
   });
+
+  it("sync --json --verbose reports the full JSON shape unchanged across upload, delete, and remote-pull phases", async () => {
+    // Byte-progress tracking (added alongside upload/download work in this
+    // command's phases) is purely a progress-bar side channel -- this
+    // asserts the JSON shape it's threaded through is still exactly what it
+    // was before that internal restructuring (including the
+    // pendingUploads/pendingDownloads -> streamPool.onIdle() simplification).
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const rootA = mkTempRoot();
+    const rootB = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        rootA,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    fs.writeFileSync(path.join(rootA, "keep.txt"), "kept content");
+    fs.writeFileSync(path.join(rootA, "gone.txt"), "will be deleted");
+    const firstSync = await runCli(["sync", "--root", rootA, "--json", "--verbose"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(firstSync.exitCode).toBe(0);
+
+    await runCli(
+      [
+        "attach_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        rootB,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    // Exercises apply-local-changes.ts's upload (keep.txt's new content) and
+    // delete (gone.txt) branches in the same run.
+    fs.rmSync(path.join(rootA, "gone.txt"));
+    fs.writeFileSync(path.join(rootA, "keep.txt"), "kept content, edited");
+    const secondSync = await runCli(["sync", "--root", rootA, "--json", "--verbose"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(secondSync.exitCode).toBe(0);
+    const parsedA = JSON.parse(secondSync.stdout) as Record<string, unknown>;
+    expect(parsedA).toEqual({
+      ok: true,
+      version_stamp: expect.any(String),
+      nothing_to_sync: false,
+      uploaded_objects: 1,
+      deduped_objects: 0,
+      local_entries_changed: 2,
+      remote_created: 0,
+      remote_modified: 0,
+      remote_deleted: 0,
+      conflicts: [],
+      case_collisions: [],
+      ignored_but_synced: [],
+    });
+
+    // B's first sync pulls A's committed state down -- exercises
+    // apply-remote-changes.ts's stub-write (no-download) branch.
+    const syncB = await runCli(["sync", "--root", rootB, "--json", "--verbose"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(syncB.exitCode).toBe(0);
+    const parsedB = JSON.parse(syncB.stdout) as Record<string, unknown>;
+    expect(parsedB).toEqual({
+      ok: true,
+      version_stamp: expect.any(String),
+      nothing_to_sync: false,
+      uploaded_objects: 0,
+      deduped_objects: 0,
+      local_entries_changed: 0,
+      remote_created: 1,
+      remote_modified: 0,
+      remote_deleted: 0,
+      conflicts: [],
+      case_collisions: [],
+      ignored_but_synced: [],
+    });
+
+    fs.rmSync(rootA, { recursive: true, force: true });
+    fs.rmSync(rootB, { recursive: true, force: true });
+  });
 });

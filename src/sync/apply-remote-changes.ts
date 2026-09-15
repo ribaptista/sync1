@@ -17,6 +17,7 @@ import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "../fs/decrypt-to-file.js";
 import { waitForRoom } from "../concurrency/pools.js";
+import type { OnProgress } from "../progress-types.js";
 
 /**
  * A path materialized (or stub-updated) here despite matching a global
@@ -35,6 +36,17 @@ export interface ApplyRemoteChangesResult {
   modified: number;
   deleted: number;
   ignoredButSynced: IgnoredButSyncedEntry[];
+}
+
+/**
+ * Byte accounting for the one kind of work here that's actually worth
+ * tracking bytes for -- a real download. A directory, a stub write (no
+ * download), and a remote deletion all contribute 0, per the universal
+ * counting rule in progress-types.ts.
+ */
+interface ByteTracking {
+  trackDispatched(size: number): void;
+  trackCompleted(size: number): void;
 }
 
 /**
@@ -65,7 +77,7 @@ export interface ApplyRemoteChangesResult {
  * download is *dispatched* to `streamPool` rather than awaited inline: the
  * merge-join loop advances to the next path immediately, and up to
  * `streamQueueLimit` downloads run concurrently in the background, joined
- * (via `Promise.all`) before this function returns. No in-memory
+ * via `streamPool.onIdle()` before this function returns. No in-memory
  * ledger/bookkeeping is needed for this pass the way apply-local-changes.ts
  * needs one -- this function does no cross-row collision or dedup
  * detection of its own, so a dispatched download never needs to be looked
@@ -93,11 +105,32 @@ export async function applyRemoteChangesToLocal(
   logger: Logger,
   streamPool: PQueue,
   streamQueueLimit: number,
+  onProgress?: OnProgress,
 ): Promise<ApplyRemoteChangesResult> {
   const candidateEntries = new EntriesRepository(candidateDb);
   const candidateObjects = new ObjectsRepository(candidateDb);
   const ignoreGlobs = new IgnorePoliciesRepository(candidateDb).listGlobs();
-  const pendingDownloads: Promise<void>[] = [];
+
+  // filesDone/filesTotal track every path the merge-join consumes (work-
+  // needing or not, mirroring other commands' "scanned" counter);
+  // bytesDone/bytesTotal track only an actual download -- see the
+  // ByteTracking interface above.
+  let scanned = 0;
+  let bytesTotal = 0;
+  let bytesDone = 0;
+  const report = (): void => {
+    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
+  };
+  const byteTracking: ByteTracking = {
+    trackDispatched(size) {
+      bytesTotal += size;
+      report();
+    },
+    trackCompleted(size) {
+      bytesDone += size;
+      report();
+    },
+  };
 
   {
     const cacheIter = cacheRepo.iterateAllSortedByPath();
@@ -137,7 +170,7 @@ export async function applyRemoteChangesToLocal(
             logger,
             streamPool,
             streamQueueLimit,
-            pendingDownloads,
+            byteTracking,
           );
           result.created++;
 
@@ -181,16 +214,19 @@ export async function applyRemoteChangesToLocal(
             logger,
             streamPool,
             streamQueueLimit,
-            pendingDownloads,
+            byteTracking,
           );
           result.modified++;
         }
         cacheNext = cacheIter.next();
         candidateNext = candidateIter.next();
       }
+
+      scanned++;
+      report();
     }
 
-    await Promise.all(pendingDownloads);
+    await streamPool.onIdle();
 
     return result;
   }
@@ -220,7 +256,7 @@ async function applyRemoteContentChange(
   logger: Logger,
   streamPool: PQueue,
   streamQueueLimit: number,
-  pendingDownloads: Promise<void>[],
+  byteTracking: ByteTracking,
 ): Promise<void> {
   const absolutePath = path.join(root, entry.path);
 
@@ -272,8 +308,9 @@ async function applyRemoteContentChange(
   }
 
   const hash = entry.hash;
+  byteTracking.trackDispatched(objectRow.size);
   await waitForRoom(streamPool, streamQueueLimit);
-  const downloadDone = streamPool.add(async () => {
+  void streamPool.add(async () => {
     const encrypted = await getObjectStream(
       s3.client,
       s3.bucket,
@@ -317,12 +354,13 @@ async function applyRemoteContentChange(
       state: "unchanged",
       parent_state_version: newBaselineVersion,
     });
+    byteTracking.trackCompleted(objectRow.size);
     logger.debug({ path: entry.path, hash }, "materialized remote file create/modify");
     logger.debug(
       { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
       "completed",
     );
-  }) as Promise<void>;
+  });
   // Logged after add(), not before -- add() synchronously starts the task
   // (if capacity allows) before returning, so this reflects occupancy
   // *including* the job just dispatched.
@@ -330,7 +368,6 @@ async function applyRemoteContentChange(
     { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
     "dispatched",
   );
-  pendingDownloads.push(downloadDone);
 }
 
 function applyRemoteDelete(

@@ -14,6 +14,7 @@ import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
 import { waitForRoom } from "../concurrency/pools.js";
+import type { OnProgress } from "../progress-types.js";
 
 export interface ApplyLocalChangesResult {
   uploadedObjects: number;
@@ -84,6 +85,7 @@ export async function applyLocalChangesToCandidate(
   logger: Logger,
   streamPool: PQueue,
   streamQueueLimit: number,
+  onProgress?: OnProgress,
 ): Promise<ApplyLocalChangesResult> {
   const objectsRepo = new ObjectsRepository(candidateDb);
   const entriesRepo = new EntriesRepository(candidateDb);
@@ -101,6 +103,18 @@ export async function applyLocalChangesToCandidate(
   const handledPaths = new Set<string>();
   const conflicts: Array<{ path: string; reason: string }> = [];
 
+  // filesDone/filesTotal track every dirty row consumed across both passes
+  // (mirroring other commands' "scanned" counter); bytesDone/bytesTotal
+  // track only an actual upload -- a delete, a no-op/conflict resolution,
+  // or a same-batch dedup attach all contribute 0, per the universal
+  // counting rule in progress-types.ts.
+  let scanned = 0;
+  let bytesTotal = 0;
+  let bytesDone = 0;
+  const report = (): void => {
+    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
+  };
+
   const iter = dirtyRows[Symbol.iterator]();
   let next = iter.next();
 
@@ -109,6 +123,8 @@ export async function applyLocalChangesToCandidate(
   // row, handing off to Pass 2 below without consuming it.
   while (!next.done && next.value.state === "deleted") {
     const row = next.value;
+    scanned++;
+    report();
     const existingEntry = entriesRepo.get(row.path);
     const decision = decideLocalChange(row, existingEntry);
 
@@ -132,11 +148,12 @@ export async function applyLocalChangesToCandidate(
   // Pass 2: creates/modifies.
   const inFlightByHash = new Map<string, InFlightUpload>();
   const inFlightByNormalizedPath = new Map<string, string>();
-  const pendingUploads: Promise<void>[] = [];
 
   while (!next.done) {
     const row = next.value;
     next = iter.next();
+    scanned++;
+    report();
 
     // Only a genuinely new path can newly collide -- "modified" targets a
     // path that already exists, so decideLocalChange's own exact-path
@@ -215,11 +232,22 @@ export async function applyLocalChangesToCandidate(
     const job: InFlightUpload = { sourceRows: [{ path: row.path, type: row.type }] };
     inFlightByHash.set(hash, job);
 
+    // non-null: row.type === "file" (checked above) and this loop only ever
+    // reaches this point for a non-deleted row (Pass 1 already consumed
+    // every "deleted" row), and the DB's CHECK constraint (see
+    // 0004_add_size.sql) guarantees size is NOT NULL for any such row.
+    // Reading it here -- before dispatch -- is also what fixes this upload
+    // path's own gap: size used to only be known *inside* the dispatched
+    // job (a fresh fs.statSync there), after a whole batch might already be
+    // in flight.
+    const size = row.size!;
+    bytesTotal += size;
+    report();
+
     await waitForRoom(streamPool, streamQueueLimit);
-    const uploadDone = streamPool.add(async () => {
+    void streamPool.add(async () => {
       const absolutePath = path.join(root, row.path);
       const context = Buffer.from(hash, "hex");
-      const size = fs.statSync(absolutePath).size;
       const sourceStream = fs.createReadStream(absolutePath);
       const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
       const key = objectKey(hash);
@@ -232,6 +260,8 @@ export async function applyLocalChangesToCandidate(
       );
       objectsRepo.upsert({ hash, s3_key: key, size });
       uploadedObjects++;
+      bytesDone += size;
+      report();
       for (const sourceRow of job.sourceRows) {
         entriesRepo.upsert({
           path: sourceRow.path,
@@ -245,7 +275,7 @@ export async function applyLocalChangesToCandidate(
         { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
         "completed",
       );
-    }) as Promise<void>;
+    });
     // Logged after add(), not before -- add() synchronously starts the task
     // (if capacity allows) before returning, so this reflects occupancy
     // *including* the job just dispatched.
@@ -253,10 +283,9 @@ export async function applyLocalChangesToCandidate(
       { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
       "dispatched",
     );
-    pendingUploads.push(uploadDone);
   }
 
-  await Promise.all(pendingUploads);
+  await streamPool.onIdle();
 
   return { uploadedObjects, dedupedObjects, handledPaths, appliedCount, conflicts };
 }

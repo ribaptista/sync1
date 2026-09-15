@@ -28,6 +28,7 @@ import {
 import { localCacheDbPath, localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
 import { renameWithRetry, copyFileWithRetry } from "../fs/safe-fs.js";
+import type { OnProgress, ProgressUpdate } from "../progress-types.js";
 
 export interface SyncConflict {
   path: string;
@@ -109,9 +110,41 @@ export async function performSync(
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
   pools: ConcurrencyPools,
+  onProgress?: OnProgress,
 ): Promise<SyncResult> {
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
+
+  // performSync runs three phases fully sequentially (performUpdateCache,
+  // then applyLocalChangesToCandidate, then applyRemoteChangesToLocal),
+  // each reporting its own progress from zero -- but sync's caller wants
+  // one running total across all three, not a counter that resets twice
+  // mid-run. `base` accumulates the final tally of every phase already
+  // finished; `phaseProgress` (handed to whichever phase is currently
+  // running) adds `base` on top of that phase's own numbers before
+  // forwarding outward. `advanceBase()` folds the just-finished phase's
+  // last reported update into `base` and resets the tracker for the next
+  // phase to start from zero again.
+  let base: ProgressUpdate = { filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0 };
+  let lastPhaseUpdate: ProgressUpdate = base;
+  const phaseProgress: OnProgress = (u) => {
+    lastPhaseUpdate = u;
+    onProgress?.({
+      filesDone: base.filesDone + u.filesDone,
+      filesTotal: base.filesTotal + u.filesTotal,
+      bytesDone: base.bytesDone + u.bytesDone,
+      bytesTotal: base.bytesTotal + u.bytesTotal,
+    });
+  };
+  const advanceBase = (): void => {
+    base = {
+      filesDone: base.filesDone + lastPhaseUpdate.filesDone,
+      filesTotal: base.filesTotal + lastPhaseUpdate.filesTotal,
+      bytesDone: base.bytesDone + lastPhaseUpdate.bytesDone,
+      bytesTotal: base.bytesTotal + lastPhaseUpdate.bytesTotal,
+    };
+    lastPhaseUpdate = { filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0 };
+  };
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
@@ -142,11 +175,13 @@ export async function performSync(
           logger,
           pools.hash,
           pools.hash.maxThreads,
+          phaseProgress,
         );
       } finally {
         stateDbForScan.close();
       }
     }
+    advanceBase();
 
     const dirtyCount = cacheRepo.countDirty();
 
@@ -222,7 +257,9 @@ export async function performSync(
           logger,
           pools.stream,
           pools.stream.concurrency * 2,
+          phaseProgress,
         );
+        advanceBase();
 
         // A version is only worth committing if something *actually*
         // mutated entries/objects -- a sync where every dirty row resolved
@@ -244,7 +281,9 @@ export async function performSync(
           logger,
           pools.stream,
           pools.stream.concurrency * 2,
+          phaseProgress,
         );
+        advanceBase();
       } finally {
         candidateDb.close(); // checkpoints WAL before we read the file back
       }

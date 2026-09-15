@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Command, OptionValues } from "commander";
-import { createLogger, type Logger } from "../logger.js";
+import type { Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError, EXIT_CONFLICT } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
@@ -15,6 +15,11 @@ import {
   resolveConcurrencyOptions,
   type GlobalConcurrencyOptions,
 } from "../cli/concurrency-options.js";
+import {
+  shouldShowProgress,
+  startBytesProgressSession,
+  createLoggerForRun,
+} from "../cli/progress.js";
 
 interface SyncOptions extends OptionValues {
   root: string;
@@ -23,6 +28,7 @@ interface SyncOptions extends OptionValues {
 interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
+  progress?: boolean;
 }
 
 export function registerSyncCommand(program: Command): void {
@@ -33,13 +39,14 @@ export function registerSyncCommand(program: Command): void {
     .action(async (opts: SyncOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
-      // sync's progress-bar/fd-3 wiring lands with the rest of its own
-      // restructuring (its remote-apply pass isn't dispatch/join-based yet)
-      // -- plain stderr logging for now, same as before this plan.
-      const logger = createLogger(globalOpts.verbose ?? false).child({ command: "sync" });
+      const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
+      const logger = createLoggerForRun({
+        verbose: globalOpts.verbose ?? false,
+        showProgress,
+      }).child({ command: "sync" });
 
       try {
-        const result = await runSync(opts, globalOpts, logger);
+        const result = await runSync(opts, globalOpts, logger, showProgress);
         const hasConflicts = result.conflicts.length > 0;
         const hasCaseCollisions = result.caseCollisions.length > 0;
         const hasIssues = hasConflicts || hasCaseCollisions;
@@ -107,6 +114,7 @@ async function runSync(
   opts: SyncOptions,
   globalOpts: GlobalOptions,
   logger: Logger,
+  showProgress: boolean,
 ): Promise<SyncResult> {
   const root = path.resolve(opts.root);
   const sync1DirPath = sync1Dir(root);
@@ -124,6 +132,8 @@ async function runSync(
   const location: RemoteLocation = { bucket: remoteConfig.bucket, prefix };
 
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
+  const progress = startBytesProgressSession({ show: showProgress, overallLabel: "syncing" });
+
   try {
     return await performSync(
       root,
@@ -131,8 +141,13 @@ async function runSync(
       { client, bucket: remoteConfig.bucket, location },
       logger,
       pools,
+      (u) => {
+        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
+        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
+      },
     );
   } finally {
+    progress.stop();
     await pools.hash.close();
   }
 }

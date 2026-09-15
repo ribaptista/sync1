@@ -9,6 +9,7 @@ import { EntriesRepository } from "../../../src/db/repositories/entries-reposito
 import { ObjectsRepository } from "../../../src/db/repositories/objects-repository.js";
 import { VersionsRepository } from "../../../src/db/repositories/versions-repository.js";
 import { hashBufferHex } from "../../../src/crypto/hash.js";
+import type { ProgressUpdate } from "../../../src/progress-types.js";
 
 vi.mock("../../../src/s3/client.js", () => ({
   // Drains the body stream, same as a real S3 client would -- otherwise the
@@ -259,6 +260,169 @@ describe("applyLocalChangesToCandidate: same-batch dedup and collision (Pass 2)"
     const entriesRepo = new EntriesRepository(candidateDb);
     expect(entriesRepo.get("photo.jpg")?.hash).toBe(hashBufferHex(Buffer.from("content one")));
     expect(entriesRepo.get("Photo.jpg")).toBeUndefined();
+
+    candidateDb.close();
+  });
+});
+
+describe("applyLocalChangesToCandidate: byte progress", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-progress-test-"));
+    putObjectStreamMock.mockClear();
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function touch(relPath: string, content: string): void {
+    fs.writeFileSync(path.join(root, relPath), content);
+  }
+
+  it("dispatch grows bytesTotal before completion advances bytesDone, for a genuine upload", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "new upload content";
+    touch("a.txt", content);
+    const hash = hashBufferHex(Buffer.from(content));
+
+    const dirtyRow = {
+      path: "a.txt",
+      type: "file" as const,
+      mtime: 1,
+      hash,
+      size: content.length,
+      state: "created" as const,
+      parent_state_version: "v0",
+    };
+
+    const updates: ProgressUpdate[] = [];
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [dirtyRow],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      (u) => updates.push(u),
+    );
+
+    expect(result.uploadedObjects).toBe(1);
+    // some report happened right after dispatch, before the upload settled
+    expect(updates.some((u) => u.bytesTotal === content.length && u.bytesDone === 0)).toBe(true);
+    expect(updates[updates.length - 1]).toEqual({
+      filesDone: 1,
+      filesTotal: 1,
+      bytesDone: content.length,
+      bytesTotal: content.length,
+    });
+
+    candidateDb.close();
+  });
+
+  it("a same-batch dedup attach contributes 0 bytes but still counts toward filesDone/filesTotal", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    touch("a.txt", "shared content");
+    touch("b.txt", "shared content");
+    const hash = hashBufferHex(Buffer.from("shared content"));
+
+    const dirtyRows = [
+      {
+        path: "a.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: 14,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+      {
+        path: "b.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: 14,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const updates: ProgressUpdate[] = [];
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      (u) => updates.push(u),
+    );
+
+    expect(result.uploadedObjects).toBe(1);
+    expect(result.dedupedObjects).toBe(1);
+    // only one file's worth of content is ever uploaded -- the dedup'd
+    // second row contributes 0 bytes, even though both rows count toward
+    // filesDone/filesTotal.
+    expect(updates[updates.length - 1]).toEqual({
+      filesDone: 2,
+      filesTotal: 2,
+      bytesDone: 14,
+      bytesTotal: 14,
+    });
+
+    candidateDb.close();
+  });
+
+  it("a deleted row contributes 0 bytes but still advances filesDone/filesTotal", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    new ObjectsRepository(candidateDb).upsert({
+      hash: "a".repeat(64),
+      s3_key: `objects/${"a".repeat(64)}`,
+      size: 5,
+    });
+    new EntriesRepository(candidateDb).upsert({
+      path: "a.txt",
+      type: "file",
+      hash: "a".repeat(64),
+      state_version: "v0",
+    });
+
+    const dirtyRow = {
+      path: "a.txt",
+      type: "file" as const,
+      mtime: 1000,
+      hash: null,
+      size: null,
+      state: "deleted" as const,
+      parent_state_version: "v0",
+    };
+
+    const updates: ProgressUpdate[] = [];
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [dirtyRow],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      (u) => updates.push(u),
+    );
+
+    expect(result.appliedCount).toBe(1);
+    expect(updates).toEqual([{ filesDone: 1, filesTotal: 1, bytesDone: 0, bytesTotal: 0 }]);
 
     candidateDb.close();
   });
