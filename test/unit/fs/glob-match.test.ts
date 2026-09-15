@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { matchesAnyGlob } from "../../../src/fs/glob-match.js";
+import { matchesAnyGlob, literalPrefixOf } from "../../../src/fs/glob-match.js";
 
 function matches(pattern: string, path: string): boolean {
   return matchesAnyGlob(path, [pattern]).matched;
@@ -139,5 +139,41 @@ describe("matchesAnyGlob: list semantics", () => {
 
   it("returns matched:false for an empty pattern list", () => {
     expect(matchesAnyGlob("anything.txt", [])).toEqual({ matched: false });
+  });
+});
+
+describe("literalPrefixOf", () => {
+  it("returns the leading literal directory run for a pattern like 'Photos/**'", () => {
+    expect(literalPrefixOf("Photos/**")).toBe("Photos");
+  });
+
+  it("returns '' when the first segment already has a wildcard", () => {
+    expect(literalPrefixOf("**/xyz/*")).toBe("");
+    expect(literalPrefixOf("*.jpg")).toBe("");
+  });
+
+  it("returns the full pattern when it has no wildcards at all", () => {
+    expect(literalPrefixOf("a/b/c.txt")).toBe("a/b/c.txt");
+    expect(literalPrefixOf("hello.txt")).toBe("hello.txt");
+  });
+
+  it("stops at the first segment containing '*', '?', or '['", () => {
+    expect(literalPrefixOf("a/b/*.jpg")).toBe("a/b");
+    expect(literalPrefixOf("a/b?/c.jpg")).toBe("a");
+    expect(literalPrefixOf("a/[abc]/c.jpg")).toBe("a");
+  });
+
+  it("stops correctly for a wildcard nested several levels deep", () => {
+    expect(literalPrefixOf("a/b/c/d/**/e.jpg")).toBe("a/b/c/d");
+  });
+
+  it("returns '' for a lone '*' or '**'", () => {
+    expect(literalPrefixOf("*")).toBe("");
+    expect(literalPrefixOf("**")).toBe("");
+  });
+
+  it("returns '' for a brace-expanded pattern -- no single shared prefix across alternatives", () => {
+    expect(literalPrefixOf("*.{jpg,png}")).toBe("");
+    expect(literalPrefixOf("{a,b}/x.jpg")).toBe("");
   });
 });

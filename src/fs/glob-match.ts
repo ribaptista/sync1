@@ -47,3 +47,32 @@ export function matchesAnyGlob(path: string, patterns: readonly string[]): GlobM
   }
   return { matched: false };
 }
+
+/**
+ * The longest leading run of wildcard-free, `/`-joined path segments in
+ * `pattern`, or `""` if the first segment already contains a wildcard (or
+ * `pattern` brace-expands into more than one alternative, each with its own
+ * possibly-different prefix -- there's no single shared prefix to report in
+ * that case). Derived directly from minimatch's own parse tree (`.set`, a
+ * public, typed property -- also how the `glob` package implements this
+ * exact walk-pruning technique) rather than a second, independently
+ * hand-rolled wildcard detector that could silently disagree with what
+ * minimatch actually treats as literal.
+ *
+ * Purely a scan-pruning optimization for callers (`src/db/glob-scan.ts`'s
+ * keyset-scan range, and `thumbnail`'s filesystem-walk-root pruning for
+ * `--glob`) -- returning `""` never affects correctness, only pruning
+ * effectiveness; every candidate path is still independently tested against
+ * the real pattern via `matchesAnyGlob`.
+ */
+export function literalPrefixOf(pattern: string): string {
+  const { set } = new Minimatch(pattern, MINIMATCH_OPTIONS);
+  if (set.length !== 1) return "";
+
+  const literal: string[] = [];
+  for (const segment of set[0]!) {
+    if (typeof segment !== "string") break; // first wildcard/GLOBSTAR segment -- stop
+    literal.push(segment);
+  }
+  return literal.join("/");
+}
