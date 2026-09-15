@@ -14,6 +14,7 @@ import { stubPathFor } from "./stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "./decrypt-to-file.js";
 import { waitForRoom } from "../concurrency/pools.js";
+import type { OnProgress } from "../progress-types.js";
 
 export interface MaterializeStats {
   materialized: number;
@@ -59,7 +60,7 @@ export async function materializeGlob(
   s3QueueLimit: number,
   streamPool: PQueue,
   streamQueueLimit: number,
-  onProgress?: (scanned: number) => void,
+  onProgress?: OnProgress,
 ): Promise<MaterializeStats> {
   const stats: MaterializeStats = {
     materialized: 0,
@@ -69,15 +70,27 @@ export async function materializeGlob(
     pending: 0,
   };
 
+  // filesDone/filesTotal track every glob-matched row (mirroring this
+  // scan's pre-existing "scanned" counter, regardless of whether it
+  // actually needed a download); bytesDone/bytesTotal track only a
+  // genuine download -- a stub whose object turns out cold (needs a
+  // restore request, or is still pending one) contributes 0 to bytes,
+  // since nothing is downloaded this run.
+  let scanned = 0;
+  let bytesTotal = 0;
+  let bytesDone = 0;
+  const report = (): void => {
+    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
+  };
+
   // A single connection/repo covers both the glob scan and cacheRepo.upsert()
   // below: iterateByGlobSortedByPath() is keyset-paginated (src/db/keyset-
   // pagination.ts), not a live `.iterate()` cursor, so the write can safely
   // interleave with it -- a write only ever conflicts with a *paused*
   // cursor, and pagination never leaves one paused between pages.
-  let scanned = 0;
   for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
     scanned++;
-    onProgress?.(scanned);
+    report();
     if (row.type !== "file") continue;
     const absolutePath = path.join(root, row.path);
     const stubAbsolutePath = stubPathFor(absolutePath);
@@ -117,6 +130,8 @@ export async function materializeGlob(
       logger.debug({ path: row.path, hash, status }, "classified archive status");
 
       if (status === "immediate" || status === "restore-ready") {
+        bytesTotal += objectRow.size;
+        report();
         await waitForRoom(streamPool, streamQueueLimit);
         void streamPool.add(async () => {
           const encrypted = await getObjectStream(s3.client, s3.bucket, key);
@@ -150,6 +165,8 @@ export async function materializeGlob(
 
           cacheRepo.upsert({ ...row, mtime: Math.round(fs.statSync(absolutePath).mtimeMs) });
           stats.materialized++;
+          bytesDone += objectRow.size;
+          report();
           logger.debug({ path: row.path }, "materialized");
           logger.debug(
             { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },

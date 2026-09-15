@@ -24,7 +24,11 @@ import {
   resolveConcurrencyOptions,
   type GlobalConcurrencyOptions,
 } from "../cli/concurrency-options.js";
-import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
+import {
+  shouldShowProgress,
+  startBytesProgressSession,
+  createLoggerForRun,
+} from "../cli/progress.js";
 
 interface MaterializeOptions extends OptionValues {
   root: string;
@@ -102,16 +106,12 @@ async function runMaterialize(
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
   const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
-  const progress = startProgressSession({
-    show: showProgress,
-    overallLabel: "materializing",
-    overallUnit: "entries",
-  });
+  const progress = startBytesProgressSession({ show: showProgress, overallLabel: "materializing" });
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
     const objectsRepo = new ObjectsRepository(stateDb);
-    progress.setOverallTotal(Math.max(cacheRepo.count(), 1));
+    progress.setOverallTotals({ files: Math.max(cacheRepo.count(), 1) });
     return await materializeGlob(
       root,
       glob,
@@ -125,9 +125,9 @@ async function runMaterialize(
       pools.s3.concurrency * 2,
       pools.stream,
       pools.stream.concurrency * 2,
-      (n) => {
-        progress.setOverallTotal(n);
-        progress.advanceOverall(1);
+      (u) => {
+        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
+        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
       },
     );
   } finally {

@@ -83,6 +83,62 @@ describe("materialize / stubify", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("materialize --json reports the full stats shape unchanged, mixing already-real and downloaded files", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    fs.writeFileSync(path.join(root, "stubbed.jpg"), "content that gets stubbed");
+    fs.writeFileSync(path.join(root, "real.jpg"), "content that stays real");
+    await runCli(["sync", "--root", root, "--json"], { env: { SYNC1_PASSWORD: PASSWORD } });
+    await runCli(["stubify", "stubbed.jpg", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+
+    // Byte-progress tracking (added alongside real-download work in this
+    // command's job-completion callbacks) is purely a progress-bar side
+    // channel -- this asserts the JSON stats shape it's threaded through is
+    // still exactly what it was before that internal restructuring.
+    const materialize = await runCli(["materialize", "*.jpg", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(materialize.exitCode).toBe(0);
+    const parsed = JSON.parse(materialize.stdout) as {
+      ok: boolean;
+      materialized: number;
+      already_real: number;
+      needs_retrieval: number;
+      retrieval_requested: number;
+      pending: number;
+    };
+    expect(parsed).toEqual({
+      ok: true,
+      materialized: 1,
+      already_real: 1,
+      needs_retrieval: 0,
+      retrieval_requested: 0,
+      pending: 0,
+    });
+    expect(fs.readFileSync(path.join(root, "stubbed.jpg"), "utf8")).toBe(
+      "content that gets stubbed",
+    );
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   it("stubify refuses a file with uncommitted local changes", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
     const bucket = await createFreshBucket(s3);
