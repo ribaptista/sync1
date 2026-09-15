@@ -231,6 +231,7 @@ async function applyRemoteContentChange(
       type: "dir",
       mtime: Math.round(fs.statSync(absolutePath).mtimeMs),
       hash: null,
+      size: null,
       state: "unchanged",
       parent_state_version: newBaselineVersion,
     });
@@ -255,6 +256,11 @@ async function applyRemoteContentChange(
       type: "file",
       mtime: Math.round(fs.statSync(stubAbsolutePath).mtimeMs),
       hash: entry.hash,
+      // The stub itself has no content bytes -- objectRow.size is the real
+      // size of the content it refers to, and is what makes cache.db's size
+      // mean "size of this path's current content" regardless of whether
+      // it's materialized or only stub-backed.
+      size: objectRow.size,
       state: "unchanged",
       parent_state_version: newBaselineVersion,
     });
@@ -307,6 +313,7 @@ async function applyRemoteContentChange(
       type: "file",
       mtime: Math.round(fs.statSync(absolutePath).mtimeMs),
       hash,
+      size: objectRow.size,
       state: "unchanged",
       parent_state_version: newBaselineVersion,
     });

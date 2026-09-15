@@ -96,4 +96,15 @@ describe("migration runner", () => {
       .sort();
     expect(indexes).toEqual(["idx_cache_normalized_path", "idx_cache_state_path"]);
   });
+
+  it("cache.db's entries table has a nullable size column", () => {
+    const db = new Database(":memory:");
+    runMigrations(db, CACHE_MIGRATIONS_DIR);
+    const columns = db
+      .prepare<[], { name: string; notnull: number }>("PRAGMA table_info(entries)")
+      .all();
+    const sizeColumn = columns.find((c) => c.name === "size");
+    expect(sizeColumn).toBeDefined();
+    expect(sizeColumn?.notnull).toBe(0);
+  });
 });

@@ -9,6 +9,7 @@ CREATE TABLE pending (
   type TEXT NOT NULL,
   mtime INTEGER,
   hash TEXT,
+  size INTEGER CHECK (type != 'file' OR state = 'deleted' OR size IS NOT NULL),
   state TEXT NOT NULL,
   parent_state_version TEXT,
   normalized_path TEXT NOT NULL
@@ -39,14 +40,17 @@ export class StagingRepository {
 
   insert(row: CacheEntryRow): void {
     this.db
-      .prepare<[string, string, number | null, string | null, string, string | null, string]>(
-        "INSERT INTO pending (path, type, mtime, hash, state, parent_state_version, normalized_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      .prepare<
+        [string, string, number | null, string | null, number | null, string, string | null, string]
+      >(
+        "INSERT INTO pending (path, type, mtime, hash, size, state, parent_state_version, normalized_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         row.path,
         row.type,
         row.mtime,
         row.hash,
+        row.size,
         row.state,
         row.parent_state_version,
         toCollisionKey(row.path),
@@ -66,7 +70,7 @@ export class StagingRepository {
       (after, limit) =>
         this.db
           .prepare<[string, number], CacheEntryRow>(
-            "SELECT path, type, mtime, hash, state, parent_state_version FROM pending WHERE path > ? ORDER BY path ASC LIMIT ?",
+            "SELECT path, type, mtime, hash, size, state, parent_state_version FROM pending WHERE path > ? ORDER BY path ASC LIMIT ?",
           )
           .all(after ?? "", limit),
       (row) => row.path,
@@ -95,7 +99,7 @@ export class StagingRepository {
   liveRowsForNormalizedPath(normalizedPath: string): CacheEntryRow[] {
     return this.db
       .prepare<[string], CacheEntryRow>(
-        "SELECT path, type, mtime, hash, state, parent_state_version FROM pending WHERE normalized_path = ? AND state != 'deleted'",
+        "SELECT path, type, mtime, hash, size, state, parent_state_version FROM pending WHERE normalized_path = ? AND state != 'deleted'",
       )
       .all(normalizedPath);
   }

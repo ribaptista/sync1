@@ -10,11 +10,13 @@ export interface CacheEntryRow {
   type: EntryType;
   mtime: number | null;
   hash: string | null;
+  /** Bytes. NULL only for a directory row or a tombstone ('deleted') -- DB-enforced, see 0004_add_size.sql. */
+  size: number | null;
   state: CacheState;
   parent_state_version: string | null;
 }
 
-const ROW_COLUMNS = "path, type, mtime, hash, state, parent_state_version";
+const ROW_COLUMNS = "path, type, mtime, hash, size, state, parent_state_version";
 
 interface CountRow {
   c: number;
@@ -33,15 +35,25 @@ export class CacheEntriesRepository {
   upsert(row: CacheEntryRow): void {
     this.db
       .prepare<
-        [string, EntryType, number | null, string | null, CacheState, string | null, string]
+        [
+          string,
+          EntryType,
+          number | null,
+          string | null,
+          number | null,
+          CacheState,
+          string | null,
+          string,
+        ]
       >(
-        "INSERT INTO entries (path, type, mtime, hash, state, parent_state_version, normalized_path) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET type = excluded.type, mtime = excluded.mtime, hash = excluded.hash, state = excluded.state, parent_state_version = excluded.parent_state_version, normalized_path = excluded.normalized_path",
+        "INSERT INTO entries (path, type, mtime, hash, size, state, parent_state_version, normalized_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET type = excluded.type, mtime = excluded.mtime, hash = excluded.hash, size = excluded.size, state = excluded.state, parent_state_version = excluded.parent_state_version, normalized_path = excluded.normalized_path",
       )
       .run(
         row.path,
         row.type,
         row.mtime,
         row.hash,
+        row.size,
         row.state,
         row.parent_state_version,
         toCollisionKey(row.path),

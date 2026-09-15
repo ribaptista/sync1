@@ -157,6 +157,7 @@ describe("performUpdateCache", () => {
       type: "file",
       mtime: 1_700_000_000_000,
       hash: hashBufferHex(Buffer.from("hello")),
+      size: 5,
       state: "unchanged",
       parent_state_version: "v0",
     });
@@ -184,6 +185,7 @@ describe("performUpdateCache", () => {
       type: "file",
       mtime: 1_700_000_000_000,
       hash: hashBufferHex(Buffer.from("hello")),
+      size: 5,
       state: "unchanged",
       parent_state_version: "v0",
     });
@@ -407,6 +409,7 @@ describe("performUpdateCache: stub files", () => {
       type: "file",
       mtime: stubMtime,
       hash: knownHash,
+      size: 1,
       state: "unchanged",
       parent_state_version: "v0",
     });
@@ -450,6 +453,7 @@ describe("performUpdateCache: case-insensitive collision detection", () => {
       type: "file",
       mtime: 1_700_000_000_000,
       hash: hashBufferHex(Buffer.from("hello")),
+      size: 5,
       state: "unchanged",
       parent_state_version: "v0",
     });
@@ -490,6 +494,7 @@ describe("performUpdateCache: case-insensitive collision detection", () => {
       type: "file",
       mtime: 1_700_000_000_000,
       hash: hashBufferHex(Buffer.from("existing")),
+      size: 8,
       state: "unchanged",
       parent_state_version: "v0",
     });

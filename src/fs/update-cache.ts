@@ -235,7 +235,8 @@ function detectCaseCollisions(
 }
 
 type ContentResolution =
-  { kind: "resolved"; hash: string | null } | { kind: "needs-hash"; absolutePath: string };
+  | { kind: "resolved"; hash: string | null; size: number | null }
+  | { kind: "needs-hash"; absolutePath: string };
 
 /**
  * Synchronously classifies a walked file/dir entry, handling all three
@@ -245,7 +246,10 @@ type ContentResolution =
  *  - "stub": read the stub's self-declared hash -- never hash the stub's
  *    own (contentless) bytes -- and validate it against known objects, so
  *    a stub can never silently reference content this vault has never
- *    actually backed up. Resolved immediately, no hash job needed.
+ *    actually backed up. Resolved immediately, no hash job needed. Its size
+ *    comes from the referenced object's own row, never from `fsEntry.size`
+ *    -- for a stub-only path, the walker's stat targets the tiny stub file
+ *    itself (just a tagged hash string), not the real content it refers to.
  *  - "both" (a dangling stub next to its now-materialized real file, e.g.
  *    from an interrupted `materialize`): the real file always wins: clean
  *    up the stray stub as a side effect (so this doesn't keep resurfacing
@@ -260,7 +264,7 @@ function classifyContent(
 ): ContentResolution {
   const absolutePath = path.join(root, fsEntry.path);
 
-  if (fsEntry.type === "dir") return { kind: "resolved", hash: null };
+  if (fsEntry.type === "dir") return { kind: "resolved", hash: null, size: null };
 
   if (fsEntry.representation === "both") {
     const stubAbsolutePath = stubPathFor(absolutePath);
@@ -286,10 +290,11 @@ function classifyContent(
       }
       throw err;
     }
-    if (!objectsRepo.has(hash)) {
+    const objectRow = objectsRepo.get(hash);
+    if (!objectRow) {
       throw new UnknownStubContentError(fsEntry.path, hash);
     }
-    return { kind: "resolved", hash };
+    return { kind: "resolved", hash, size: objectRow.size };
   }
 
   return { kind: "needs-hash", absolutePath };
@@ -331,7 +336,7 @@ async function dispatchCreatedRow(
   const mtime = Math.round(fsEntry.mtimeMs);
   const resolution = classifyContent(fsEntry, root, objectsRepo, logger);
 
-  const finalize = (hash: string | null): void => {
+  const finalize = (hash: string | null, size: number | null): void => {
     stats.created++;
     logger.debug({ path: fsEntry.path, type: fsEntry.type }, "new path detected");
     staging.insert({
@@ -339,17 +344,23 @@ async function dispatchCreatedRow(
       type: fsEntry.type,
       mtime,
       hash,
+      size,
       state: "created",
       parent_state_version: lastSyncedVersion,
     });
   };
 
   if (resolution.kind === "resolved") {
-    finalize(resolution.hash);
+    finalize(resolution.hash, resolution.size);
     return;
   }
 
-  await dispatchHash(hashJobs, hashRunner, resolution.absolutePath, logger, finalize);
+  // needs-hash only ever happens for a real (or dangling-both) file, where
+  // the walker's own stat targeted that real file -- fsEntry.size is
+  // correct here, unlike the stub-resolved case above.
+  await dispatchHash(hashJobs, hashRunner, resolution.absolutePath, logger, (hash) =>
+    finalize(hash, fsEntry.size),
+  );
 }
 
 function buildMissingFromFsRow(
@@ -369,6 +380,7 @@ function buildMissingFromFsRow(
     type: cacheEntry.type,
     mtime: null,
     hash: null,
+    size: null,
     state: "deleted",
     parent_state_version: lastSyncedVersion,
   };
@@ -401,6 +413,7 @@ async function dispatchExistingRow(
         type: "dir",
         mtime: newMtime,
         hash: null,
+        size: null,
         state: "created",
         parent_state_version: lastSyncedVersion,
       });
@@ -426,11 +439,12 @@ async function dispatchExistingRow(
 
   const resolution = classifyContent(fsEntry, root, objectsRepo, logger);
 
-  const finalize = (newHash: string | null): void => {
+  const finalize = (newHash: string | null, size: number | null): void => {
     if (newHash === cacheEntry.hash) {
       // mtime noise only (e.g. a bare touch, or a cleaned-up dangling stub
       // that referenced the same content) -- refresh the baseline mtime, no
       // real content change, so don't disturb whatever state it already had
+      // (size is unchanged too, already correct via the spread below)
       stats.unchanged++;
       staging.insert({ ...cacheEntry, mtime: newMtime });
       return;
@@ -447,6 +461,7 @@ async function dispatchExistingRow(
         type: "file",
         mtime: newMtime,
         hash: newHash,
+        size,
         state: newState,
         parent_state_version: lastSyncedVersion,
       });
@@ -454,15 +469,20 @@ async function dispatchExistingRow(
     }
 
     // already pending (created/modified): content changed again before
-    // syncing -- keep the original baseline, just refresh hash/mtime
+    // syncing -- keep the original baseline, just refresh hash/mtime/size
     stats[cacheEntry.state]++;
-    staging.insert({ ...cacheEntry, mtime: newMtime, hash: newHash });
+    staging.insert({ ...cacheEntry, mtime: newMtime, hash: newHash, size });
   };
 
   if (resolution.kind === "resolved") {
-    finalize(resolution.hash);
+    finalize(resolution.hash, resolution.size);
     return;
   }
 
-  await dispatchHash(hashJobs, hashRunner, resolution.absolutePath, logger, finalize);
+  // needs-hash only ever happens for a real (or dangling-both) file, where
+  // the walker's own stat targeted that real file -- fsEntry.size is
+  // correct here, unlike the stub-resolved case above.
+  await dispatchHash(hashJobs, hashRunner, resolution.absolutePath, logger, (hash) =>
+    finalize(hash, fsEntry.size),
+  );
 }

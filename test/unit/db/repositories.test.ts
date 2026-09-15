@@ -163,10 +163,79 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: 12345,
       hash: "h1",
+      size: 100,
       state: "created",
       parent_state_version: "v0",
     });
     expect(repo.get("photos/a.jpg")?.state).toBe("created");
+  });
+
+  it("size round-trips through upsert/get, and a conflicting upsert updates it", () => {
+    const db = openCacheDb(":memory:");
+    const repo = new CacheEntriesRepository(db);
+    repo.upsert({
+      path: "a.txt",
+      type: "file",
+      mtime: 1,
+      hash: "h1",
+      size: 123,
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+    expect(repo.get("a.txt")?.size).toBe(123);
+
+    repo.upsert({
+      path: "a.txt",
+      type: "file",
+      mtime: 2,
+      hash: "h2",
+      size: 456,
+      state: "modified",
+      parent_state_version: "v0",
+    });
+    expect(repo.get("a.txt")?.size).toBe(456);
+  });
+
+  it("accepts a null size for a directory row and for a deleted (tombstone) row", () => {
+    const db = openCacheDb(":memory:");
+    const repo = new CacheEntriesRepository(db);
+    repo.upsert({
+      path: "dir",
+      type: "dir",
+      mtime: 1,
+      hash: null,
+      size: null,
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+    expect(repo.get("dir")?.size).toBeNull();
+
+    repo.upsert({
+      path: "gone.txt",
+      type: "file",
+      mtime: null,
+      hash: null,
+      size: null,
+      state: "deleted",
+      parent_state_version: "v0",
+    });
+    expect(repo.get("gone.txt")?.size).toBeNull();
+  });
+
+  it("rejects a null size for a live (non-deleted) file row at the database level", () => {
+    const db = openCacheDb(":memory:");
+    const repo = new CacheEntriesRepository(db);
+    expect(() =>
+      repo.upsert({
+        path: "bad.txt",
+        type: "file",
+        mtime: 1,
+        hash: "h1",
+        size: null,
+        state: "unchanged",
+        parent_state_version: "v0",
+      }),
+    ).toThrow(/CHECK constraint failed/);
   });
 
   it("iterateDirty only returns non-unchanged rows", () => {
@@ -177,6 +246,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: 1,
       hash: "h1",
+      size: 10,
       state: "unchanged",
       parent_state_version: "v0",
     });
@@ -185,6 +255,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: 2,
       hash: "h2",
+      size: 20,
       state: "modified",
       parent_state_version: "v0",
     });
@@ -193,6 +264,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: null,
       hash: null,
+      size: null,
       state: "deleted",
       parent_state_version: "v0",
     });
@@ -214,6 +286,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: 1,
       hash: "h1",
+      size: 10,
       state: "created",
       parent_state_version: "v0",
     });
@@ -222,6 +295,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: null,
       hash: null,
+      size: null,
       state: "deleted",
       parent_state_version: "v0",
     });
@@ -230,6 +304,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: null,
       hash: null,
+      size: null,
       state: "deleted",
       parent_state_version: "v0",
     });
@@ -238,6 +313,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: 2,
       hash: "h2",
+      size: 20,
       state: "modified",
       parent_state_version: "v0",
     });
@@ -258,6 +334,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
         type: "file",
         mtime: 1,
         hash: "h",
+        size: 10,
         state: "unchanged",
         parent_state_version: "v0",
       });
@@ -274,6 +351,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: 1,
       hash: "h1",
+      size: 10,
       state: "unchanged",
       parent_state_version: "v0",
     });
@@ -295,6 +373,7 @@ describe("CacheEntriesRepository (cache.db)", () => {
       type: "file",
       mtime: null,
       hash: null,
+      size: null,
       state: "deleted",
       parent_state_version: "v0",
     });

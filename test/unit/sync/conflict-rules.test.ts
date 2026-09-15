@@ -9,6 +9,7 @@ function cacheRow(overrides: Partial<CacheEntryRow>): CacheEntryRow {
     type: "file",
     mtime: 1000,
     hash: "hash-local",
+    size: 10,
     state: "created",
     parent_state_version: "v0",
     ...overrides,

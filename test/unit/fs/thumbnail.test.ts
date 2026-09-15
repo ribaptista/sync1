@@ -47,6 +47,7 @@ function seedCache(relativePath: string, hash: string): void {
     type: "file",
     mtime: 0,
     hash,
+    size: 1,
     state: "unchanged",
     parent_state_version: null,
   });

@@ -28,6 +28,7 @@ describe("StagingRepository", () => {
       type: "file",
       mtime: 123,
       hash: "abc",
+      size: 100,
       state: "created",
       parent_state_version: "v0",
     });
@@ -36,6 +37,7 @@ describe("StagingRepository", () => {
       type: "file",
       mtime: null,
       hash: null,
+      size: null,
       state: "deleted",
       parent_state_version: "v0",
     });
@@ -47,6 +49,7 @@ describe("StagingRepository", () => {
         type: "file",
         mtime: 123,
         hash: "abc",
+        size: 100,
         state: "created",
         parent_state_version: "v0",
       },
@@ -55,6 +58,7 @@ describe("StagingRepository", () => {
         type: "file",
         mtime: null,
         hash: null,
+        size: null,
         state: "deleted",
         parent_state_version: "v0",
       },
@@ -72,6 +76,7 @@ describe("StagingRepository", () => {
         type: "file",
         mtime: i,
         hash: `hash-${i}`,
+        size: i,
         state: "created",
         parent_state_version: "v0",
       });
@@ -104,6 +109,7 @@ describe("StagingRepository", () => {
       type: "file",
       mtime: null,
       hash: null,
+      size: null,
       state: "deleted",
       parent_state_version: "v0",
     });
@@ -112,6 +118,7 @@ describe("StagingRepository", () => {
       type: "file",
       mtime: 1,
       hash: "abc",
+      size: 10,
       state: "created",
       parent_state_version: "v0",
     });
