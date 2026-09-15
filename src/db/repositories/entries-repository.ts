@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
 import { toCollisionKey } from "../../fs/case-collision.js";
 import { paginateKeyset } from "../keyset-pagination.js";
+import { paginateKeysetFilteredByGlob } from "../glob-scan.js";
+import { literalPrefixOf } from "../../fs/glob-match.js";
 
 export type EntryType = "file" | "dir";
 
@@ -69,39 +71,79 @@ export class EntriesRepository {
       .iterate(hash);
   }
 
-  /** SQLite's native GLOB operator against `path` -- used by `inspect`. Keyset-paginated, same reasoning as iterateAllSortedByPath. */
+  /**
+   * Matched in memory via `matchesAnyGlob` (see src/fs/glob-match.ts) over
+   * a keyset-paginated scan of `entries` -- no SQL `GLOB` filter, since
+   * minimatch's dialect doesn't correspond to any SQLite operator. See
+   * src/db/glob-scan.ts for how the scan still stays efficient for the
+   * common case (a literal filename, or a well-anchored subtree), seeded
+   * by `pattern`'s literal prefix rather than a true full scan every time.
+   * Used by `inspect`.
+   */
   iterateByGlobSortedByPath(pattern: string): IterableIterator<EntryRow> {
-    return paginateKeyset<EntryRow, string>(
+    const literalPrefix = literalPrefixOf(pattern);
+    return paginateKeysetFilteredByGlob<EntryRow>(
       (after, limit) =>
-        this.db
-          .prepare<[string, string, number], EntryRow>(
-            `SELECT ${ROW_COLUMNS} FROM entries WHERE path GLOB ? AND path > ? ORDER BY path ASC LIMIT ?`,
-          )
-          .all(pattern, after ?? "", limit),
+        after === null
+          ? this.db
+              .prepare<[string, number], EntryRow>(
+                `SELECT ${ROW_COLUMNS} FROM entries WHERE path >= ? ORDER BY path ASC LIMIT ?`,
+              )
+              .all(literalPrefix, limit)
+          : this.db
+              .prepare<[string, number], EntryRow>(
+                `SELECT ${ROW_COLUMNS} FROM entries WHERE path > ? ORDER BY path ASC LIMIT ?`,
+              )
+              .all(after, limit),
       (row) => row.path,
+      pattern,
     );
   }
 
   /**
-   * Distinct hashes among paths matching a SQLite GLOB pattern (directories
-   * excluded, since they have no hash/storage class). One row per
-   * *content*, not per path, since operations like `status`/`converge`
-   * act on the underlying object, which may be referenced by several paths.
-   * Keyset-paginated by `hash` (uses `idx_entries_hash`) -- not a
-   * correctness hazard today (the nested `iterateByHash` read this feeds
-   * stays synchronous throughout, see converge-storage-policies.ts),
-   * converted for consistency with the rest of this codebase's queries.
+   * Distinct hashes among paths matching `pattern` (directories excluded,
+   * since they have no hash/storage class). One row per *content*, not per
+   * path, since operations like `status`/`converge` act on the underlying
+   * object, which may be referenced by several paths.
+   *
+   * Scans `entries` ordered by `path` (reusing its own primary-key index,
+   * not `idx_entries_hash`) rather than by `hash` -- SQL can no longer
+   * pre-filter by path before deduping by hash, since there's no SQL GLOB
+   * filter at all (see src/db/glob-scan.ts). Dedup happens in an in-memory
+   * `Set`, yielding a hash only the first time it's seen -- the same
+   * "small enough to hold in memory" reasoning already relied on for the
+   * nested `iterateByHash` read this feeds (stays synchronous throughout,
+   * see converge-storage-policies.ts), just applied to the distinct-hash
+   * count instead of one hash's path list.
    */
   iterateDistinctHashesMatchingGlob(pattern: string): IterableIterator<HashRow> {
-    return paginateKeyset<HashRow, string>(
+    const literalPrefix = literalPrefixOf(pattern);
+    const scan = paginateKeysetFilteredByGlob<EntryRow>(
       (after, limit) =>
-        this.db
-          .prepare<[string, string, number], HashRow>(
-            "SELECT DISTINCT hash FROM entries WHERE hash IS NOT NULL AND path GLOB ? AND hash > ? ORDER BY hash ASC LIMIT ?",
-          )
-          .all(pattern, after ?? "", limit),
-      (row) => row.hash,
+        after === null
+          ? this.db
+              .prepare<[string, number], EntryRow>(
+                `SELECT ${ROW_COLUMNS} FROM entries WHERE hash IS NOT NULL AND path >= ? ORDER BY path ASC LIMIT ?`,
+              )
+              .all(literalPrefix, limit)
+          : this.db
+              .prepare<[string, number], EntryRow>(
+                `SELECT ${ROW_COLUMNS} FROM entries WHERE hash IS NOT NULL AND path > ? ORDER BY path ASC LIMIT ?`,
+              )
+              .all(after, limit),
+      (row) => row.path,
+      pattern,
     );
+
+    function* dedup(): Generator<HashRow> {
+      const seen = new Set<string>();
+      for (const row of scan) {
+        if (row.hash === null || seen.has(row.hash)) continue;
+        seen.add(row.hash);
+        yield { hash: row.hash };
+      }
+    }
+    return dedup();
   }
 
   /**

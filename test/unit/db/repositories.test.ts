@@ -122,6 +122,78 @@ describe("EntriesRepository (state.db)", () => {
     const paths = [...repo.iterateAllSortedByPath()].map((r) => r.path);
     expect(paths).toEqual(["a.txt", "m/nested.txt", "z.txt"]);
   });
+
+  describe("iterateByGlobSortedByPath", () => {
+    it("matches a '**' pattern across nested directories", () => {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      const repo = new EntriesRepository(db);
+      repo.upsert({ path: "photos/a.jpg", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "photos/sub/b.jpg", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "docs/c.txt", type: "file", hash: null, state_version: "v0" });
+
+      const paths = [...repo.iterateByGlobSortedByPath("photos/**/*.jpg")].map((r) => r.path);
+      expect(paths).toEqual(["photos/a.jpg", "photos/sub/b.jpg"]);
+    });
+
+    it("matches dotfiles like any other name", () => {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      const repo = new EntriesRepository(db);
+      repo.upsert({ path: ".env", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "readme.md", type: "file", hash: null, state_version: "v0" });
+
+      const paths = [...repo.iterateByGlobSortedByPath("*")].map((r) => r.path);
+      expect(paths).toEqual([".env", "readme.md"]);
+    });
+
+    it("still finds every match for a leading-wildcard pattern (no literal prefix to seed from)", () => {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      const repo = new EntriesRepository(db);
+      repo.upsert({ path: "a.jpg", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "sub/b.jpg", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "z.jpg", type: "file", hash: null, state_version: "v0" });
+
+      const paths = [...repo.iterateByGlobSortedByPath("*.jpg")].map((r) => r.path);
+      expect(paths).toEqual(["a.jpg", "z.jpg"]); // segment-bound '*' excludes "sub/b.jpg"
+    });
+
+    it("a literal-prefix-anchored pattern excludes a sibling sharing only a raw string prefix", () => {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      const repo = new EntriesRepository(db);
+      repo.upsert({ path: "Photos/2024/a.jpg", type: "file", hash: null, state_version: "v0" });
+      // Shares the raw string prefix "Photos/2024" but is not actually
+      // under that directory -- the seed/stop range in glob-scan.ts is
+      // deliberately loose (a byte-prefix bound, not a path-segment bound),
+      // so this row gets visited; matchesAnyGlob must still reject it.
+      repo.upsert({ path: "Photos/20245.txt", type: "file", hash: null, state_version: "v0" });
+
+      const paths = [...repo.iterateByGlobSortedByPath("Photos/2024/*.jpg")].map((r) => r.path);
+      expect(paths).toEqual(["Photos/2024/a.jpg"]);
+    });
+  });
+
+  describe("iterateDistinctHashesMatchingGlob", () => {
+    it("yields a hash exactly once even when only some of its several paths match the glob", () => {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      new ObjectsRepository(db).upsert({ hash: "h1", s3_key: "objects/h1", size: 1 });
+      new ObjectsRepository(db).upsert({ hash: "h2", s3_key: "objects/h2", size: 1 });
+      const repo = new EntriesRepository(db);
+      // Same content, dedup'd, referenced by both a matching and a
+      // non-matching path.
+      repo.upsert({ path: "photos/a.jpg", type: "file", hash: "h1", state_version: "v0" });
+      repo.upsert({ path: "archive/a.jpg", type: "file", hash: "h1", state_version: "v0" });
+      repo.upsert({ path: "photos/b.jpg", type: "file", hash: "h2", state_version: "v0" });
+
+      const hashes = [...repo.iterateDistinctHashesMatchingGlob("photos/*")]
+        .map((r) => r.hash)
+        .sort();
+      expect(hashes).toEqual(["h1", "h2"]);
+    });
+  });
 });
 
 describe("CacheEntriesRepository (cache.db)", () => {
