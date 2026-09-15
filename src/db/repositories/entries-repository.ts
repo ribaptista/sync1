@@ -82,13 +82,6 @@ export class EntriesRepository {
     );
   }
 
-  /** Every hash currently referenced by a live entry — the GC "keep" set. */
-  iterateDistinctReferencedHashes(): IterableIterator<HashRow> {
-    return this.db
-      .prepare<[], HashRow>("SELECT DISTINCT hash FROM entries WHERE hash IS NOT NULL")
-      .iterate();
-  }
-
   /**
    * Distinct hashes among paths matching a SQLite GLOB pattern (directories
    * excluded, since they have no hash/storage class). One row per

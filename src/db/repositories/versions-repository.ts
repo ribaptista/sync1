@@ -27,10 +27,4 @@ export class VersionsRepository {
       .prepare<[], VersionRow>("SELECT * FROM versions ORDER BY sequence DESC LIMIT 1")
       .get();
   }
-
-  iterateAll(): IterableIterator<VersionRow> {
-    return this.db
-      .prepare<[], VersionRow>("SELECT * FROM versions ORDER BY sequence ASC")
-      .iterate();
-  }
 }

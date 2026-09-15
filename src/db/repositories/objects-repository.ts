@@ -34,10 +34,6 @@ export class ObjectsRepository {
     this.db.prepare<[string]>("DELETE FROM objects WHERE hash = ?").run(hash);
   }
 
-  iterateAll(): IterableIterator<ObjectRow> {
-    return this.db.prepare<[], ObjectRow>("SELECT * FROM objects ORDER BY hash ASC").iterate();
-  }
-
   count(): number {
     const row = this.db.prepare<[], CountRow>("SELECT COUNT(*) as c FROM objects").get();
     return row?.c ?? 0;

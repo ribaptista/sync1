@@ -22,9 +22,6 @@ describe("VersionsRepository", () => {
 
     const v0 = repo.getByVersionStamp("v0");
     expect(v0?.sequence).toBe(1);
-
-    const all = [...repo.iterateAll()].map((r) => r.version_stamp);
-    expect(all).toEqual(["v0", "v1"]);
   });
 });
 
@@ -47,17 +44,6 @@ describe("ObjectsRepository", () => {
     repo.delete("aaa");
     expect(repo.has("aaa")).toBe(false);
     expect(repo.count()).toBe(1);
-  });
-
-  it("iterates all rows in hash order", () => {
-    const db = openStateDb(":memory:");
-    const repo = new ObjectsRepository(db);
-    repo.upsert({ hash: "ccc", s3_key: "objects/ccc", size: 1 });
-    repo.upsert({ hash: "aaa", s3_key: "objects/aaa", size: 1 });
-    repo.upsert({ hash: "bbb", s3_key: "objects/bbb", size: 1 });
-
-    const hashes = [...repo.iterateAll()].map((r) => r.hash);
-    expect(hashes).toEqual(["aaa", "bbb", "ccc"]);
   });
 
   it("computes orphan count/size via an anti-join against entries, entirely in SQL", () => {
@@ -135,22 +121,6 @@ describe("EntriesRepository (state.db)", () => {
 
     const paths = [...repo.iterateAllSortedByPath()].map((r) => r.path);
     expect(paths).toEqual(["a.txt", "m/nested.txt", "z.txt"]);
-  });
-
-  it("iterateDistinctReferencedHashes supports GC's referenced-hash set", () => {
-    const db = openStateDb(":memory:");
-    new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
-    const objects = new ObjectsRepository(db);
-    objects.upsert({ hash: "h1", s3_key: "objects/h1", size: 1 });
-    objects.upsert({ hash: "h2", s3_key: "objects/h2", size: 1 });
-    const repo = new EntriesRepository(db);
-    repo.upsert({ path: "a.txt", type: "file", hash: "h1", state_version: "v0" });
-    repo.upsert({ path: "b.txt", type: "file", hash: "h1", state_version: "v0" }); // dedup: shares h1
-    repo.upsert({ path: "c.txt", type: "file", hash: "h2", state_version: "v0" });
-    repo.upsert({ path: "dir", type: "dir", hash: null, state_version: "v0" });
-
-    const hashes = [...repo.iterateDistinctReferencedHashes()].map((r) => r.hash).sort();
-    expect(hashes).toEqual(["h1", "h2"]);
   });
 });
 
