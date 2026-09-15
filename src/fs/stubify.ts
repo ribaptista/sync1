@@ -5,6 +5,7 @@ import { CacheEntriesRepository } from "../db/repositories/cache-entries-reposit
 import { writeStubAtomic, stubPathFor } from "./stub.js";
 import { BoundedTaskTracker } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
+import type { OnProgress } from "../progress-types.js";
 
 export interface StubifySkip {
   path: string;
@@ -43,20 +44,30 @@ export async function stubifyGlob(
   logger: Logger,
   hashRunner: HashRunner,
   maxInFlightHashes: number,
-  onProgress?: (scanned: number) => void,
+  onProgress?: OnProgress,
 ): Promise<StubifyStats> {
   const stats: StubifyStats = { stubified: 0, alreadyStub: 0, skipped: [] };
   const hashJobs = new BoundedTaskTracker(maxInFlightHashes);
+
+  // filesDone/filesTotal track every glob-matched row (mirroring this
+  // scan's pre-existing "scanned" counter); bytesDone/bytesTotal track only
+  // a genuine rehash -- the common mtime-unchanged fast path below (which
+  // never reads through the file's content at all) contributes 0.
+  let scanned = 0;
+  let bytesTotal = 0;
+  let bytesDone = 0;
+  const report = (): void => {
+    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
+  };
 
   // A single connection/repo covers both the glob scan and cacheRepo.upsert()
   // below: iterateByGlobSortedByPath() is keyset-paginated (src/db/keyset-
   // pagination.ts), not a live `.iterate()` cursor, so the write can safely
   // interleave with it -- a write only ever conflicts with a *paused*
   // cursor, and pagination never leaves one paused between pages.
-  let scanned = 0;
   for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
     scanned++;
-    onProgress?.(scanned);
+    report();
     if (row.type !== "file") continue;
     const absolutePath = path.join(root, row.path);
     const stubAbsolutePath = stubPathFor(absolutePath);
@@ -89,8 +100,18 @@ export async function stubifyGlob(
       continue;
     }
 
+    // non-null: row.state === "unchanged" (checked above) means this is a
+    // live, tracked file row, and the DB's CHECK constraint (see
+    // 0004_add_size.sql) guarantees size is NOT NULL for any such row.
+    const size = row.size!;
+    bytesTotal += size;
+    report();
     await hashJobs.dispatch(async () => {
       const rehash = await hashRunner.run(absolutePath);
+      // The work of reading through the file happened either way, whether
+      // or not the rehash actually confirms row.hash below.
+      bytesDone += size;
+      report();
       logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
       if (rehash !== row.hash) {
         stats.skipped.push({

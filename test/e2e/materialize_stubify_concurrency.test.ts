@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import {
   startLocalStack,
   createTestS3Client,
@@ -43,6 +44,14 @@ function parseDispatchLogs(stderr: string): DispatchLogLine[] {
 function maxInFlightFor(logs: DispatchLogLine[], pool: string): number {
   const dispatches = logs.filter((l) => l.pool === pool && l.msg === "dispatched");
   return Math.max(...dispatches.map((l) => l.inFlight));
+}
+
+function readCacheSize(root: string, relativePath: string): number | null {
+  const db = new Database(path.join(root, ".sync1", "cache.db"), { readonly: true });
+  const row = db.prepare("SELECT size FROM entries WHERE path = ?").get(relativePath) as
+    { size: number | null } | undefined;
+  db.close();
+  return row?.size ?? null;
 }
 
 describe("materialize/stubify: concurrency", () => {
@@ -158,6 +167,14 @@ describe("materialize/stubify: concurrency", () => {
       (await runCli(["sync", "--root", root, "--json"], { env: { SYNC1_PASSWORD: PASSWORD } }))
         .exitCode,
     ).toBe(0);
+
+    // Confirms cache.db's size column is already populated for every real,
+    // synced file at this point -- stubify's rehash path below reads size
+    // straight from the row (never falling back to a fresh fs.statSync),
+    // which is only correct if this is true.
+    for (let i = 0; i < fileCount; i++) {
+      expect(readCacheSize(root, `f${i}.txt`)).toBe(`content of file ${i}`.repeat(500).length);
+    }
 
     // Bump every file's mtime without changing its content -- stubify must
     // rehash each one (mtime no longer matches cache.db's baseline) before

@@ -11,7 +11,11 @@ import {
   resolveConcurrencyOptions,
   type GlobalConcurrencyOptions,
 } from "../cli/concurrency-options.js";
-import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
+import {
+  shouldShowProgress,
+  startBytesProgressSession,
+  createLoggerForRun,
+} from "../cli/progress.js";
 
 interface StubifyOptions extends OptionValues {
   root: string;
@@ -76,15 +80,11 @@ async function runStubify(
 
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
-  const progress = startProgressSession({
-    show: showProgress,
-    overallLabel: "stubifying",
-    overallUnit: "entries",
-  });
+  const progress = startBytesProgressSession({ show: showProgress, overallLabel: "stubifying" });
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
-    progress.setOverallTotal(Math.max(cacheRepo.count(), 1));
+    progress.setOverallTotals({ files: Math.max(cacheRepo.count(), 1) });
     return await stubifyGlob(
       root,
       glob,
@@ -92,9 +92,9 @@ async function runStubify(
       logger,
       pools.hash,
       pools.hash.maxThreads,
-      (n) => {
-        progress.setOverallTotal(n);
-        progress.advanceOverall(1);
+      (u) => {
+        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
+        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
       },
     );
   } finally {
