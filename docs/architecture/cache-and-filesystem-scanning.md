@@ -75,3 +75,14 @@ not yet folded into a `sync` commit) and the file changes _again_ before `sync` 
 keeps it in that same category and preserves its original `parent_state_version` baseline — it only
 refreshes the recorded hash/mtime. Only an actual `sync` commit ever clears a row back to `unchanged`;
 `update_cache` alone never does, since doing so would erase evidence of an uncommitted local change.
+
+The baseline is preserved more broadly than that, though: an `unchanged` row going `deleted` or
+`modified` carries its existing `parent_state_version` over too. Dirtying a file doesn't change which
+vault version the change is based on, and `update_cache` has no business re-stamping it from the run's
+`last_synced_version` — see [conflict-resolution.md](conflict-resolution.md)'s invariant section for
+why the global pointer and a path's own vault stamp are different numbers. The one row that genuinely
+takes `last_synced_version` is a brand-new `created` path: there's no vault row for it to mirror yet.
+
+`update_cache`'s reported counts follow the same "what did this scan actually do" rule throughout: a
+path that is already a `deleted` tombstone from a prior run is a no-op, and is not re-counted as a
+deletion on every subsequent scan.

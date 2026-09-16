@@ -10,6 +10,49 @@ path, and if so, did it move to the exact same place I'm trying to move it, or s
 different?" That's the same shape as `git push` being rejected as non-fast-forward, and a conflicted
 merge needing a human to resolve it — not a novel mechanism, just applied per-path instead of per-repo.
 
+## The invariant: `parent_state_version` is per-path, never a commit-level value
+
+Everything below depends on one rule holding at every single site that writes a cache row:
+
+> `cache[path].parent_state_version` is always a copy of `entries[path].state_version` — the version at
+> which **that path's own row** was last written in the vault. It is never the version of whatever
+> commit happened to be in flight, and never this machine's `last_synced_version`.
+
+The reason is simply that it is _compared_ against `entries[path].state_version` for the same path (the
+`state_version === parent_state_version` checks in the matrix below). Anything else is comparing two
+different kinds of number.
+
+The temptation is to treat "the version this machine last synced at" as good enough, because for a
+while it is: if `sync` is the only thing ever minting versions, and every commit rewrites every dirty
+path, the global and per-path numbers move in lockstep. Neither premise holds:
+
+- **Policy mutations mint versions without touching `entries` at all.** `ignore`, `storage_policy` and
+  `thumbnail_policy` edits all commit through `src/sync/mutate-state-db.ts`, which creates a new version
+  and advances `.sync1/last_synced_version` while every `entries` row keeps the stamp it already had.
+  One policy edit is enough to put the global pointer permanently ahead of every path in the vault.
+- **A commit doesn't rewrite the paths it merely pulled down.** A sync that commits this machine's own
+  edit to one path while pulling another machine's change down for a different path leaves the second
+  path's vault row at the _other_ machine's version, not this commit's.
+
+Once the two numbers drift apart, every subsequently deleted or modified path is compared against a
+baseline that has nothing to do with it, and the matrix's version check fails for reasons that have
+nothing to do with what actually happened — producing a stream of false
+`"was deleted locally, but modified remotely"` conflicts on a vault only one machine has ever touched.
+This was a real bug; `test/e2e/sync_version_stamp_drift.test.ts` reproduces both routes to it.
+
+Concretely, that means:
+
+| Writing a cache row because…                                        | the stamp to write is                                                                                                                          |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| a path was pulled down from the vault (`apply-remote-changes.ts`)   | that entry's own `state_version`                                                                                                               |
+| a scan found a path locally deleted or modified (`update-cache.ts`) | the row's existing stamp, carried over unchanged — dirtying a file doesn't change which vault version the change is based on                   |
+| a scan found a brand-new path (`update-cache.ts`)                   | `last_synced_version` — the one legitimate use: there is no vault row to mirror yet, and `created` rows are resolved by hash, never by version |
+| a commit applied the row (`reconcile-cache.ts`)                     | the new commit's stamp — it was just written into `entries` with exactly that                                                                  |
+| a commit resolved the row as a **no-op** (`reconcile-cache.ts`)     | the stamp the vault already held, since a no-op writes nothing to `entries`                                                                    |
+
+The last two are why `applyLocalChangesToCandidate` reports a path → stamp map (`HandledPathStamps`)
+rather than just the set of paths it handled: only it knows, per row, which of those two cases applied.
+
 ## The full matrix (`src/sync/conflict-rules.ts`)
 
 Pure, exhaustively unit-tested decision logic — given a locally-dirty cache row and whatever entry (if
