@@ -326,7 +326,9 @@ async function applyRemoteContentChange(
       const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
       let computedHash: string;
       try {
-        computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
+        computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath, (n) =>
+          fileTracker.advance(n),
+        );
       } catch (err) {
         if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
         if (err instanceof CryptoAuthError) {
