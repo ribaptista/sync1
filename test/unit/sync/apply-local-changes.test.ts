@@ -142,6 +142,134 @@ describe("applyLocalChangesToCandidate: case-insensitive collision (sync-time)",
   });
 });
 
+describe("applyLocalChangesToCandidate: reported baseline stamps", () => {
+  const HASH = "a".repeat(64);
+
+  function seedCandidate(): import("better-sqlite3").Database {
+    const candidateDb = openStateDb(":memory:");
+    const versions = new VersionsRepository(candidateDb);
+    // "v0" is where this path's entry sits. "v5" stands in for any later
+    // commit that never rewrote this path's row -- a policy mutation, or
+    // another path's commit.
+    versions.insert("v0", new Date().toISOString());
+    versions.insert("v5", new Date().toISOString());
+    new ObjectsRepository(candidateDb).upsert({ hash: HASH, s3_key: `objects/${HASH}`, size: 1 });
+    new EntriesRepository(candidateDb).upsert({
+      path: "photo.jpg",
+      type: "file",
+      hash: HASH,
+      state_version: "v0",
+    });
+    return candidateDb;
+  }
+
+  it("reports a no-op-resolved row at the stamp the vault still holds, not this run's", async () => {
+    const candidateDb = seedCandidate();
+
+    const dirtyRow = {
+      path: "photo.jpg",
+      type: "file" as const,
+      mtime: 1,
+      // Content matches what the vault already has, but the baseline
+      // doesn't ("v5" vs the entry's "v0") -- decideModified's hash
+      // fallback resolves this as a no-op, and a no-op writes nothing to
+      // `entries`.
+      hash: HASH,
+      size: 1,
+      state: "modified" as const,
+      parent_state_version: "v5",
+    };
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [dirtyRow],
+      "/unused-root",
+      Buffer.alloc(32),
+      "v9",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+    );
+
+    expect(result.conflicts).toEqual([]);
+    expect(result.appliedCount).toBe(0);
+    // The regression this guards: reconciling the cache row to the run's
+    // "v9" would leave it claiming a baseline the vault never had (its
+    // entry is still at "v0"), so the next local edit or delete of this
+    // path would be reported as "modified remotely".
+    expect(result.handledPaths.get("photo.jpg")).toBe("v0");
+
+    candidateDb.close();
+  });
+
+  it("reports an applied row at this run's stamp -- the one it was just written with", async () => {
+    const candidateDb = seedCandidate();
+
+    const dirtyRow = {
+      path: "photo.jpg",
+      type: "dir" as const, // a dir needs no upload, keeping this test I/O-free
+      mtime: 1,
+      hash: null,
+      size: null,
+      state: "modified" as const,
+      parent_state_version: "v0", // matches the entry -> fast-forward apply
+    };
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [dirtyRow],
+      "/unused-root",
+      Buffer.alloc(32),
+      "v9",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+    );
+
+    expect(result.appliedCount).toBe(1);
+    expect(result.handledPaths.get("photo.jpg")).toBe("v9");
+    expect(new EntriesRepository(candidateDb).get("photo.jpg")?.state_version).toBe("v9");
+
+    candidateDb.close();
+  });
+
+  it("reports a deleted row as having no vault stamp at all", async () => {
+    const candidateDb = seedCandidate();
+
+    const dirtyRow = {
+      path: "photo.jpg",
+      type: "file" as const,
+      mtime: null,
+      hash: null,
+      size: null,
+      state: "deleted" as const,
+      parent_state_version: "v0",
+    };
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [dirtyRow],
+      "/unused-root",
+      Buffer.alloc(32),
+      "v9",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+    );
+
+    expect(result.appliedCount).toBe(1);
+    // Handled, but with no stamp -- the entry is gone, and reconciliation
+    // drops the cache row outright rather than stamping it.
+    expect(result.handledPaths.has("photo.jpg")).toBe(true);
+    expect(result.handledPaths.get("photo.jpg")).toBeNull();
+
+    candidateDb.close();
+  });
+});
+
 describe("applyLocalChangesToCandidate: same-batch dedup and collision (Pass 2)", () => {
   let root: string;
 

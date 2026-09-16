@@ -16,11 +16,33 @@ import { toCollisionKey } from "../fs/case-collision.js";
 import { waitForRoom } from "../concurrency/pools.js";
 import type { OnProgress } from "../progress-types.js";
 
+/**
+ * Every path successfully applied or resolved as a no-op (so: safe to
+ * reconcile to 'unchanged'), mapped to **the version stamp the vault
+ * actually holds for that path** once this run is done.
+ *
+ * That distinction is the whole point of this being a map rather than a set.
+ * cache.db's `parent_state_version` is compared against `entries.
+ * state_version` for the *same path* (src/sync/conflict-rules.ts), so it has
+ * to mirror that path's own row, not the commit that happened to be in
+ * flight. A row this run genuinely applied was written to `entries` with
+ * this commit's stamp; a row that resolved as a **no-op** never touched
+ * `entries` at all, so the vault still holds whatever stamp it held before,
+ * and reconciling it to the new commit's stamp would make the very next
+ * local edit or delete of that path report a false "modified remotely"
+ * conflict.
+ *
+ * `null` means the vault holds no row for the path at all. Only ever
+ * produced for a locally-deleted row (whether the delete was applied or was
+ * already gone remotely), which reconciliation removes from cache.db
+ * outright rather than stamping -- so the null is never read as a stamp.
+ */
+export type HandledPathStamps = ReadonlyMap<string, string | null>;
+
 export interface ApplyLocalChangesResult {
   uploadedObjects: number;
   dedupedObjects: number;
-  /** rows successfully applied or resolved as no-ops -- safe to reconcile to 'unchanged' */
-  handledPaths: Set<string>;
+  handledPaths: HandledPathStamps;
   /**
    * Count of rows that caused a *real* entries mutation (as opposed to a
    * no-op resolution, which reconciles cache.db but never touches
@@ -100,7 +122,7 @@ export async function applyLocalChangesToCandidate(
   let uploadedObjects = 0;
   let dedupedObjects = 0;
   let appliedCount = 0;
-  const handledPaths = new Set<string>();
+  const handledPaths = new Map<string, string | null>();
   const conflicts: Array<{ path: string; reason: string }> = [];
 
   // filesDone/filesTotal track every dirty row consumed across both passes
@@ -132,7 +154,11 @@ export async function applyLocalChangesToCandidate(
       conflicts.push({ path: row.path, reason: decision.reason });
       logger.debug({ path: row.path, reason: decision.reason }, "local change conflicts, skipping");
     } else {
-      handledPaths.add(row.path);
+      // Always null: this pass only handles deletes, and either branch below
+      // leaves the vault with no `entries` row for the path (applied ->
+      // removed here; no-op -> it was already gone remotely). Reconciliation
+      // drops such cache rows entirely, so no stamp is ever needed.
+      handledPaths.set(row.path, null);
       if (decision.kind === "apply") {
         appliedCount++;
         entriesRepo.delete(row.path);
@@ -182,14 +208,22 @@ export async function applyLocalChangesToCandidate(
       continue;
     }
 
-    handledPaths.add(row.path);
-
     if (decision.kind === "noop") {
+      // Nothing is written to `entries` here, so the vault keeps the stamp
+      // it already had for this path -- reconciling the cache row to this
+      // run's `versionStamp` instead is what used to produce false
+      // "modified remotely" conflicts on the next local change.
+      // `existingEntry` is always present for a no-op on a created/modified
+      // row (see conflict-rules.ts: both no-op branches are reached only by
+      // comparing against an existing entry's hash).
+      handledPaths.set(row.path, existingEntry?.state_version ?? null);
       logger.debug({ path: row.path }, "local change already reconciled remotely (no-op)");
       continue;
     }
 
-    // decision.kind === "apply"
+    // decision.kind === "apply" -- every branch below writes this path into
+    // `entries` at `versionStamp`, so that is what the vault will hold.
+    handledPaths.set(row.path, versionStamp);
     appliedCount++;
 
     if (row.type !== "file") {

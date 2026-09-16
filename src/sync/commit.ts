@@ -13,7 +13,7 @@ import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { performUpdateCache, type CaseCollision } from "../fs/update-cache.js";
 import type { ConcurrencyPools } from "../concurrency/pools.js";
-import { applyLocalChangesToCandidate } from "./apply-local-changes.js";
+import { applyLocalChangesToCandidate, type HandledPathStamps } from "./apply-local-changes.js";
 import { applyRemoteChangesToLocal, type IgnoredButSyncedEntry } from "./apply-remote-changes.js";
 import { reconcileCacheAfterCommit } from "./reconcile-cache.js";
 import { generateVersionStamp } from "../vault/version-stamp.js";
@@ -82,13 +82,13 @@ function* tapPaths(rows: Iterable<CacheEntryRow>, sink: Set<string>): Generator<
   }
 }
 
-/** Yields only the rows from `rows` whose path is in `paths`. */
+/** Yields only the rows from `rows` whose path was handled by this run. */
 function* filterByPath(
   rows: Iterable<CacheEntryRow>,
-  paths: ReadonlySet<string>,
+  handled: HandledPathStamps,
 ): Generator<CacheEntryRow> {
   for (const row of rows) {
-    if (paths.has(row.path)) yield row;
+    if (handled.has(row.path)) yield row;
   }
 }
 
@@ -240,7 +240,7 @@ export async function performSync(
     try {
       const versionStamp = generateVersionStamp();
       const candidateDb = openStateDb(candidatePath, logger);
-      let localResult, remoteResult, willCommit, cacheBaselineVersion;
+      let localResult, remoteResult, willCommit;
       try {
         // excludePaths is filled in as a side effect of the same pass that
         // feeds applyLocalChangesToCandidate, rather than a second read --
@@ -265,7 +265,6 @@ export async function performSync(
         // mutated entries/objects -- a sync where every dirty row resolved
         // as a no-op (see conflict-rules.ts) has nothing new to upload.
         willCommit = localResult.appliedCount > 0;
-        cacheBaselineVersion = willCommit ? versionStamp : remoteVersionStamp;
 
         // Diffs cache.db directly against the candidate (remote + this
         // machine's own successful edits) -- see apply-remote-changes.ts
@@ -301,7 +300,7 @@ export async function performSync(
         reconcileCacheAfterCommit(
           cacheRepo,
           filterByPath(cacheRepo.iterateDirty(), localResult.handledPaths),
-          cacheBaselineVersion,
+          localResult.handledPaths,
         );
 
         const remoteTotal = remoteResult.created + remoteResult.modified + remoteResult.deleted;
@@ -309,7 +308,10 @@ export async function performSync(
           dirtyCount === 0 && remoteTotal === 0 && localResult.conflicts.length === 0;
 
         return {
-          versionStamp: cacheBaselineVersion,
+          // No new version was minted, so the baseline this machine now sits
+          // at is whatever the remote holds (unchanged from
+          // `lastSyncedVersion` when the remote hadn't moved either).
+          versionStamp: remoteVersionStamp,
           nothingToSync,
           uploadedObjects: 0,
           dedupedObjects: 0,
@@ -354,7 +356,7 @@ export async function performSync(
       reconcileCacheAfterCommit(
         cacheRepo,
         filterByPath(cacheRepo.iterateDirty(), localResult.handledPaths),
-        versionStamp,
+        localResult.handledPaths,
       );
 
       return {
