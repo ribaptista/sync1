@@ -13,6 +13,7 @@ import { putObjectStream } from "../s3/client.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
+import { countingReadable } from "../fs/counting-stream.js";
 import { waitForRoom } from "../concurrency/pools.js";
 import { createProgressTracker, type OnProgress } from "../progress-types.js";
 
@@ -296,7 +297,22 @@ export async function applyLocalChangesToCandidate(
       const fileTracker = progress.startFile(absolutePath, size);
       try {
         const context = Buffer.from(hash, "hex");
-        const sourceStream = fs.createReadStream(absolutePath);
+        // Counted on the *plaintext* side, before encryptStream: those bytes
+        // sum to exactly `size`, the denominator this file's tracker was
+        // started with, whereas the ciphertext runs larger (a ~50-byte
+        // header plus a tag per chunk) and would overrun the declared total.
+        //
+        // This necessarily leads the wire a little. Below
+        // MULTIPART_THRESHOLD_BYTES the SDK buffers `requestStreamBufferSize`
+        // ahead; above it, lib-storage's `Upload` stages roughly
+        // queueSize * partSize before the first part is even sent. Accepted:
+        // the alternative, `upload.on("httpUploadProgress")`, reports
+        // encrypted bytes (wrong units again) and doesn't exist at all on
+        // the single-PUT path, so it would buy accuracy for large files by
+        // giving up on small ones entirely.
+        const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
+          fileTracker.advance(n),
+        );
         const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
         const key = objectKey(hash);
         await putObjectStream(
