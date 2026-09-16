@@ -37,7 +37,8 @@ vi.mock("cli-progress", () => ({
   Presets: { shades_classic: {} },
 }));
 
-const { shouldShowProgress, createLoggerForRun } = await import("../../../src/cli/progress.js");
+const { shouldShowProgress, createLoggerForRun, fitPath, reporterFor } =
+  await import("../../../src/cli/progress.js");
 
 describe("shouldShowProgress", () => {
   const originalIsTTY = process.stderr.isTTY;
@@ -171,6 +172,7 @@ describe("startBytesProgressSession", () => {
       filesTotal: "10",
       sizeDone: prettyBytes(1_000_000),
       sizeTotal: prettyBytes(2_000_000),
+      activity: "", // no activity reported yet
     });
   });
 
@@ -186,6 +188,7 @@ describe("startBytesProgressSession", () => {
       filesTotal: "10",
       sizeDone: prettyBytes(700),
       sizeTotal: prettyBytes(1000),
+      activity: "",
     });
   });
 
@@ -193,5 +196,107 @@ describe("startBytesProgressSession", () => {
     const session = startBytesProgressSession({ show: true, overallLabel: "x" });
     session.stop();
     expect(multibarStopMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders whatever caller-supplied verb it's given, with no vocabulary of its own", () => {
+    // "frobnicating" isn't a real verb anywhere in this codebase -- the
+    // point is that the module doesn't care, it renders exactly what it's
+    // handed rather than validating against a known set.
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 100 });
+    session.setOverallProgress({
+      bytes: 10,
+      activity: { verb: "frobnicating", path: "gear.dat" },
+    });
+
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      10,
+      expect.objectContaining({ activity: "frobnicating gear.dat..." }),
+    );
+  });
+
+  it("a later update omitting activity leaves the previously shown label in place", () => {
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 100 });
+    session.setOverallProgress({ bytes: 10, activity: { verb: "hashing", path: "a.jpg" } });
+
+    session.setOverallProgress({ bytes: 20 }); // activity omitted
+
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      20,
+      expect.objectContaining({ activity: "hashing a.jpg..." }),
+    );
+  });
+});
+
+describe("fitPath", () => {
+  it("returns the path unchanged when it fits exactly within budget", () => {
+    // columns=100, verb="hashing" (7 chars) -> budget = 100 - 55 - 7 = 38
+    const path = "a".repeat(38);
+    expect(fitPath(path, 100, "hashing")).toBe(path);
+  });
+
+  it("truncates from the front, keeping the tail, when the path is over budget", () => {
+    // Same budget (38) as above, but a path well past it.
+    const path = "/very/long/directory/tree/leading/up/to/summer/IMG_0431.jpg";
+    const result = fitPath(path, 100, "hashing");
+
+    expect(result.length).toBe(38);
+    expect(result.startsWith("…")).toBe(true);
+    expect(path.endsWith(result.slice(1))).toBe(true); // the kept suffix really is the path's tail
+    expect(result.endsWith("IMG_0431.jpg")).toBe(true);
+  });
+
+  it("floors the budget at the truncation mark's own length when columns/verb leave no room", () => {
+    // columns=10, verb="downloading" (11 chars) -> raw budget deeply negative
+    const result = fitPath("/some/reasonably/long/path.bin", 10, "downloading");
+    expect(result).toBe("…");
+  });
+
+  it("falls back to 80 columns when columns is undefined, matching cli-progress's own fallback", () => {
+    const path = "/very/long/directory/tree/leading/up/to/summer/IMG_0431.jpg";
+    expect(fitPath(path, undefined, "hashing")).toBe(fitPath(path, 80, "hashing"));
+  });
+});
+
+describe("reporterFor", () => {
+  it("collapses a ProgressUpdate into the session's setOverallTotals + setOverallProgress calls", () => {
+    const session = {
+      setOverallTotals: vi.fn(),
+      setOverallProgress: vi.fn(),
+      stop: vi.fn(),
+    };
+
+    const report = reporterFor(session);
+    report({
+      filesDone: 3,
+      filesTotal: 10,
+      bytesDone: 300,
+      bytesTotal: 1000,
+      activity: { verb: "uploading", path: "a.jpg" },
+    });
+
+    expect(session.setOverallTotals).toHaveBeenCalledWith({ files: 10, bytes: 1000 });
+    expect(session.setOverallProgress).toHaveBeenCalledWith({
+      files: 3,
+      bytes: 300,
+      activity: { verb: "uploading", path: "a.jpg" },
+    });
+  });
+
+  it("passes an update with no activity through as undefined, not omitted", () => {
+    const session = {
+      setOverallTotals: vi.fn(),
+      setOverallProgress: vi.fn(),
+      stop: vi.fn(),
+    };
+
+    reporterFor(session)({ filesDone: 1, filesTotal: 1, bytesDone: 0, bytesTotal: 0 });
+
+    expect(session.setOverallProgress).toHaveBeenCalledWith({
+      files: 1,
+      bytes: 0,
+      activity: undefined,
+    });
   });
 });

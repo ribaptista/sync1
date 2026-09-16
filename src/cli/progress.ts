@@ -3,6 +3,7 @@ import pino from "pino";
 import { MultiBar, Presets, type SingleBar } from "cli-progress";
 import prettyBytes from "pretty-bytes";
 import { createLogger, type Logger } from "../logger.js";
+import type { OnProgress, ProgressUpdate } from "../progress-types.js";
 
 export interface ShouldShowProgressOptions {
   json: boolean;
@@ -84,10 +85,24 @@ export function startProgressSession(opts: {
  * `ProgressSession.setOverallTotal`; `setOverallProgress` sets the current
  * position directly (mirroring `SingleBar.update(value)`'s own primitive),
  * so no delta bookkeeping is needed by any caller.
+ *
+ * `setOverallProgress`'s `activity` is the trailing per-file label
+ * (`hashing …/summer/IMG_0431.jpg...`) -- rendered verbatim, this module
+ * has no vocabulary of its own for what "hashing" or "uploading" mean, see
+ * `fitPath` and `reporterFor` below. Like `files`/`bytes`, omitting it
+ * leaves whatever was last shown in place rather than clearing it; a
+ * caller that wants a clean label at a phase boundary (so a stale
+ * `uploaded …` doesn't survive into a download phase, say) gets that for
+ * free by building a fresh `ProgressTracker` per phase rather than by this
+ * session clearing anything itself.
  */
 export interface BytesProgressSession {
   setOverallTotals(totals: { files?: number; bytes?: number }): void;
-  setOverallProgress(current: { files?: number; bytes?: number }): void;
+  setOverallProgress(current: {
+    files?: number;
+    bytes?: number;
+    activity?: { verb: string; path: string } | undefined;
+  }): void;
   stop(): void;
 }
 
@@ -97,6 +112,46 @@ class NullBytesProgressSession implements BytesProgressSession {
   stop(): void {}
 }
 
+// Rough width of everything on the byte-progress line other than the
+// activity label itself: the overall label, the bar (cli-progress's own
+// default barsize is 40 columns), the surrounding "|...|" decoration, the
+// file counts, the pretty-printed byte sizes, and the ETA. Deliberately
+// approximate -- digit counts and the overall label's own length shift the
+// real figure by a handful of characters as a run progresses -- because
+// `linewrap: false` (see fitPath below) makes this cosmetic only: getting
+// it slightly wrong just clips a couple more/fewer characters, never
+// corrupts the line.
+const ACTIVITY_LABEL_CHROME = 55;
+
+// Leading mark on a path that had to be truncated to fit -- one character,
+// so the floor case in fitPath (budget too small for anything else) still
+// has somewhere valid to go.
+const TRUNCATION_MARK = "…";
+
+/**
+ * Truncates `path` to fit the terminal width, keeping the *tail*.
+ * `linewrap: false` makes cli-progress write each line raw and let the
+ * terminal clip whatever overflows at the right edge -- fine for the rest
+ * of the line, but wrong for a path, where the filename at the tail (not
+ * the leading directories) is the informative half; this function does the
+ * truncation ourselves so the tail always survives instead.
+ *
+ * Mirrors cli-progress's own width fallback exactly (`stream.columns ||
+ * 80`) so this stays in sync with the bar's own behavior on a
+ * non-TTY-but-still-columns-reporting stream, and is called fresh on every
+ * render rather than once at construction so a terminal resize is picked
+ * up. `verb` factors into the budget because the two verbs sharing a
+ * phase's line differ in width (`hashing` vs. `downloading`); no padding
+ * is applied for the difference since the label is last on the line, so a
+ * variable width shifts nothing that comes before it.
+ */
+export function fitPath(path: string, columns: number | undefined, verb: string): string {
+  const width = columns || 80;
+  const budget = Math.max(width - ACTIVITY_LABEL_CHROME - verb.length, TRUNCATION_MARK.length);
+  if (path.length <= budget) return path;
+  return TRUNCATION_MARK + path.slice(path.length - (budget - TRUNCATION_MARK.length));
+}
+
 class MultiBarBytesProgressSession implements BytesProgressSession {
   private readonly multibar: MultiBar;
   private readonly overall: SingleBar;
@@ -104,13 +159,14 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
   private filesDone = 0;
   private bytesTotal = 0;
   private bytesDone = 0;
+  private activity: { verb: string; path: string } | undefined;
 
   constructor(overallLabel: string) {
     this.multibar = new MultiBar(
       {
         clearOnComplete: false,
         hideCursor: true,
-        format: `${overallLabel} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- ETA {eta_formatted}`,
+        format: `${overallLabel} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- ETA {eta_formatted} {activity}`,
       },
       Presets.shades_classic,
     );
@@ -120,6 +176,16 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
     this.render();
   }
 
+  // Built fresh on every render, not cached: `fitPath` reads
+  // `process.stderr.columns` at call time specifically so a terminal
+  // resize between renders is picked up, which a value computed once here
+  // and reused would defeat.
+  private activityLabel(): string {
+    if (!this.activity) return "";
+    const { verb, path } = this.activity;
+    return `${verb} ${fitPath(path, process.stderr.columns, verb)}...`;
+  }
+
   private render(): void {
     this.overall.setTotal(Math.max(this.bytesTotal, 1));
     this.overall.update(this.bytesDone, {
@@ -127,6 +193,7 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
       filesTotal: String(this.filesTotal),
       sizeDone: prettyBytes(this.bytesDone),
       sizeTotal: prettyBytes(this.bytesTotal),
+      activity: this.activityLabel(),
     });
   }
 
@@ -140,9 +207,14 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
     this.render();
   }
 
-  setOverallProgress(current: { files?: number; bytes?: number }): void {
+  setOverallProgress(current: {
+    files?: number;
+    bytes?: number;
+    activity?: { verb: string; path: string } | undefined;
+  }): void {
     if (current.files !== undefined) this.filesDone = current.files;
     if (current.bytes !== undefined) this.bytesDone = current.bytes;
+    if (current.activity !== undefined) this.activity = current.activity;
     this.render();
   }
 
@@ -158,6 +230,25 @@ export function startBytesProgressSession(opts: {
   return opts.show
     ? new MultiBarBytesProgressSession(opts.overallLabel)
     : new NullBytesProgressSession();
+}
+
+/**
+ * Adapts a `BytesProgressSession` into the `OnProgress` callback a
+ * `ProgressTracker` (see `../progress-types.js`) calls with each update --
+ * collapsing the setOverallTotals/setOverallProgress two-line dance that
+ * used to be hand-duplicated once per command (update_cache, sync,
+ * materialize, stubify, sanity_check) into a single call each command
+ * makes when it builds its tracker.
+ */
+export function reporterFor(session: BytesProgressSession): OnProgress {
+  return (update: ProgressUpdate) => {
+    session.setOverallTotals({ files: update.filesTotal, bytes: update.bytesTotal });
+    session.setOverallProgress({
+      files: update.filesDone,
+      bytes: update.bytesDone,
+      activity: update.activity,
+    });
+  };
 }
 
 let notifiedFd3Missing = false;
