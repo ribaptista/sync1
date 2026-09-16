@@ -22,4 +22,20 @@ describe("countingReadable", () => {
     expect(seen).toEqual([3, 2, 1]);
     expect(seen.reduce((a, b) => a + b, 0)).toBe(result.length);
   });
+
+  it("surfaces a mid-read error on the source to a consumer of the returned stream", async () => {
+    // Before the pipeline() fix, `source.pipe(counter)` never forwarded
+    // `error` -- a consumer draining the returned stream would hang forever
+    // instead of seeing this rejection, which is exactly the ENOENT/EIO
+    // scenario an upload can hit mid-read.
+    async function* chunksThenBoom() {
+      yield Buffer.from("partial");
+      throw new Error("simulated read failure");
+    }
+    const source = Readable.from(chunksThenBoom());
+
+    await expect(drain(countingReadable(source, () => {}))).rejects.toThrow(
+      "simulated read failure",
+    );
+  });
 });
