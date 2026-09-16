@@ -276,7 +276,6 @@ export async function performSync(
           masterKey,
           cacheRepo,
           excludePaths,
-          cacheBaselineVersion,
           s3,
           logger,
           pools.stream,

@@ -100,7 +100,6 @@ export async function applyRemoteChangesToLocal(
   masterKey: Buffer,
   cacheRepo: CacheEntriesRepository,
   excludePaths: ReadonlySet<string>,
-  newBaselineVersion: string,
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
   streamPool: PQueue,
@@ -164,7 +163,6 @@ export async function applyRemoteChangesToLocal(
             masterKey,
             candidateObjects,
             cacheRepo,
-            newBaselineVersion,
             true,
             s3,
             logger,
@@ -208,7 +206,6 @@ export async function applyRemoteChangesToLocal(
             masterKey,
             candidateObjects,
             cacheRepo,
-            newBaselineVersion,
             preserveAsStub,
             s3,
             logger,
@@ -243,6 +240,14 @@ function currentlyStubBacked(root: string, entryPath: string): boolean {
  * one case that's genuine network I/O: a real download. Directory creation
  * and stub writes are cheap and synchronous, so they're applied immediately
  * and never touch the pool.
+ *
+ * Every cache row written here takes its `parent_state_version` from
+ * `entry.state_version` -- the version at which *this path's* row was last
+ * written in state.db -- never from the version of whatever commit happens
+ * to be in flight. That's the invariant conflict-rules.ts relies on: it
+ * compares a cache row's `parent_state_version` against the candidate
+ * entry's own `state_version`, so the two must always be the same kind of
+ * thing. See docs/architecture/conflict-resolution.md.
  */
 async function applyRemoteContentChange(
   entry: EntryRow,
@@ -250,7 +255,6 @@ async function applyRemoteContentChange(
   masterKey: Buffer,
   candidateObjects: ObjectsRepository,
   cacheRepo: CacheEntriesRepository,
-  newBaselineVersion: string,
   writeAsStub: boolean,
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
@@ -269,7 +273,7 @@ async function applyRemoteContentChange(
       hash: null,
       size: null,
       state: "unchanged",
-      parent_state_version: newBaselineVersion,
+      parent_state_version: entry.state_version,
     });
     logger.debug({ path: entry.path }, "materialized remote directory");
     return;
@@ -298,7 +302,7 @@ async function applyRemoteContentChange(
       // it's materialized or only stub-backed.
       size: objectRow.size,
       state: "unchanged",
-      parent_state_version: newBaselineVersion,
+      parent_state_version: entry.state_version,
     });
     logger.debug(
       { path: entry.path, hash: entry.hash },
@@ -352,7 +356,7 @@ async function applyRemoteContentChange(
       hash,
       size: objectRow.size,
       state: "unchanged",
-      parent_state_version: newBaselineVersion,
+      parent_state_version: entry.state_version,
     });
     byteTracking.trackCompleted(objectRow.size);
     logger.debug({ path: entry.path, hash }, "materialized remote file create/modify");
