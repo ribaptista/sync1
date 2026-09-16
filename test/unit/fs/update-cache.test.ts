@@ -175,7 +175,12 @@ describe("performUpdateCache", () => {
     });
     const row = repo.get("a.txt");
     expect(row?.state).toBe("modified");
-    expect(row?.parent_state_version).toBe("v1"); // fresh baseline, established now
+    // Carried over from the row itself, NOT re-stamped from the run's
+    // lastSyncedVersion ("v1" here). The baseline answers "which vault
+    // version is this local change based on", and dirtying a file doesn't
+    // change that answer -- the vault's row for "a.txt" is still at "v0".
+    // See the invariant note in src/fs/update-cache.ts.
+    expect(row?.parent_state_version).toBe("v0");
   });
 
   it("treats a touch with no real content change (same hash) as still unchanged", async () => {
@@ -226,6 +231,35 @@ describe("performUpdateCache", () => {
     expect(row?.mtime).toBeNull();
   });
 
+  it("keeps a deleted row's own baseline when the global version stamp has moved on", async () => {
+    // The regression this guards: a policy mutation (ignore/storage_policy/
+    // thumbnail_policy) mints a new vault version and advances
+    // .sync1/last_synced_version without touching `entries` at all -- so the
+    // global stamp routinely runs ahead of any given path's own row. Stamping
+    // a locally-deleted row with that global value made sync compare the
+    // vault's "v0" row against a "v5" baseline and report every deletion as
+    // "was deleted locally, but modified remotely".
+    touch("a.txt", "hello", 1_700_000_000_000);
+    const repo = makeRepo();
+    repo.upsert({
+      path: "a.txt",
+      type: "file",
+      mtime: 1_700_000_000_000,
+      hash: hashBufferHex(Buffer.from("hello")),
+      size: 5,
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+
+    fs.rmSync(path.join(root, "a.txt"));
+    const stats = await run(repo, { version: "v5" });
+    expect(stats.deleted).toBe(1);
+
+    const row = repo.get("a.txt");
+    expect(row?.state).toBe("deleted");
+    expect(row?.parent_state_version).toBe("v0");
+  });
+
   it("is idempotent for an already-deleted tombstone", async () => {
     touch("a.txt", "hello");
     const repo = makeRepo();
@@ -234,14 +268,20 @@ describe("performUpdateCache", () => {
     await run(repo);
 
     const stats = await run(repo);
+    // Zero, not one: the tombstone was already written by the previous run,
+    // and this scan made no transition. `deleted` counts transitions this
+    // scan actually performed, the same way created/modified do -- counting
+    // the early return too made repeat scans claim deletions they never wrote.
     expect(stats).toEqual({
       created: 0,
       modified: 0,
-      deleted: 1,
+      deleted: 0,
       unchanged: 0,
       caseCollisions: [],
       ignored: 0,
     });
+    // ...and the tombstone itself is untouched.
+    expect(repo.get("a.txt")?.state).toBe("deleted");
   });
 
   it("treats a file recreated at a previously-deleted path as a fresh creation", async () => {

@@ -174,7 +174,7 @@ export async function performUpdateCache(
         }
         fsNext = await fsIter.next();
       } else if (cacheEntry !== null && (fsEntry === null || cacheEntry.path < fsEntry.path)) {
-        const row = buildMissingFromFsRow(cacheEntry, lastSyncedVersion, stats, logger);
+        const row = buildMissingFromFsRow(cacheEntry, stats, logger);
         if (row) staging.insert(row);
         cacheNext = cacheIter.next();
       } else if (fsEntry !== null && cacheEntry !== null) {
@@ -182,7 +182,6 @@ export async function performUpdateCache(
           fsEntry,
           cacheEntry,
           root,
-          lastSyncedVersion,
           objectsRepo,
           stats,
           logger,
@@ -413,15 +412,17 @@ async function dispatchCreatedRow(
 
 function buildMissingFromFsRow(
   cacheEntry: CacheEntryRow,
-  lastSyncedVersion: string,
   stats: UpdateCacheStats,
   logger: Logger,
 ): CacheEntryRow | null {
-  stats.deleted++;
   if (cacheEntry.state === "deleted") {
-    // already a pending tombstone from a prior run -- idempotent no-op
+    // Already a pending tombstone from a prior run -- idempotent no-op, and
+    // deliberately not counted: `deleted` reports transitions this scan
+    // actually made, the same way created/modified do. Counting it here too
+    // made a re-scan claim deletions it never wrote.
     return null;
   }
+  stats.deleted++;
   logger.debug({ path: cacheEntry.path }, "path no longer exists on disk");
   return {
     path: cacheEntry.path,
@@ -430,7 +431,14 @@ function buildMissingFromFsRow(
     hash: null,
     size: null,
     state: "deleted",
-    parent_state_version: lastSyncedVersion,
+    // Carried over, never re-stamped from the run's `lastSyncedVersion`:
+    // this row's baseline means "the version at which *this path* was last
+    // written in state.db", which is what conflict-rules.ts compares it
+    // against. The run-wide version advances on any commit at all --
+    // including policy mutations that never touch `entries` -- so adopting
+    // it here made the next sync see a mismatch and cry "modified
+    // remotely". See docs/architecture/conflict-resolution.md.
+    parent_state_version: cacheEntry.parent_state_version,
   };
 }
 
@@ -438,7 +446,6 @@ async function dispatchExistingRow(
   fsEntry: WalkEntry,
   cacheEntry: CacheEntryRow,
   root: string,
-  lastSyncedVersion: string,
   objectsRepo: ObjectsRepository,
   stats: UpdateCacheStats,
   logger: Logger,
@@ -464,7 +471,7 @@ async function dispatchExistingRow(
         hash: null,
         size: null,
         state: "created",
-        parent_state_version: lastSyncedVersion,
+        parent_state_version: cacheEntry.parent_state_version,
       });
       return;
     }
@@ -502,7 +509,10 @@ async function dispatchExistingRow(
     logger.debug({ path: fsEntry.path, oldHash: cacheEntry.hash, newHash }, "file content changed");
 
     if (cacheEntry.state === "unchanged" || cacheEntry.state === "deleted") {
-      // establishing a brand-new pending change: fresh baseline
+      // Establishing a brand-new pending change. The baseline carries over
+      // from the row's existing one rather than being re-stamped with this
+      // run's `lastSyncedVersion` -- see buildMissingFromFsRow for why that
+      // distinction matters.
       const newState = cacheEntry.state === "deleted" ? "created" : "modified";
       stats[newState]++;
       staging.insert({
@@ -512,7 +522,7 @@ async function dispatchExistingRow(
         hash: newHash,
         size,
         state: newState,
-        parent_state_version: lastSyncedVersion,
+        parent_state_version: cacheEntry.parent_state_version,
       });
       return;
     }
