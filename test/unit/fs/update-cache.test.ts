@@ -718,12 +718,22 @@ describe("performUpdateCache: byte progress", () => {
     await vi.waitFor(() => expect(resolveHash).toBeDefined());
     expect(updates.some((u) => u.bytesTotal === 5 && u.bytesDone === 0)).toBe(true);
     expect(updates.every((u) => u.bytesDone === 0)).toBe(true);
+    // The discovered/resolved split's own regression test: rowDiscovered()
+    // fires as soon as the merge-join reaches this row, but rowResolved()
+    // is deferred until the hash job actually settles -- while it's still
+    // pending, filesTotal has counted this row and filesDone hasn't.
+    expect(updates.some((u) => u.filesTotal > u.filesDone)).toBe(true);
 
     resolveHash(hashBufferHex(Buffer.from("hello")));
     const stats = await statsPromise;
 
     expect(stats.created).toBe(1);
-    expect(updates.at(-1)).toMatchObject({ bytesDone: 5, bytesTotal: 5 });
+    expect(updates.at(-1)).toMatchObject({
+      bytesDone: 5,
+      bytesTotal: 5,
+      filesDone: 1,
+      filesTotal: 1,
+    });
   });
 
   it("a directory contributes 0 bytes", async () => {

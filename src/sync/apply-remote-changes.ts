@@ -102,11 +102,12 @@ export async function applyRemoteChangesToLocal(
   // filesDone/filesTotal track every path the merge-join consumes (work-
   // needing or not, mirroring other commands' "scanned" counter);
   // bytesDone/bytesTotal track only an actual download -- see
-  // progress-types.ts's own doc comment for the full rule. Kept equal to
-  // each other here -- rowResolved() is called right alongside
-  // rowDiscovered() at the same site "scanned" used to be bumped, since
-  // splitting them to reflect real dispatch/resolve timing is the next
-  // commit's job, not this purely mechanical swap's.
+  // progress-types.ts's own doc comment for the full rule. rowDiscovered()
+  // fires once per merge-join step, at the top of the loop below;
+  // rowResolved() fires immediately for a synchronous outcome (excluded,
+  // deleted, a directory, a stub write) and is deferred into
+  // applyRemoteContentChange's own download-completion point for a path
+  // whose remote content actually needs downloading.
   const progress = createProgressTracker(onProgress, ["downloading", "downloaded"]);
 
   {
@@ -127,6 +128,8 @@ export async function applyRemoteChangesToLocal(
       const cacheEntry = cacheNext.done ? null : cacheNext.value;
       const candidateEntry = candidateNext.done ? null : candidateNext.value;
 
+      progress.rowDiscovered();
+
       if (
         candidateEntry !== null &&
         (cacheEntry === null || candidateEntry.path < cacheEntry.path)
@@ -135,6 +138,11 @@ export async function applyRemoteChangesToLocal(
         // or (the attach_remote case) never materialized locally yet.
         // Either way: default to a stub, never a download.
         if (!excludePaths.has(candidateEntry.path)) {
+          // Always resolves synchronously within itself -- writeAsStub is
+          // hardcoded true here, so applyRemoteContentChange never reaches
+          // its own download branch for a brand-new path -- but it still
+          // owns calling rowResolved(), same as the modified branch below,
+          // so both call sites stay uniform.
           await applyRemoteContentChange(
             candidateEntry,
             root,
@@ -161,6 +169,8 @@ export async function applyRemoteChangesToLocal(
               "path matches a global ignore policy but was already shared before the policy applied -- materializing anyway",
             );
           }
+        } else {
+          progress.rowResolved();
         }
         candidateNext = candidateIter.next();
       } else if (
@@ -168,15 +178,20 @@ export async function applyRemoteChangesToLocal(
         (candidateEntry === null || cacheEntry.path < candidateEntry.path)
       ) {
         // Tracked locally but gone from state.db -- deleted remotely.
+        // Always synchronous, excluded or not, so rowResolved() is never
+        // deferred here.
         if (!excludePaths.has(cacheEntry.path)) {
           applyRemoteDelete(cacheEntry.path, cacheEntry.type, root, cacheRepo, logger);
           result.deleted++;
         }
+        progress.rowResolved();
         cacheNext = cacheIter.next();
       } else if (cacheEntry !== null && candidateEntry !== null) {
         if (!excludePaths.has(candidateEntry.path) && cacheEntry.hash !== candidateEntry.hash) {
           // Already known locally: preserve whatever representation is
           // currently on disk rather than the default-to-stub policy above.
+          // applyRemoteContentChange owns rowResolved() here -- this is the
+          // one path that can genuinely dispatch a real download.
           const preserveAsStub = currentlyStubBacked(root, candidateEntry.path);
           await applyRemoteContentChange(
             candidateEntry,
@@ -192,13 +207,12 @@ export async function applyRemoteChangesToLocal(
             progress,
           );
           result.modified++;
+        } else {
+          progress.rowResolved();
         }
         cacheNext = cacheIter.next();
         candidateNext = candidateIter.next();
       }
-
-      progress.rowDiscovered();
-      progress.rowResolved();
     }
 
     await streamPool.onIdle();
@@ -254,6 +268,7 @@ async function applyRemoteContentChange(
       parent_state_version: entry.state_version,
     });
     logger.debug({ path: entry.path }, "materialized remote directory");
+    progress.rowResolved();
     return;
   }
 
@@ -286,6 +301,7 @@ async function applyRemoteContentChange(
       { path: entry.path, hash: entry.hash },
       "wrote stub for remote content (no download)",
     );
+    progress.rowResolved();
     return;
   }
 
@@ -348,6 +364,7 @@ async function applyRemoteContentChange(
       // update-cache.ts's dispatchHash for why this matters even on the
       // error paths above.
       fileTracker.finish();
+      progress.rowResolved();
     }
   });
   // Logged after add(), not before -- add() synchronously starts the task

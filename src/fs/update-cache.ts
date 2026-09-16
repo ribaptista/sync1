@@ -108,11 +108,12 @@ export async function performUpdateCache(
   // filesDone/filesTotal track every row the merge-join consumes (work-
   // needing or not, mirroring this scan's pre-existing "scanned" counter);
   // bytesDone/bytesTotal track only content actually hashed this run --
-  // see progress-types.ts's own doc comment for the full rule. Kept equal
-  // to each other here -- rowResolved() is called right alongside
-  // rowDiscovered() at the same site "scanned" used to be bumped, since
-  // splitting them to reflect real dispatch/resolve timing is the next
-  // commit's job, not this purely mechanical swap's.
+  // see progress-types.ts's own doc comment for the full rule.
+  // rowDiscovered() fires once per merge-join step, at the top of the loop
+  // below; rowResolved() fires wherever that step's work actually finishes
+  // -- immediately for a synchronous row (ignored, tombstoned, dir,
+  // already-resolved content), or deferred into dispatchHash's own
+  // completion for a row that needed a real hash.
   const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
 
   try {
@@ -126,6 +127,8 @@ export async function performUpdateCache(
       const fsEntry = fsNext.done ? null : fsNext.value;
       const cacheEntry = cacheNext.done ? null : cacheNext.value;
 
+      progress.rowDiscovered();
+
       if (fsEntry !== null && (cacheEntry === null || fsEntry.path < cacheEntry.path)) {
         const ignoreMatch = matchesAnyGlob(fsEntry.path, ignoreGlobs);
         if (ignoreMatch.matched) {
@@ -134,6 +137,7 @@ export async function performUpdateCache(
             { path: fsEntry.path, pattern: ignoreMatch.pattern },
             "path matches an ignore policy -- skipping",
           );
+          progress.rowResolved();
         } else {
           await dispatchCreatedRow(
             fsEntry,
@@ -152,6 +156,7 @@ export async function performUpdateCache(
       } else if (cacheEntry !== null && (fsEntry === null || cacheEntry.path < fsEntry.path)) {
         const row = buildMissingFromFsRow(cacheEntry, stats, logger);
         if (row) staging.insert(row);
+        progress.rowResolved();
         cacheNext = cacheIter.next();
       } else if (fsEntry !== null && cacheEntry !== null) {
         await dispatchExistingRow(
@@ -169,9 +174,6 @@ export async function performUpdateCache(
         fsNext = await fsIter.next();
         cacheNext = cacheIter.next();
       }
-
-      progress.rowDiscovered();
-      progress.rowResolved();
     }
 
     // Every dispatched hash job must have inserted its row (or thrown) before
@@ -339,8 +341,13 @@ async function dispatchHash(
       // Unconditional, per FileTracker's own contract -- a rejected job's
       // cleanup path (caught by BoundedTaskTracker, not here) must never
       // leave this file's share of inFlightBytes pinned for the rest of
-      // the run.
+      // the run. rowResolved() lives here too: dispatchHash always speaks
+      // for exactly one row (update-cache.ts never shares a hash job
+      // across rows the way apply-local-changes.ts's dedup attach does),
+      // so "this row's async work resolved" and "this hash job settled"
+      // are the same event, success or failure alike.
       fileTracker.finish();
+      progress.rowResolved();
     }
   });
   logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
@@ -377,12 +384,14 @@ async function dispatchCreatedRow(
 
   if (resolution.kind === "resolved") {
     finalize(resolution.hash, resolution.size);
+    progress.rowResolved();
     return;
   }
 
   // needs-hash only ever happens for a real (or dangling-both) file, where
   // the walker's own stat targeted that real file -- fsEntry.size is
-  // correct here, unlike the stub-resolved case above.
+  // correct here, unlike the stub-resolved case above. dispatchHash calls
+  // progress.rowResolved() itself once the hash job settles.
   await dispatchHash(
     hashJobs,
     hashRunner,
@@ -457,9 +466,11 @@ async function dispatchExistingRow(
         state: "created",
         parent_state_version: cacheEntry.parent_state_version,
       });
+      progress.rowResolved();
       return;
     }
     stats.unchanged++;
+    progress.rowResolved();
     return;
   }
 
@@ -474,6 +485,7 @@ async function dispatchExistingRow(
   // re-read, and a steady-state stub is never re-validated, on every scan.
   if (!danglingStub && cacheEntry.mtime === newMtime) {
     stats.unchanged++;
+    progress.rowResolved();
     return;
   }
 
@@ -519,12 +531,14 @@ async function dispatchExistingRow(
 
   if (resolution.kind === "resolved") {
     finalize(resolution.hash, resolution.size);
+    progress.rowResolved();
     return;
   }
 
   // needs-hash only ever happens for a real (or dangling-both) file, where
   // the walker's own stat targeted that real file -- fsEntry.size is
-  // correct here, unlike the stub-resolved case above.
+  // correct here, unlike the stub-resolved case above. dispatchHash calls
+  // progress.rowResolved() itself once the hash job settles.
   await dispatchHash(
     hashJobs,
     hashRunner,

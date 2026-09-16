@@ -159,6 +159,7 @@ async function runSanityCheck(
     const entriesRepo = new EntriesRepository(db);
     const objectsRepo = new ObjectsRepository(db);
     const ignorePoliciesRepo = new IgnorePoliciesRepository(db);
+    progress.setOverallTotals({ files: Math.max(entriesRepo.count(), 1) });
 
     const objectExists = async (s3Key: string): Promise<boolean> => {
       const head = await headObject(client, remoteConfig.bucket, remoteKey(location, s3Key));

@@ -129,11 +129,13 @@ export async function applyLocalChangesToCandidate(
   // (mirroring other commands' "scanned" counter); bytesDone/bytesTotal
   // track only an actual upload -- a delete, a no-op/conflict resolution,
   // or a same-batch dedup attach all contribute 0, per the universal
-  // counting rule in progress-types.ts. Kept equal to each other here --
-  // rowResolved() is called right alongside rowDiscovered() at the same
-  // site "scanned" used to be bumped, since splitting them to reflect real
-  // dispatch/resolve timing is the next commit's job, not this purely
-  // mechanical swap's.
+  // counting rule in progress-types.ts. rowDiscovered() fires once per row
+  // at the top of each pass's loop; rowResolved() fires immediately for
+  // every synchronous outcome (conflict, no-op, delete, a non-file apply,
+  // a dedup hit already known to `objects`), but is deferred for a row
+  // whose content is actually uploaded -- including a same-batch dedup
+  // attach, which rides along on the same in-flight upload rather than
+  // getting one of its own (see the Pass 2 dispatch below).
   const progress = createProgressTracker(onProgress, ["uploading", "uploaded"]);
 
   const iter = dirtyRows[Symbol.iterator]();
@@ -145,7 +147,6 @@ export async function applyLocalChangesToCandidate(
   while (!next.done && next.value.state === "deleted") {
     const row = next.value;
     progress.rowDiscovered();
-    progress.rowResolved();
     const existingEntry = entriesRepo.get(row.path);
     const decision = decideLocalChange(row, existingEntry);
 
@@ -167,6 +168,10 @@ export async function applyLocalChangesToCandidate(
       }
     }
 
+    // A delete is always fully synchronous -- no I/O, no pool -- so
+    // rowResolved() trails rowDiscovered() by nothing more than the
+    // decision logic above, but it's still a genuinely separate event.
+    progress.rowResolved();
     next = iter.next();
   }
 
@@ -178,7 +183,6 @@ export async function applyLocalChangesToCandidate(
     const row = next.value;
     next = iter.next();
     progress.rowDiscovered();
-    progress.rowResolved();
 
     // Only a genuinely new path can newly collide -- "modified" targets a
     // path that already exists, so decideLocalChange's own exact-path
@@ -194,6 +198,7 @@ export async function applyLocalChangesToCandidate(
         const reason = `case-insensitive collision with existing entry "${collidesWith}" -- rename or remove one of them and sync again`;
         conflicts.push({ path: row.path, reason });
         logger.debug({ path: row.path, collidesWith }, "case-insensitive collision, skipping");
+        progress.rowResolved();
         continue;
       }
     }
@@ -204,6 +209,7 @@ export async function applyLocalChangesToCandidate(
     if (decision.kind === "conflict") {
       conflicts.push({ path: row.path, reason: decision.reason });
       logger.debug({ path: row.path, reason: decision.reason }, "local change conflicts, skipping");
+      progress.rowResolved();
       continue;
     }
 
@@ -217,6 +223,7 @@ export async function applyLocalChangesToCandidate(
       // comparing against an existing entry's hash).
       handledPaths.set(row.path, existingEntry?.state_version ?? null);
       logger.debug({ path: row.path }, "local change already reconciled remotely (no-op)");
+      progress.rowResolved();
       continue;
     }
 
@@ -232,6 +239,7 @@ export async function applyLocalChangesToCandidate(
         hash: null,
         state_version: versionStamp,
       });
+      progress.rowResolved();
       continue;
     }
 
@@ -252,6 +260,11 @@ export async function applyLocalChangesToCandidate(
         { path: row.path, hash },
         "content already in flight this batch, attaching (dedup)",
       );
+      // rowResolved() deliberately NOT called here -- this row has no
+      // upload of its own. It attaches to the already-in-flight job above
+      // and resolves alongside every other row riding on it, whenever
+      // that job's own dispatch settles (see the streamPool.add callback
+      // below), not at attach time.
       continue;
     }
 
@@ -259,6 +272,7 @@ export async function applyLocalChangesToCandidate(
       dedupedObjects++;
       logger.debug({ path: row.path, hash }, "content already known, skipping upload (dedup)");
       entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
+      progress.rowResolved();
       continue;
     }
 
@@ -310,8 +324,12 @@ export async function applyLocalChangesToCandidate(
       } finally {
         // Unconditional, per FileTracker's own contract -- see
         // update-cache.ts's dispatchHash for why this matters even on the
-        // error paths above.
+        // error paths above. Every row riding on this job -- the one that
+        // dispatched it, plus any dedup attach that arrived before it
+        // settled (job.sourceRows can have grown since dispatch, above) --
+        // resolves together here, success or failure alike.
         fileTracker.finish();
+        for (let i = 0; i < job.sourceRows.length; i++) progress.rowResolved();
       }
     });
     // Logged after add(), not before -- add() synchronously starts the task

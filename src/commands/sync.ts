@@ -7,8 +7,15 @@ import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import { sync1Dir, localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
+import {
+  sync1Dir,
+  localVaultJsonPath,
+  localRemoteConfigPath,
+  localCacheDbPath,
+} from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
+import { openCacheDb } from "../db/connection.js";
+import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { performSync, RemoteDivergedError, type SyncResult } from "../sync/commit.js";
 import { createConcurrencyPools } from "../concurrency/pools.js";
 import {
@@ -134,6 +141,23 @@ async function runSync(
 
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
   const progress = startBytesProgressSession({ show: showProgress, overallLabel: "syncing" });
+
+  // performSync opens its own cache.db connection internally (it isn't
+  // handed a repo the way update_cache/materialize/stubify are) -- this
+  // short-lived one exists only to preseed the file count before that
+  // first phase starts, same as the other three commands already do from
+  // their own cacheRepo. Closed immediately after; sync's real connection
+  // is performSync's own.
+  {
+    const cacheDb = openCacheDb(localCacheDbPath(root), logger);
+    try {
+      progress.setOverallTotals({
+        files: Math.max(new CacheEntriesRepository(cacheDb).count(), 1),
+      });
+    } finally {
+      cacheDb.close();
+    }
+  }
 
   try {
     return await performSync(

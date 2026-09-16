@@ -75,11 +75,11 @@ export async function materializeGlob(
   // actually needed a download); bytesDone/bytesTotal track only a
   // genuine download -- a stub whose object turns out cold (needs a
   // restore request, or is still pending one) contributes 0 to bytes,
-  // since nothing is downloaded this run. Kept equal to each other here --
-  // rowResolved() is called right alongside rowDiscovered() at the same
-  // site "scanned" used to be bumped, since splitting them to reflect real
-  // dispatch/resolve timing is the next commit's job, not this purely
-  // mechanical swap's.
+  // since nothing is downloaded this run. rowDiscovered() fires once per
+  // glob-matched row, at the top of the loop below; rowResolved() fires
+  // immediately for a synchronous outcome (not a stub, a dangling stub, a
+  // cold object) and is deferred into the download's own completion for a
+  // stub whose object turns out to be immediately retrievable.
   const progress = createProgressTracker(onProgress, ["downloading", "downloaded"]);
 
   // A single connection/repo covers both the glob scan and cacheRepo.upsert()
@@ -89,8 +89,10 @@ export async function materializeGlob(
   // cursor, and pagination never leaves one paused between pages.
   for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
     progress.rowDiscovered();
-    progress.rowResolved();
-    if (row.type !== "file") continue;
+    if (row.type !== "file") {
+      progress.rowResolved();
+      continue;
+    }
     const absolutePath = path.join(root, row.path);
     const stubAbsolutePath = stubPathFor(absolutePath);
     const hasReal = fs.existsSync(absolutePath);
@@ -98,6 +100,7 @@ export async function materializeGlob(
 
     if (!hasStub) {
       stats.alreadyReal++;
+      progress.rowResolved();
       continue;
     }
     if (hasReal) {
@@ -105,6 +108,7 @@ export async function materializeGlob(
       // normally have cleaned this up already; do it defensively here too.
       fs.rmSync(stubAbsolutePath);
       stats.alreadyReal++;
+      progress.rowResolved();
       continue;
     }
 
@@ -173,8 +177,11 @@ export async function materializeGlob(
           } finally {
             // Unconditional, per FileTracker's own contract -- see
             // update-cache.ts's dispatchHash for why this matters even on
-            // the error paths above.
+            // the error paths above. rowResolved() lives here too: this is
+            // the one branch of the three below that has any further byte
+            // work pending after the HEAD check settles.
             fileTracker.finish();
+            progress.rowResolved();
           }
         });
         logger.debug(
@@ -192,8 +199,11 @@ export async function materializeGlob(
         } else {
           stats.needsRetrieval++;
         }
+        // No download this run either way -- nothing further pending.
+        progress.rowResolved();
       } else {
         stats.pending++;
+        progress.rowResolved();
       }
 
       logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "completed");

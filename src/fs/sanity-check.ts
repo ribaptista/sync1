@@ -124,11 +124,12 @@ export async function performSanityCheck(
   // filesDone/filesTotal track every row the merge-join consumes (mirroring
   // this scan's pre-existing "scanned" counter); bytesDone/bytesTotal track
   // only content actually hashed this run -- see progress-types.ts's own
-  // doc comment for the full rule. Kept equal to each other here --
-  // rowResolved() is called right alongside rowDiscovered() at the same
-  // site "scanned" used to be bumped, since splitting them to reflect real
-  // dispatch/resolve timing is the next commit's job, not this purely
-  // mechanical swap's.
+  // doc comment for the full rule. rowDiscovered() fires once per
+  // merge-join step, at the top of the loop below; rowResolved() fires
+  // immediately for every synchronous branch (untracked, ignored,
+  // out-of-scope, missing-locally, a stub's declared hash) and is deferred
+  // into dispatchTrackedEntryCheck's own hash-completion point for a real
+  // file that needed hashing.
   const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
 
   const fsIter = walk(root);
@@ -141,6 +142,8 @@ export async function performSanityCheck(
     const fsEntry = fsNext.done ? null : fsNext.value;
     const entry = entryNext.done ? null : entryNext.value;
 
+    progress.rowDiscovered();
+
     if (fsEntry !== null && (entry === null || fsEntry.path < entry.path)) {
       if (inScope(fsEntry.path)) {
         const ignoreMatch = matchesAnyGlob(fsEntry.path, ignoreGlobs);
@@ -150,12 +153,16 @@ export async function performSanityCheck(
           result.untracked.push(fsEntry.path);
         }
       }
+      // Synchronous either way -- an untracked/ignored path (or one
+      // filtered out by --filter) needs no further work.
+      progress.rowResolved();
       fsNext = await fsIter.next();
     } else if (entry !== null && (fsEntry === null || entry.path < fsEntry.path)) {
       if (inScope(entry.path)) {
         result.missingLocally.push(entry.path);
         logger.debug({ path: entry.path }, "sanity_check: tracked but missing locally");
       }
+      progress.rowResolved();
       entryNext = entryIter.next();
     } else if (fsEntry !== null && entry !== null) {
       if (inScope(entry.path)) {
@@ -173,13 +180,14 @@ export async function performSanityCheck(
           s3QueueLimit,
           progress,
         );
+      } else {
+        // Matched on both sides but out of --filter's scope -- still
+        // discovered, still resolved, just never checked.
+        progress.rowResolved();
       }
       fsNext = await fsIter.next();
       entryNext = entryIter.next();
     }
-
-    progress.rowDiscovered();
-    progress.rowResolved();
   }
 
   // Draining order matters: a hash job's own completion is what enqueues
@@ -208,11 +216,17 @@ async function dispatchTrackedEntryCheck(
   s3QueueLimit: number,
   progress: ProgressTracker,
 ): Promise<void> {
-  if (entry.type === "dir") return; // directories carry no content -- existence is the only signal, already confirmed by reaching here
+  if (entry.type === "dir") {
+    // Directories carry no content -- existence is the only signal,
+    // already confirmed by reaching here.
+    progress.rowResolved();
+    return;
+  }
 
   if (fsEntry.representation === "both") {
     result.bothStubAndReal.push(entry.path);
     logger.debug({ path: entry.path }, "sanity_check: both a stub and the real file are present");
+    progress.rowResolved();
     return;
   }
 
@@ -243,8 +257,15 @@ async function dispatchTrackedEntryCheck(
       } finally {
         // Unconditional, per FileTracker's own contract -- see
         // update-cache.ts's dispatchHash for why this matters even on the
-        // error paths above.
+        // error paths above. rowResolved() lives here too, deliberately:
+        // it means "no further BYTE work pending for this row", which is
+        // true the instant the hash settles -- not once the follow-on S3
+        // existence check (dispatchS3Check, above) actually lands. An S3
+        // HEAD isn't byte work, and resolving there instead would leave
+        // filesDone lagging behind by the whole s3Pool queue, still
+        // advancing well after hashJobs.onIdle() has already resolved.
         fileTracker.finish();
+        progress.rowResolved();
       }
     });
     logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
@@ -257,6 +278,7 @@ async function dispatchTrackedEntryCheck(
   } catch (err) {
     if (err instanceof StubFormatError) {
       result.stubMismatch.push({ path: entry.path, reason: err.message });
+      progress.rowResolved();
       return;
     }
     throw err;
@@ -266,10 +288,16 @@ async function dispatchTrackedEntryCheck(
       path: entry.path,
       reason: `stub declares hash ${stubHash}, state.db expects ${entry.hash}`,
     });
+    progress.rowResolved();
     return;
   }
 
-  if (!entry.hash) return; // a file entry should always have a hash; nothing further to verify if it somehow doesn't
+  if (!entry.hash) {
+    // A file entry should always have a hash; nothing further to verify if
+    // it somehow doesn't.
+    progress.rowResolved();
+    return;
+  }
   await dispatchS3Check(
     s3Pool,
     s3QueueLimit,
@@ -280,6 +308,12 @@ async function dispatchTrackedEntryCheck(
     result,
     logger,
   );
+  // A stub's declared hash is read synchronously above (never hashed), so
+  // by the time dispatchS3Check's own dispatch-not-await-completion has
+  // returned, there's no further byte work pending for this row -- same
+  // "resolved at dispatch, not completion" rule as the real-file branch's
+  // finally above.
+  progress.rowResolved();
 }
 
 async function dispatchS3Check(
