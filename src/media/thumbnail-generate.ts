@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Logger } from "../logger.js";
 import { MediaToolMissingError } from "./probe.js";
 
 export interface Dimensions {
@@ -91,8 +92,30 @@ function isEnoent(err: unknown): boolean {
   );
 }
 
-/** Runs an external tool, mapping a real ENOENT to `MediaToolMissingError` (fatal) and any other nonzero exit to `ThumbnailGenerationError` (per-file, non-fatal). */
-async function runTool(command: string, args: string[], toolLabel: string): Promise<void> {
+const SHELL_SAFE_UNQUOTED = /^[a-zA-Z0-9_\-./:=,@]+$/;
+
+/** Single-quotes any arg that isn't trivially shell-safe -- log output only, never fed back to a shell. */
+function formatCommandForLog(command: string, args: string[]): string {
+  return [command, ...args]
+    .map((part) => (SHELL_SAFE_UNQUOTED.test(part) ? part : `'${part.replace(/'/g, "'\\''")}'`))
+    .join(" ");
+}
+
+/**
+ * Runs an external tool, mapping a real ENOENT to `MediaToolMissingError`
+ * (fatal) and any other nonzero exit to `ThumbnailGenerationError`
+ * (per-file, non-fatal). Logs the exact command line at debug level (i.e.
+ * visible under `--verbose`) before running it -- lets a user reproduce and
+ * inspect a specific generation step by hand, e.g. to compare against a
+ * locally-installed ffmpeg's own behavior for an unusual input.
+ */
+async function runTool(
+  command: string,
+  args: string[],
+  toolLabel: string,
+  logger: Logger,
+): Promise<void> {
+  logger.debug({ command: formatCommandForLog(command, args) }, `running ${toolLabel}`);
   try {
     await execFileP(command, args);
   } catch (err) {
@@ -109,8 +132,8 @@ async function runTool(command: string, args: string[], toolLabel: string): Prom
 }
 
 export interface ThumbnailGenerator {
-  generateImageThumbnail(input: GenerateImageThumbnailInput): Promise<void>;
-  generateVideoMosaic(input: GenerateVideoMosaicInput): Promise<void>;
+  generateImageThumbnail(input: GenerateImageThumbnailInput, logger: Logger): Promise<void>;
+  generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logger): Promise<void>;
 }
 
 export interface GenerateImageThumbnailInput {
@@ -131,7 +154,10 @@ const JPEG_EXTENSION = /\.jpe?g$/i;
  * `computeContainFitSize`, so re-deriving a fit here could disagree with it
  * by a rounding pixel and silently violate our own contract.
  */
-async function generateImageThumbnail(input: GenerateImageThumbnailInput): Promise<void> {
+async function generateImageThumbnail(
+  input: GenerateImageThumbnailInput,
+  logger: Logger,
+): Promise<void> {
   const isJpeg = JPEG_EXTENSION.test(input.destPath);
   await runTool(
     "convert",
@@ -144,6 +170,7 @@ async function generateImageThumbnail(input: GenerateImageThumbnailInput): Promi
       input.destPath,
     ],
     "convert",
+    logger,
   );
 }
 
@@ -176,7 +203,7 @@ function mapJpegQualityToFfmpegQScale(jpegQuality: number): number {
  * JPEG. Temp per-frame PNGs are written under a fresh temp dir, always
  * removed in `finally`.
  */
-async function generateVideoMosaic(input: GenerateVideoMosaicInput): Promise<void> {
+async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logger): Promise<void> {
   const tileCount = input.tileRowCount * input.tileColumnCount;
   const fit = computeContainFitSize(
     { width: input.sourceWidth, height: input.sourceHeight },
@@ -206,6 +233,7 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput): Promise<voi
           framePath,
         ],
         "ffmpeg (frame extraction)",
+        logger,
       );
       framePaths.push(framePath);
     }
@@ -234,6 +262,7 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput): Promise<voi
         input.destPath,
       ],
       "ffmpeg (mosaic composite)",
+      logger,
     );
   } finally {
     await fs.promises.rm(tempDir, { recursive: true, force: true });

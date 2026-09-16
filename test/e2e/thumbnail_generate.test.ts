@@ -11,6 +11,11 @@ import {
 const FIXTURES_DIR = path.resolve("test/fixtures/media");
 const tempDirs: string[] = [];
 
+const silentLogger = {
+  debug: () => {},
+  warn: () => {},
+} as unknown as import("../../src/logger.js").Logger;
+
 function mkTempDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-thumbnail-generate-"));
   tempDirs.push(dir);
@@ -32,13 +37,16 @@ describe("generateImageThumbnail (real convert)", () => {
     expect(size).toEqual({ width: 20, height: 15 });
 
     const destPath = path.join(mkTempDir(), "thumb.jpg");
-    await realThumbnailGenerator.generateImageThumbnail({
-      sourcePath: path.join(FIXTURES_DIR, "tiny.jpg"),
-      destPath,
-      width: size.width,
-      height: size.height,
-      jpegQuality: 80,
-    });
+    await realThumbnailGenerator.generateImageThumbnail(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.jpg"),
+        destPath,
+        width: size.width,
+        height: size.height,
+        jpegQuality: 80,
+      },
+      silentLogger,
+    );
 
     const probed = await realMediaProber.detectMedia(destPath);
     expect(probed).toEqual({ kind: "image", mimeType: "image/jpeg", width: 20, height: 15 });
@@ -47,13 +55,16 @@ describe("generateImageThumbnail (real convert)", () => {
   it("generates a PNG thumbnail (format matches the original, no -quality flag)", async () => {
     const size = computeContainFitSize({ width: 32, height: 24 }, { width: 16, height: 16 });
     const destPath = path.join(mkTempDir(), "thumb.png");
-    await realThumbnailGenerator.generateImageThumbnail({
-      sourcePath: path.join(FIXTURES_DIR, "tiny.png"),
-      destPath,
-      width: size.width,
-      height: size.height,
-      jpegQuality: 80,
-    });
+    await realThumbnailGenerator.generateImageThumbnail(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.png"),
+        destPath,
+        width: size.width,
+        height: size.height,
+        jpegQuality: 80,
+      },
+      silentLogger,
+    );
 
     const probed = await realMediaProber.detectMedia(destPath);
     expect(probed).toMatchObject({ kind: "image", mimeType: "image/png" });
@@ -73,13 +84,16 @@ describe("generateImageThumbnail (real convert)", () => {
     expect(extremeSize).toEqual({ width: 200, height: 20 }); // overflowed the 20-wide box, as designed
 
     const destPath = path.join(mkTempDir(), "thumb.jpg");
-    await realThumbnailGenerator.generateImageThumbnail({
-      sourcePath: path.join(FIXTURES_DIR, "tiny.jpg"),
-      destPath,
-      width: extremeSize.width,
-      height: extremeSize.height,
-      jpegQuality: 80,
-    });
+    await realThumbnailGenerator.generateImageThumbnail(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.jpg"),
+        destPath,
+        width: extremeSize.width,
+        height: extremeSize.height,
+        jpegQuality: 80,
+      },
+      silentLogger,
+    );
 
     const probed = await realMediaProber.detectMedia(destPath);
     expect(probed).toEqual({
@@ -94,18 +108,21 @@ describe("generateImageThumbnail (real convert)", () => {
 describe("generateVideoMosaic (real ffmpeg)", () => {
   it("generates a mosaic JPEG sized exactly rows*tileWidth by columns*tileHeight", async () => {
     const destPath = path.join(mkTempDir(), "mosaic.jpg");
-    await realThumbnailGenerator.generateVideoMosaic({
-      sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
-      destPath,
-      sourceWidth: 32,
-      sourceHeight: 24,
-      durationSeconds: 2,
-      tileRowCount: 2,
-      tileColumnCount: 2,
-      tileWidth: 16,
-      tileHeight: 12,
-      jpegQuality: 80,
-    });
+    await realThumbnailGenerator.generateVideoMosaic(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        tileRowCount: 2,
+        tileColumnCount: 2,
+        tileWidth: 16,
+        tileHeight: 12,
+        jpegQuality: 80,
+      },
+      silentLogger,
+    );
 
     const probed = await realMediaProber.detectMedia(destPath);
     expect(probed).toEqual({ kind: "image", mimeType: "image/jpeg", width: 32, height: 24 });
@@ -117,18 +134,21 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
       .readdirSync(os.tmpdir())
       .filter((n) => n.startsWith("sync1-mosaic-"));
 
-    await realThumbnailGenerator.generateVideoMosaic({
-      sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
-      destPath,
-      sourceWidth: 32,
-      sourceHeight: 24,
-      durationSeconds: 2,
-      tileRowCount: 1,
-      tileColumnCount: 3,
-      tileWidth: 10,
-      tileHeight: 10,
-      jpegQuality: 50,
-    });
+    await realThumbnailGenerator.generateVideoMosaic(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        tileRowCount: 1,
+        tileColumnCount: 3,
+        tileWidth: 10,
+        tileHeight: 10,
+        jpegQuality: 50,
+      },
+      silentLogger,
+    );
 
     const tmpEntriesAfter = fs
       .readdirSync(os.tmpdir())

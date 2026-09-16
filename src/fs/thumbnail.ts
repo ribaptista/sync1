@@ -175,6 +175,7 @@ async function generateForDecision(
   policy: ThumbnailPolicyRow,
   staleThumbnail: ExistingThumbnailFile | undefined,
   generator: ThumbnailGenerator,
+  logger: Logger,
 ): Promise<void> {
   if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
 
@@ -193,26 +194,32 @@ async function generateForDecision(
       { width: decision.probed.width, height: decision.probed.height },
       { width: policy.imageWidth!, height: policy.imageHeight! },
     );
-    await generator.generateImageThumbnail({
-      sourcePath: sourceAbsolutePath,
-      destPath: destAbsolutePath,
-      width: size.width,
-      height: size.height,
-      jpegQuality: policy.jpegQuality!,
-    });
+    await generator.generateImageThumbnail(
+      {
+        sourcePath: sourceAbsolutePath,
+        destPath: destAbsolutePath,
+        width: size.width,
+        height: size.height,
+        jpegQuality: policy.jpegQuality!,
+      },
+      logger,
+    );
   } else {
-    await generator.generateVideoMosaic({
-      sourcePath: sourceAbsolutePath,
-      destPath: destAbsolutePath,
-      sourceWidth: decision.probed.width,
-      sourceHeight: decision.probed.height,
-      durationSeconds: decision.probed.durationSeconds,
-      tileRowCount: policy.tileRowCount!,
-      tileColumnCount: policy.tileColumnCount!,
-      tileWidth: policy.tileWidth!,
-      tileHeight: policy.tileHeight!,
-      jpegQuality: policy.jpegQuality!,
-    });
+    await generator.generateVideoMosaic(
+      {
+        sourcePath: sourceAbsolutePath,
+        destPath: destAbsolutePath,
+        sourceWidth: decision.probed.width,
+        sourceHeight: decision.probed.height,
+        durationSeconds: decision.probed.durationSeconds,
+        tileRowCount: policy.tileRowCount!,
+        tileColumnCount: policy.tileColumnCount!,
+        tileWidth: policy.tileWidth!,
+        tileHeight: policy.tileHeight!,
+        jpegQuality: policy.jpegQuality!,
+      },
+      logger,
+    );
   }
 }
 
@@ -345,7 +352,7 @@ export async function scanThumbnails(
         await waitForRoom(pool, poolQueueLimit);
         void pool.add(async () => {
           try {
-            await generateForDecision(root, decision, policy, staleThumbnail, generator);
+            await generateForDecision(root, decision, policy, staleThumbnail, generator, logger);
           } catch (err) {
             if (!(err instanceof ThumbnailGenerationError)) throw err;
             stats.errors++;
@@ -362,7 +369,7 @@ export async function scanThumbnails(
         await waitForRoom(pool, poolQueueLimit);
         void pool.add(async () => {
           try {
-            await generateForDecision(root, decision, policy, undefined, generator);
+            await generateForDecision(root, decision, policy, undefined, generator, logger);
           } catch (err) {
             if (!(err instanceof ThumbnailGenerationError)) throw err;
             stats.errors++;
