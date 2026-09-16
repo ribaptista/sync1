@@ -16,7 +16,7 @@ import { matchesAnyGlob } from "./glob-match.js";
 import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { BoundedTaskTracker } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
-import type { OnProgress } from "../progress-types.js";
+import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
 
 export interface CaseCollision {
   path: string;
@@ -39,18 +39,6 @@ export class UnknownStubContentError extends CorruptionError {
     );
     this.name = "UnknownStubContentError";
   }
-}
-
-/**
- * Byte accounting for the one kind of work in this scan that's actually
- * worth tracking bytes for -- an actual hash of real file content. A
- * directory, an already-resolved stub (hash read from the stub file
- * itself, never hashed), and a no-op row all contribute 0, per the
- * universal counting rule in src/progress-types.ts.
- */
-interface ByteTracking {
-  trackDispatched(size: number): void;
-  trackCompleted(size: number): void;
 }
 
 /**
@@ -120,24 +108,12 @@ export async function performUpdateCache(
   // filesDone/filesTotal track every row the merge-join consumes (work-
   // needing or not, mirroring this scan's pre-existing "scanned" counter);
   // bytesDone/bytesTotal track only content actually hashed this run --
-  // see the ByteTracking interface above and progress-types.ts's own
-  // doc comment for the full rule.
-  let scanned = 0;
-  let bytesTotal = 0;
-  let bytesDone = 0;
-  const report = (): void => {
-    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
-  };
-  const byteTracking: ByteTracking = {
-    trackDispatched(size) {
-      bytesTotal += size;
-      report();
-    },
-    trackCompleted(size) {
-      bytesDone += size;
-      report();
-    },
-  };
+  // see progress-types.ts's own doc comment for the full rule. Kept equal
+  // to each other here -- rowResolved() is called right alongside
+  // rowDiscovered() at the same site "scanned" used to be bumped, since
+  // splitting them to reflect real dispatch/resolve timing is the next
+  // commit's job, not this purely mechanical swap's.
+  const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
 
   try {
     const fsIter = walk(root);
@@ -169,7 +145,7 @@ export async function performUpdateCache(
             hashRunner,
             hashJobs,
             staging,
-            byteTracking,
+            progress,
           );
         }
         fsNext = await fsIter.next();
@@ -188,14 +164,14 @@ export async function performUpdateCache(
           hashRunner,
           hashJobs,
           staging,
-          byteTracking,
+          progress,
         );
         fsNext = await fsIter.next();
         cacheNext = cacheIter.next();
       }
 
-      scanned++;
-      report();
+      progress.rowDiscovered();
+      progress.rowResolved();
     }
 
     // Every dispatched hash job must have inserted its row (or thrown) before
@@ -349,15 +325,23 @@ async function dispatchHash(
   absolutePath: string,
   size: number,
   logger: Logger,
-  byteTracking: ByteTracking,
+  progress: ProgressTracker,
   onResolved: (hash: string) => void,
 ): Promise<void> {
-  byteTracking.trackDispatched(size);
+  progress.expectBytes(size);
   await hashJobs.dispatch(async () => {
-    const hash = await hashRunner.run(absolutePath);
-    onResolved(hash);
-    byteTracking.trackCompleted(size);
-    logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
+    const fileTracker = progress.startFile(absolutePath, size);
+    try {
+      const hash = await hashRunner.run(absolutePath);
+      onResolved(hash);
+      logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
+    } finally {
+      // Unconditional, per FileTracker's own contract -- a rejected job's
+      // cleanup path (caught by BoundedTaskTracker, not here) must never
+      // leave this file's share of inFlightBytes pinned for the rest of
+      // the run.
+      fileTracker.finish();
+    }
   });
   logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
 }
@@ -372,7 +356,7 @@ async function dispatchCreatedRow(
   hashRunner: HashRunner,
   hashJobs: BoundedTaskTracker,
   staging: StagingRepository,
-  byteTracking: ByteTracking,
+  progress: ProgressTracker,
 ): Promise<void> {
   const mtime = Math.round(fsEntry.mtimeMs);
   const resolution = classifyContent(fsEntry, root, objectsRepo, logger);
@@ -405,7 +389,7 @@ async function dispatchCreatedRow(
     resolution.absolutePath,
     fsEntry.size,
     logger,
-    byteTracking,
+    progress,
     (hash) => finalize(hash, fsEntry.size),
   );
 }
@@ -452,7 +436,7 @@ async function dispatchExistingRow(
   hashRunner: HashRunner,
   hashJobs: BoundedTaskTracker,
   staging: StagingRepository,
-  byteTracking: ByteTracking,
+  progress: ProgressTracker,
 ): Promise<void> {
   const newMtime = Math.round(fsEntry.mtimeMs);
 
@@ -547,7 +531,7 @@ async function dispatchExistingRow(
     resolution.absolutePath,
     fsEntry.size,
     logger,
-    byteTracking,
+    progress,
     (hash) => finalize(hash, fsEntry.size),
   );
 }

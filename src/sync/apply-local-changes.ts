@@ -14,7 +14,7 @@ import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
 import { waitForRoom } from "../concurrency/pools.js";
-import type { OnProgress } from "../progress-types.js";
+import { createProgressTracker, type OnProgress } from "../progress-types.js";
 
 /**
  * Every path successfully applied or resolved as a no-op (so: safe to
@@ -129,13 +129,12 @@ export async function applyLocalChangesToCandidate(
   // (mirroring other commands' "scanned" counter); bytesDone/bytesTotal
   // track only an actual upload -- a delete, a no-op/conflict resolution,
   // or a same-batch dedup attach all contribute 0, per the universal
-  // counting rule in progress-types.ts.
-  let scanned = 0;
-  let bytesTotal = 0;
-  let bytesDone = 0;
-  const report = (): void => {
-    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
-  };
+  // counting rule in progress-types.ts. Kept equal to each other here --
+  // rowResolved() is called right alongside rowDiscovered() at the same
+  // site "scanned" used to be bumped, since splitting them to reflect real
+  // dispatch/resolve timing is the next commit's job, not this purely
+  // mechanical swap's.
+  const progress = createProgressTracker(onProgress, ["uploading", "uploaded"]);
 
   const iter = dirtyRows[Symbol.iterator]();
   let next = iter.next();
@@ -145,8 +144,8 @@ export async function applyLocalChangesToCandidate(
   // row, handing off to Pass 2 below without consuming it.
   while (!next.done && next.value.state === "deleted") {
     const row = next.value;
-    scanned++;
-    report();
+    progress.rowDiscovered();
+    progress.rowResolved();
     const existingEntry = entriesRepo.get(row.path);
     const decision = decideLocalChange(row, existingEntry);
 
@@ -178,8 +177,8 @@ export async function applyLocalChangesToCandidate(
   while (!next.done) {
     const row = next.value;
     next = iter.next();
-    scanned++;
-    report();
+    progress.rowDiscovered();
+    progress.rowResolved();
 
     // Only a genuinely new path can newly collide -- "modified" targets a
     // path that already exists, so decideLocalChange's own exact-path
@@ -275,40 +274,45 @@ export async function applyLocalChangesToCandidate(
     // job (a fresh fs.statSync there), after a whole batch might already be
     // in flight.
     const size = row.size!;
-    bytesTotal += size;
-    report();
+    progress.expectBytes(size);
 
     await waitForRoom(streamPool, streamQueueLimit);
     void streamPool.add(async () => {
       const absolutePath = path.join(root, row.path);
-      const context = Buffer.from(hash, "hex");
-      const sourceStream = fs.createReadStream(absolutePath);
-      const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
-      const key = objectKey(hash);
-      await putObjectStream(
-        s3.client,
-        s3.bucket,
-        remoteKey(s3.location, key),
-        encryptedStream,
-        encryptedSize(size, context.length),
-      );
-      objectsRepo.upsert({ hash, s3_key: key, size });
-      uploadedObjects++;
-      bytesDone += size;
-      report();
-      for (const sourceRow of job.sourceRows) {
-        entriesRepo.upsert({
-          path: sourceRow.path,
-          type: sourceRow.type,
-          hash,
-          state_version: versionStamp,
-        });
+      const fileTracker = progress.startFile(absolutePath, size);
+      try {
+        const context = Buffer.from(hash, "hex");
+        const sourceStream = fs.createReadStream(absolutePath);
+        const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
+        const key = objectKey(hash);
+        await putObjectStream(
+          s3.client,
+          s3.bucket,
+          remoteKey(s3.location, key),
+          encryptedStream,
+          encryptedSize(size, context.length),
+        );
+        objectsRepo.upsert({ hash, s3_key: key, size });
+        uploadedObjects++;
+        for (const sourceRow of job.sourceRows) {
+          entriesRepo.upsert({
+            path: sourceRow.path,
+            type: sourceRow.type,
+            hash,
+            state_version: versionStamp,
+          });
+        }
+        inFlightByHash.delete(hash);
+        logger.debug(
+          { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+          "completed",
+        );
+      } finally {
+        // Unconditional, per FileTracker's own contract -- see
+        // update-cache.ts's dispatchHash for why this matters even on the
+        // error paths above.
+        fileTracker.finish();
       }
-      inFlightByHash.delete(hash);
-      logger.debug(
-        { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
-        "completed",
-      );
     });
     // Logged after add(), not before -- add() synchronously starts the task
     // (if capacity allows) before returning, so this reflects occupancy

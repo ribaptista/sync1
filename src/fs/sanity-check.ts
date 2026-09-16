@@ -9,7 +9,7 @@ import type { ObjectsRepository } from "../db/repositories/objects-repository.js
 import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { BoundedTaskTracker, waitForRoom } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
-import type { OnProgress } from "../progress-types.js";
+import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
 
 export interface HashMismatch {
   path: string;
@@ -48,18 +48,6 @@ export interface SanityCheckResult {
  * unit-tested without a real or mocked S3 client.
  */
 export type ObjectExistsChecker = (s3Key: string) => Promise<boolean>;
-
-/**
- * Byte accounting for the one kind of work in this scan that's actually
- * worth tracking bytes for -- an actual hash of real file content. A
- * directory, a stub (its declared hash is read synchronously, never
- * hashed), and an out-of-scope (filterGlob) path all contribute 0, per
- * the universal counting rule in src/progress-types.ts.
- */
-interface ByteTracking {
-  trackDispatched(size: number): void;
-  trackCompleted(size: number): void;
-}
 
 function emptyResult(): SanityCheckResult {
   return {
@@ -135,23 +123,13 @@ export async function performSanityCheck(
 
   // filesDone/filesTotal track every row the merge-join consumes (mirroring
   // this scan's pre-existing "scanned" counter); bytesDone/bytesTotal track
-  // only content actually hashed this run -- see ByteTracking above.
-  let scanned = 0;
-  let bytesTotal = 0;
-  let bytesDone = 0;
-  const report = (): void => {
-    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
-  };
-  const byteTracking: ByteTracking = {
-    trackDispatched(size) {
-      bytesTotal += size;
-      report();
-    },
-    trackCompleted(size) {
-      bytesDone += size;
-      report();
-    },
-  };
+  // only content actually hashed this run -- see progress-types.ts's own
+  // doc comment for the full rule. Kept equal to each other here --
+  // rowResolved() is called right alongside rowDiscovered() at the same
+  // site "scanned" used to be bumped, since splitting them to reflect real
+  // dispatch/resolve timing is the next commit's job, not this purely
+  // mechanical swap's.
+  const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
 
   const fsIter = walk(root);
   const entryIter = entriesRepo.iterateAllSortedByPath();
@@ -193,15 +171,15 @@ export async function performSanityCheck(
           hashJobs,
           s3Pool,
           s3QueueLimit,
-          byteTracking,
+          progress,
         );
       }
       fsNext = await fsIter.next();
       entryNext = entryIter.next();
     }
 
-    scanned++;
-    report();
+    progress.rowDiscovered();
+    progress.rowResolved();
   }
 
   // Draining order matters: a hash job's own completion is what enqueues
@@ -228,7 +206,7 @@ async function dispatchTrackedEntryCheck(
   hashJobs: BoundedTaskTracker,
   s3Pool: PQueue,
   s3QueueLimit: number,
-  byteTracking: ByteTracking,
+  progress: ProgressTracker,
 ): Promise<void> {
   if (entry.type === "dir") return; // directories carry no content -- existence is the only signal, already confirmed by reaching here
 
@@ -241,26 +219,33 @@ async function dispatchTrackedEntryCheck(
   const absolutePath = path.join(root, entry.path);
 
   if (fsEntry.representation === "real") {
-    byteTracking.trackDispatched(fsEntry.size);
+    progress.expectBytes(fsEntry.size);
     await hashJobs.dispatch(async () => {
-      const actualHash = await hashRunner.run(absolutePath);
-      byteTracking.trackCompleted(fsEntry.size);
-      logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
-      if (entry.hash !== null && actualHash !== entry.hash) {
-        result.hashMismatch.push({ path: entry.path, expectedHash: entry.hash, actualHash });
-        return;
+      const fileTracker = progress.startFile(absolutePath, fsEntry.size);
+      try {
+        const actualHash = await hashRunner.run(absolutePath);
+        logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
+        if (entry.hash !== null && actualHash !== entry.hash) {
+          result.hashMismatch.push({ path: entry.path, expectedHash: entry.hash, actualHash });
+          return;
+        }
+        if (!entry.hash) return;
+        await dispatchS3Check(
+          s3Pool,
+          s3QueueLimit,
+          entry.hash,
+          entry.path,
+          objectsRepo,
+          objectExists,
+          result,
+          logger,
+        );
+      } finally {
+        // Unconditional, per FileTracker's own contract -- see
+        // update-cache.ts's dispatchHash for why this matters even on the
+        // error paths above.
+        fileTracker.finish();
       }
-      if (!entry.hash) return;
-      await dispatchS3Check(
-        s3Pool,
-        s3QueueLimit,
-        entry.hash,
-        entry.path,
-        objectsRepo,
-        objectExists,
-        result,
-        logger,
-      );
     });
     logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
     return;

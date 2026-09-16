@@ -17,7 +17,7 @@ import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "../fs/decrypt-to-file.js";
 import { waitForRoom } from "../concurrency/pools.js";
-import type { OnProgress } from "../progress-types.js";
+import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
 
 /**
  * A path materialized (or stub-updated) here despite matching a global
@@ -36,17 +36,6 @@ export interface ApplyRemoteChangesResult {
   modified: number;
   deleted: number;
   ignoredButSynced: IgnoredButSyncedEntry[];
-}
-
-/**
- * Byte accounting for the one kind of work here that's actually worth
- * tracking bytes for -- a real download. A directory, a stub write (no
- * download), and a remote deletion all contribute 0, per the universal
- * counting rule in progress-types.ts.
- */
-interface ByteTracking {
-  trackDispatched(size: number): void;
-  trackCompleted(size: number): void;
 }
 
 /**
@@ -112,24 +101,13 @@ export async function applyRemoteChangesToLocal(
 
   // filesDone/filesTotal track every path the merge-join consumes (work-
   // needing or not, mirroring other commands' "scanned" counter);
-  // bytesDone/bytesTotal track only an actual download -- see the
-  // ByteTracking interface above.
-  let scanned = 0;
-  let bytesTotal = 0;
-  let bytesDone = 0;
-  const report = (): void => {
-    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
-  };
-  const byteTracking: ByteTracking = {
-    trackDispatched(size) {
-      bytesTotal += size;
-      report();
-    },
-    trackCompleted(size) {
-      bytesDone += size;
-      report();
-    },
-  };
+  // bytesDone/bytesTotal track only an actual download -- see
+  // progress-types.ts's own doc comment for the full rule. Kept equal to
+  // each other here -- rowResolved() is called right alongside
+  // rowDiscovered() at the same site "scanned" used to be bumped, since
+  // splitting them to reflect real dispatch/resolve timing is the next
+  // commit's job, not this purely mechanical swap's.
+  const progress = createProgressTracker(onProgress, ["downloading", "downloaded"]);
 
   {
     const cacheIter = cacheRepo.iterateAllSortedByPath();
@@ -168,7 +146,7 @@ export async function applyRemoteChangesToLocal(
             logger,
             streamPool,
             streamQueueLimit,
-            byteTracking,
+            progress,
           );
           result.created++;
 
@@ -211,7 +189,7 @@ export async function applyRemoteChangesToLocal(
             logger,
             streamPool,
             streamQueueLimit,
-            byteTracking,
+            progress,
           );
           result.modified++;
         }
@@ -219,8 +197,8 @@ export async function applyRemoteChangesToLocal(
         candidateNext = candidateIter.next();
       }
 
-      scanned++;
-      report();
+      progress.rowDiscovered();
+      progress.rowResolved();
     }
 
     await streamPool.onIdle();
@@ -260,7 +238,7 @@ async function applyRemoteContentChange(
   logger: Logger,
   streamPool: PQueue,
   streamQueueLimit: number,
-  byteTracking: ByteTracking,
+  progress: ProgressTracker,
 ): Promise<void> {
   const absolutePath = path.join(root, entry.path);
 
@@ -312,58 +290,65 @@ async function applyRemoteContentChange(
   }
 
   const hash = entry.hash;
-  byteTracking.trackDispatched(objectRow.size);
+  progress.expectBytes(objectRow.size);
   await waitForRoom(streamPool, streamQueueLimit);
   void streamPool.add(async () => {
-    const encrypted = await getObjectStream(
-      s3.client,
-      s3.bucket,
-      remoteKey(s3.location, objectRow.s3_key),
-    );
-    if (!encrypted) {
-      throw new CorruptionError(
-        `object ${hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
-      );
-    }
-
-    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-    const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
-    let computedHash: string;
+    const fileTracker = progress.startFile(absolutePath, objectRow.size);
     try {
-      computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
-    } catch (err) {
-      if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
-      if (err instanceof CryptoAuthError) {
+      const encrypted = await getObjectStream(
+        s3.client,
+        s3.bucket,
+        remoteKey(s3.location, objectRow.s3_key),
+      );
+      if (!encrypted) {
         throw new CorruptionError(
-          `object ${hash} for "${entry.path}" failed decryption/authentication`,
+          `object ${hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
         );
       }
-      throw err;
-    }
-    if (computedHash !== hash) {
-      fs.rmSync(tmpPath);
-      throw new CorruptionError(
-        `object ${hash} for "${entry.path}" does not match its recorded hash`,
+
+      fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+      const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+      let computedHash: string;
+      try {
+        computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
+      } catch (err) {
+        if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
+        if (err instanceof CryptoAuthError) {
+          throw new CorruptionError(
+            `object ${hash} for "${entry.path}" failed decryption/authentication`,
+          );
+        }
+        throw err;
+      }
+      if (computedHash !== hash) {
+        fs.rmSync(tmpPath);
+        throw new CorruptionError(
+          `object ${hash} for "${entry.path}" does not match its recorded hash`,
+        );
+      }
+
+      fs.renameSync(tmpPath, absolutePath);
+
+      cacheRepo.upsert({
+        path: entry.path,
+        type: "file",
+        mtime: Math.round(fs.statSync(absolutePath).mtimeMs),
+        hash,
+        size: objectRow.size,
+        state: "unchanged",
+        parent_state_version: entry.state_version,
+      });
+      logger.debug({ path: entry.path, hash }, "materialized remote file create/modify");
+      logger.debug(
+        { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+        "completed",
       );
+    } finally {
+      // Unconditional, per FileTracker's own contract -- see
+      // update-cache.ts's dispatchHash for why this matters even on the
+      // error paths above.
+      fileTracker.finish();
     }
-
-    fs.renameSync(tmpPath, absolutePath);
-
-    cacheRepo.upsert({
-      path: entry.path,
-      type: "file",
-      mtime: Math.round(fs.statSync(absolutePath).mtimeMs),
-      hash,
-      size: objectRow.size,
-      state: "unchanged",
-      parent_state_version: entry.state_version,
-    });
-    byteTracking.trackCompleted(objectRow.size);
-    logger.debug({ path: entry.path, hash }, "materialized remote file create/modify");
-    logger.debug(
-      { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
-      "completed",
-    );
   });
   // Logged after add(), not before -- add() synchronously starts the task
   // (if capacity allows) before returning, so this reflects occupancy

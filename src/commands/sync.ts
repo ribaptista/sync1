@@ -19,6 +19,7 @@ import {
   shouldShowProgress,
   startBytesProgressSession,
   createLoggerForRun,
+  reporterFor,
 } from "../cli/progress.js";
 
 interface SyncOptions extends OptionValues {
@@ -141,10 +142,7 @@ async function runSync(
       { client, bucket: remoteConfig.bucket, location },
       logger,
       pools,
-      (u) => {
-        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
-        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
-      },
+      reporterFor(progress),
     );
   } finally {
     progress.stop();

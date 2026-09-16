@@ -23,6 +23,7 @@ import {
   shouldShowProgress,
   startBytesProgressSession,
   createLoggerForRun,
+  reporterFor,
 } from "../cli/progress.js";
 
 interface UpdateCacheOptions extends OptionValues {
@@ -121,10 +122,7 @@ async function runUpdateCache(
       logger,
       pools.hash,
       pools.hash.maxThreads,
-      (u) => {
-        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
-        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
-      },
+      reporterFor(progress),
     );
     return stats;
   } finally {

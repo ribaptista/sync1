@@ -5,7 +5,7 @@ import { CacheEntriesRepository } from "../db/repositories/cache-entries-reposit
 import { writeStubAtomic, stubPathFor } from "./stub.js";
 import { BoundedTaskTracker } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
-import type { OnProgress } from "../progress-types.js";
+import { createProgressTracker, type OnProgress } from "../progress-types.js";
 
 export interface StubifySkip {
   path: string;
@@ -52,13 +52,12 @@ export async function stubifyGlob(
   // filesDone/filesTotal track every glob-matched row (mirroring this
   // scan's pre-existing "scanned" counter); bytesDone/bytesTotal track only
   // a genuine rehash -- the common mtime-unchanged fast path below (which
-  // never reads through the file's content at all) contributes 0.
-  let scanned = 0;
-  let bytesTotal = 0;
-  let bytesDone = 0;
-  const report = (): void => {
-    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
-  };
+  // never reads through the file's content at all) contributes 0. Kept
+  // equal to each other here -- rowResolved() is called right alongside
+  // rowDiscovered() at the same site "scanned" used to be bumped, since
+  // splitting them to reflect real dispatch/resolve timing is the next
+  // commit's job, not this purely mechanical swap's.
+  const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
 
   // A single connection/repo covers both the glob scan and cacheRepo.upsert()
   // below: iterateByGlobSortedByPath() is keyset-paginated (src/db/keyset-
@@ -66,8 +65,8 @@ export async function stubifyGlob(
   // interleave with it -- a write only ever conflicts with a *paused*
   // cursor, and pagination never leaves one paused between pages.
   for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
-    scanned++;
-    report();
+    progress.rowDiscovered();
+    progress.rowResolved();
     if (row.type !== "file") continue;
     const absolutePath = path.join(root, row.path);
     const stubAbsolutePath = stubPathFor(absolutePath);
@@ -104,23 +103,28 @@ export async function stubifyGlob(
     // live, tracked file row, and the DB's CHECK constraint (see
     // 0004_add_size.sql) guarantees size is NOT NULL for any such row.
     const size = row.size!;
-    bytesTotal += size;
-    report();
+    progress.expectBytes(size);
     await hashJobs.dispatch(async () => {
-      const rehash = await hashRunner.run(absolutePath);
-      // The work of reading through the file happened either way, whether
-      // or not the rehash actually confirms row.hash below.
-      bytesDone += size;
-      report();
-      logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
-      if (rehash !== row.hash) {
-        stats.skipped.push({
-          path: row.path,
-          reason: "file changed since it was last synced -- run sync first",
-        });
-        return;
+      const fileTracker = progress.startFile(absolutePath, size);
+      try {
+        const rehash = await hashRunner.run(absolutePath);
+        logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
+        // The work of reading through the file happened either way, whether
+        // or not the rehash actually confirms row.hash below.
+        if (rehash !== row.hash) {
+          stats.skipped.push({
+            path: row.path,
+            reason: "file changed since it was last synced -- run sync first",
+          });
+          return;
+        }
+        finalize(rehash);
+      } finally {
+        // Unconditional, per FileTracker's own contract -- see
+        // update-cache.ts's dispatchHash for why this matters even on the
+        // error paths above.
+        fileTracker.finish();
       }
-      finalize(rehash);
     });
     logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
   }

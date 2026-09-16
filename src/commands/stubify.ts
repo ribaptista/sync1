@@ -15,6 +15,7 @@ import {
   shouldShowProgress,
   startBytesProgressSession,
   createLoggerForRun,
+  reporterFor,
 } from "../cli/progress.js";
 
 interface StubifyOptions extends OptionValues {
@@ -92,10 +93,7 @@ async function runStubify(
       logger,
       pools.hash,
       pools.hash.maxThreads,
-      (u) => {
-        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
-        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
-      },
+      reporterFor(progress),
     );
   } finally {
     progress.stop();

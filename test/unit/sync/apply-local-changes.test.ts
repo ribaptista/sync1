@@ -443,7 +443,10 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     expect(result.uploadedObjects).toBe(1);
     // some report happened right after dispatch, before the upload settled
     expect(updates.some((u) => u.bytesTotal === content.length && u.bytesDone === 0)).toBe(true);
-    expect(updates[updates.length - 1]).toEqual({
+    // toMatchObject, not toEqual: the last update also carries an `activity`
+    // ("uploaded ...") from FileTracker.finish() -- this checks the numeric
+    // tally without pinning down that label's exact shape.
+    expect(updates[updates.length - 1]).toMatchObject({
       filesDone: 1,
       filesTotal: 1,
       bytesDone: content.length,
@@ -499,8 +502,9 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     expect(result.dedupedObjects).toBe(1);
     // only one file's worth of content is ever uploaded -- the dedup'd
     // second row contributes 0 bytes, even though both rows count toward
-    // filesDone/filesTotal.
-    expect(updates[updates.length - 1]).toEqual({
+    // filesDone/filesTotal. toMatchObject, not toEqual: see the upload test
+    // above for why (the last update also carries an `activity` label).
+    expect(updates[updates.length - 1]).toMatchObject({
       filesDone: 2,
       filesTotal: 2,
       bytesDone: 14,
@@ -550,7 +554,16 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     );
 
     expect(result.appliedCount).toBe(1);
-    expect(updates).toEqual([{ filesDone: 1, filesTotal: 1, bytesDone: 0, bytesTotal: 0 }]);
+    // Two updates now, not one: rowDiscovered() and rowResolved() each emit
+    // their own update, even for a delete (fully synchronous, no byte work
+    // at all) -- the last one is what matters, and equals the final tally.
+    expect(updates.at(-1)).toEqual({ filesDone: 1, filesTotal: 1, bytesDone: 0, bytesTotal: 0 });
+    // The regression test for the discovered/resolved split itself: every
+    // row -- even a synchronous one like this delete -- passes through a
+    // real intermediate state where it's been counted as discovered but not
+    // yet resolved, because rowDiscovered() and rowResolved() are always
+    // two separate calls (see progress-types.ts's createProgressTracker).
+    expect(updates.some((u) => u.filesTotal > u.filesDone)).toBe(true);
 
     candidateDb.close();
   });

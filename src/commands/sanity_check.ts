@@ -20,6 +20,7 @@ import {
   shouldShowProgress,
   startBytesProgressSession,
   createLoggerForRun,
+  reporterFor,
 } from "../cli/progress.js";
 
 interface SanityCheckOptions extends OptionValues {
@@ -176,10 +177,7 @@ async function runSanityCheck(
       pools.s3,
       pools.s3.concurrency * 2,
       opts.filter,
-      (u) => {
-        progress.setOverallTotals({ files: u.filesTotal, bytes: u.bytesTotal });
-        progress.setOverallProgress({ files: u.filesDone, bytes: u.bytesDone });
-      },
+      reporterFor(progress),
     );
   } finally {
     progress.stop();

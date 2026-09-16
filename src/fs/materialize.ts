@@ -14,7 +14,7 @@ import { stubPathFor } from "./stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "./decrypt-to-file.js";
 import { waitForRoom } from "../concurrency/pools.js";
-import type { OnProgress } from "../progress-types.js";
+import { createProgressTracker, type OnProgress } from "../progress-types.js";
 
 export interface MaterializeStats {
   materialized: number;
@@ -75,13 +75,12 @@ export async function materializeGlob(
   // actually needed a download); bytesDone/bytesTotal track only a
   // genuine download -- a stub whose object turns out cold (needs a
   // restore request, or is still pending one) contributes 0 to bytes,
-  // since nothing is downloaded this run.
-  let scanned = 0;
-  let bytesTotal = 0;
-  let bytesDone = 0;
-  const report = (): void => {
-    onProgress?.({ filesDone: scanned, filesTotal: scanned, bytesDone, bytesTotal });
-  };
+  // since nothing is downloaded this run. Kept equal to each other here --
+  // rowResolved() is called right alongside rowDiscovered() at the same
+  // site "scanned" used to be bumped, since splitting them to reflect real
+  // dispatch/resolve timing is the next commit's job, not this purely
+  // mechanical swap's.
+  const progress = createProgressTracker(onProgress, ["downloading", "downloaded"]);
 
   // A single connection/repo covers both the glob scan and cacheRepo.upsert()
   // below: iterateByGlobSortedByPath() is keyset-paginated (src/db/keyset-
@@ -89,8 +88,8 @@ export async function materializeGlob(
   // interleave with it -- a write only ever conflicts with a *paused*
   // cursor, and pagination never leaves one paused between pages.
   for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
-    scanned++;
-    report();
+    progress.rowDiscovered();
+    progress.rowResolved();
     if (row.type !== "file") continue;
     const absolutePath = path.join(root, row.path);
     const stubAbsolutePath = stubPathFor(absolutePath);
@@ -130,48 +129,53 @@ export async function materializeGlob(
       logger.debug({ path: row.path, hash, status }, "classified archive status");
 
       if (status === "immediate" || status === "restore-ready") {
-        bytesTotal += objectRow.size;
-        report();
+        progress.expectBytes(objectRow.size);
         await waitForRoom(streamPool, streamQueueLimit);
         void streamPool.add(async () => {
-          const encrypted = await getObjectStream(s3.client, s3.bucket, key);
-          if (!encrypted) {
-            throw new CorruptionError(`object ${hash} for "${row.path}" is missing in S3`);
-          }
-
-          fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-          const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
-          let computedHash: string;
+          const fileTracker = progress.startFile(absolutePath, objectRow.size);
           try {
-            computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
-          } catch (err) {
-            if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
-            if (err instanceof CryptoAuthError) {
+            const encrypted = await getObjectStream(s3.client, s3.bucket, key);
+            if (!encrypted) {
+              throw new CorruptionError(`object ${hash} for "${row.path}" is missing in S3`);
+            }
+
+            fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+            const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+            let computedHash: string;
+            try {
+              computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath);
+            } catch (err) {
+              if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
+              if (err instanceof CryptoAuthError) {
+                throw new CorruptionError(
+                  `object ${hash} for "${row.path}" failed decryption/authentication`,
+                );
+              }
+              throw err;
+            }
+            if (computedHash !== hash) {
+              fs.rmSync(tmpPath);
               throw new CorruptionError(
-                `object ${hash} for "${row.path}" failed decryption/authentication`,
+                `object ${hash} for "${row.path}" does not match its recorded hash`,
               );
             }
-            throw err;
-          }
-          if (computedHash !== hash) {
-            fs.rmSync(tmpPath);
-            throw new CorruptionError(
-              `object ${hash} for "${row.path}" does not match its recorded hash`,
+
+            fs.renameSync(tmpPath, absolutePath); // materialize first...
+            fs.rmSync(stubAbsolutePath); // ...only then delete the stub
+
+            cacheRepo.upsert({ ...row, mtime: Math.round(fs.statSync(absolutePath).mtimeMs) });
+            stats.materialized++;
+            logger.debug({ path: row.path }, "materialized");
+            logger.debug(
+              { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+              "completed",
             );
+          } finally {
+            // Unconditional, per FileTracker's own contract -- see
+            // update-cache.ts's dispatchHash for why this matters even on
+            // the error paths above.
+            fileTracker.finish();
           }
-
-          fs.renameSync(tmpPath, absolutePath); // materialize first...
-          fs.rmSync(stubAbsolutePath); // ...only then delete the stub
-
-          cacheRepo.upsert({ ...row, mtime: Math.round(fs.statSync(absolutePath).mtimeMs) });
-          stats.materialized++;
-          bytesDone += objectRow.size;
-          report();
-          logger.debug({ path: row.path }, "materialized");
-          logger.debug(
-            { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
-            "completed",
-          );
         });
         logger.debug(
           { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },

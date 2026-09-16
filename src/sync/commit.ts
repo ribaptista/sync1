@@ -134,6 +134,14 @@ export async function performSync(
       filesTotal: base.filesTotal + u.filesTotal,
       bytesDone: base.bytesDone + u.bytesDone,
       bytesTotal: base.bytesTotal + u.bytesTotal,
+      // Passed through verbatim, never summed with anything from `base` --
+      // it's a per-file label, not a numeric tally. Also never carried
+      // across advanceBase() below: each phase builds its own tracker with
+      // its own verb pair, so a stale "uploaded ..." label from the phase
+      // that just finished naturally stops arriving the moment the next
+      // phase's tracker starts emitting its own (typically "downloading
+      // ...") activity -- nothing here needs to reset it explicitly.
+      activity: u.activity,
     });
   };
   const advanceBase = (): void => {
