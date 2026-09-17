@@ -89,10 +89,25 @@ collision detection of its own.
 constructable`.
 
 Every command that dispatches hash jobs takes the hash pool through a small `HashRunner` interface
-(`{ run(absolutePath): Promise<string> }`) rather than a concrete `Piscina` type — production passes
-the real pool (which already satisfies the shape), and unit tests inject a fake, synchronous-ish
+(`{ run: (absolutePath, onBytes?) => Promise<string> }`) rather than a concrete `Piscina` type —
+production passes `createHashRunner(pool)`, and unit tests inject a fake, synchronous-ish
 implementation instead of spinning up real worker threads (slow, and pointless for testing the
 merge-join logic itself, which is the actual complexity).
+
+The adapter exists because a worker thread can't reach the progress bar directly: it writes its
+running byte count into a `SharedArrayBuffer` handed in with the task, and the main thread samples that
+on a timer. Shared memory rather than a `MessageChannel` — a port would have to be transferred in,
+listened to, and closed on every exit path, including the ones that reject before the handler runs
+(which leaks the worker-side port and hangs pool shutdown), whereas a `SharedArrayBuffer` is plain
+memory that gets collected. It also leaves throttling to the reader, which knows the bar's redraw rate,
+rather than making the writer guess at a chunk interval. The counter is a `BigInt64Array`: a 32-bit one
+wraps at 2.1GB, on exactly the multi-GB video this is for.
+
+Note `HashRunner.run` is declared as a **property**, not a method. Method syntax is checked
+bivariantly even under `strict`, so a bare `Piscina` — whose own `run(task, options?)` takes an options
+object second — would keep on structurally satisfying the interface while silently passing a callback
+where piscina expects its options. As a property, `strictFunctionTypes` applies contravariantly and
+every un-migrated call site is a compile error instead.
 
 ## Backpressure: never let a producer outrun what it feeds
 
@@ -142,15 +157,32 @@ measures:
   the bar's own internal total/current** — and therefore `{eta_formatted}`'s real math — since an ETA
   derived from item _count_ alone would be misleading when file sizes vary wildly (hashing one 4GB
   video vs. ten 1KB text files). File counts ride along purely as custom payload tokens, cosmetic only:
+
   ```
-  ${label} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- ETA {eta_formatted}
+  ${label} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- ETA {eta_formatted} {activity}
   ```
+
   `{eta_formatted}` (and `{duration_formatted}`) are `cli-progress`'s own built-in tokens — the bar
   computes ETA automatically from real `total`/`current` values fed to it. An earlier iteration of this
   code had a fully-implemented but never-wired-up nested-bar API (`ChildBar`/`addChildBar`) that
   hand-rolled its own throughput/rate math; it was deleted outright rather than adapted, since its
   per-file-nested-bar shape didn't fit "one combined overall bar" anyway, and `cli-progress` already
-  does this correctly for free.
+  does this correctly for free. That judgement still stands, and one bar per parallel worker was
+  reconsidered and rejected again since: `MultiBar` redraws by moving the cursor up `dy` lines, so the
+  moment the stack outgrows the terminal's height the origin is lost and the display degrades into
+  repeating bars — and a hash pool defaults to one thread per CPU.
+
+  `{activity}` is what replaced it: a single trailing label naming the file currently being worked on,
+  written by whichever producer is running. It flips at **two** moments per file — `hashing <path>...`
+  when that file's job starts and `hashed <path>...` when it finishes (`uploading`/`uploaded`,
+  `downloading`/`downloaded` likewise). Labelling only completion would have been simpler but leaves
+  the label empty for however long the first file of a run takes, which is precisely the dead-air case
+  the label exists to fill. Paths flash past unreadably on small files; that's accepted — the bar
+  redraws at 10fps regardless, so it's a rolling sample, not a log. `fitPath` truncates to the terminal
+  width keeping the **tail**, since the filename is the informative end and `linewrap: false` means the
+  terminal would otherwise clip the head. The verbs are supplied by each producer, never enumerated in
+  `src/cli/progress.ts` — the bar renders whatever word it is handed and knows nothing about hashing or
+  S3, which is also what lets `sync` show a different verb per phase through one session.
 
 Both session types share the same "only grows" convention for totals (`setOverallTotal`/
 `setOverallTotals` never shrinks a total that's already been set, since the true total often isn't
@@ -161,16 +193,36 @@ rendering).
 Every domain function in `BytesProgressSession`'s scope takes an `onProgress?: OnProgress` parameter
 (`src/progress-types.ts` — kept as its own leaf module, not part of `src/cli/*`, since `src/fs/*` and
 `src/sync/*` never import from `src/cli/*` and this type needs to cross that boundary without inverting
-it) and reports `{ filesDone, filesTotal, bytesDone, bytesTotal }`. The counting rule is the same
-everywhere: **`filesDone`/`filesTotal` count every row a scan/merge-join consumes**, whether or not it
-actually needed work — unchanged from what every command already reported before byte tracking existed.
+it) and reports `{ filesDone, filesTotal, bytesDone, bytesTotal, activity? }`. None of them build that
+object by hand: they all drive a `createProgressTracker`, which owns the counting rule in one place
+rather than in six near-identical `report()` closures.
+
+The counting rule is the same everywhere. **`filesTotal` counts every row a scan/merge-join has
+_discovered_; `filesDone` counts the ones whose work has actually _resolved_** — a row needing no
+async work resolves the moment it's seen, so the two only diverge by what is genuinely in flight. They
+were previously the same variable, which is why the bar used to read a pinned `X/X`. Note the gap this
+opens is bounded by pool concurrency, since the producers block once the pool is full; the honest
+denominator early in a run comes from each command preseeding a total from its own row count.
+
 **`bytesDone`/`bytesTotal` count only content actually hashed/uploaded/downloaded this run** — a
 directory, an already-resolved stub (hash read from the stub file itself, never hashed), a
 no-op/unchanged/dedup-skip row, and (for `stubify`) the common mtime-unchanged fast path all contribute
 exactly 0 to both. A size is known synchronously (from cache.db's `entries.size` column, or from
 `objects.size` for anything keyed by content hash) at classification time, before a job is dispatched —
-so `bytesTotal` grows at dispatch and `bytesDone` advances at completion, the same decide/dispatch/join
-shape as everything else in this doc.
+so `bytesTotal` grows at dispatch (`expectBytes`), the same decide/dispatch/join shape as everything
+else in this doc.
+
+`bytesDone`, though, is **completed bytes plus the partial progress of everything in flight**, not just
+whole files at completion. That distinction is the point of the whole mechanism: since bytes alone
+drive the bar's fill and its ETA, counting only completed files froze both for as long as one large
+file took. Each in-flight file reports through a `FileTracker` fed by whichever byte source fits that
+pipeline — `countingReadable` around the plaintext read for uploads, an `onBytes` hook in
+`decryptStreamToFile`'s plaintext loop for downloads, and a shared-memory counter sampled off the
+worker thread for hashing (see `createHashRunner`). All three are denominated in **plaintext** bytes so
+they sum to exactly the size the tracker was opened with; ciphertext byte counts run larger and would
+overrun the declared total. A file's partial contribution is clamped to its own size and `finish()` is
+idempotent and called from a `finally`, which together keep `bytesDone` monotonic — a property
+`performSync`'s phase accumulator below depends on.
 
 `sync` is the one command whose progress spans more than one domain function: `performSync` runs three
 phases fully sequentially (`performUpdateCache`, then `applyLocalChangesToCandidate`, then

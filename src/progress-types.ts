@@ -7,15 +7,23 @@
  * `fs`/`sync`, only `commands/*.ts` bridges them), and this type needs to be
  * importable from both sides of that boundary without inverting it.
  *
- * `filesDone`/`filesTotal` count every row a scan/merge-join consumes,
- * whether or not it actually needed hashing/uploading/downloading --
- * "how far through the tree" visibility, unchanged from what every command
- * already reported before byte tracking existed. `bytesDone`/`bytesTotal`
- * count only content actually hashed/uploaded/downloaded this run -- a
- * directory, an already-resolved stub, a no-op/unchanged/dedup-skip row,
- * and (for stubify) the common mtime-unchanged fast path all contribute 0
- * to both. This is what makes bytes a meaningful basis for an ETA where
- * item counts alone wouldn't be (file sizes vary wildly).
+ * `filesTotal` counts every row a scan/merge-join has *discovered*;
+ * `filesDone` counts the ones whose work has actually *resolved*. A row
+ * needing no async work resolves the moment it's seen, so the two diverge
+ * only by what is genuinely in flight -- they used to be the same variable,
+ * which is why the bar read a pinned "X/X". Both count every row, whether
+ * or not it needed hashing/uploading/downloading: that's "how far through
+ * the tree" visibility.
+ *
+ * `bytesDone`/`bytesTotal` count only content actually hashed/uploaded/
+ * downloaded this run -- a directory, an already-resolved stub, a
+ * no-op/unchanged/dedup-skip row, and (for stubify) the common
+ * mtime-unchanged fast path all contribute 0 to both. This is what makes
+ * bytes a meaningful basis for an ETA where item counts alone wouldn't be
+ * (file sizes vary wildly), and it's why `bytesDone` includes the partial
+ * progress of in-flight files rather than whole files at completion:
+ * bytes drive the bar's fill and its ETA, so counting only completions
+ * froze both for as long as a single large file took.
  */
 export interface ProgressUpdate {
   filesDone: number;
