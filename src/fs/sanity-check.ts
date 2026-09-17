@@ -237,7 +237,7 @@ async function dispatchTrackedEntryCheck(
     await hashJobs.dispatch(async () => {
       const fileTracker = progress.startFile(absolutePath, fsEntry.size);
       try {
-        const actualHash = await hashRunner.run(absolutePath);
+        const actualHash = await hashRunner.run(absolutePath, (n) => fileTracker.advance(n));
         logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
         if (entry.hash !== null && actualHash !== entry.hash) {
           result.hashMismatch.push({ path: entry.path, expectedHash: entry.hash, actualHash });

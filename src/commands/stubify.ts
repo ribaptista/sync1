@@ -91,7 +91,7 @@ async function runStubify(
       glob,
       cacheRepo,
       logger,
-      pools.hash,
+      pools.hashRunner,
       pools.hash.maxThreads,
       reporterFor(progress),
     );

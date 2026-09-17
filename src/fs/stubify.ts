@@ -139,7 +139,7 @@ async function processRow(
   await hashJobs.dispatch(async () => {
     const fileTracker = progress.startFile(absolutePath, size);
     try {
-      const rehash = await hashRunner.run(absolutePath);
+      const rehash = await hashRunner.run(absolutePath, (n) => fileTracker.advance(n));
       logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
       // The work of reading through the file happened either way, whether
       // or not the rehash actually confirms row.hash below.

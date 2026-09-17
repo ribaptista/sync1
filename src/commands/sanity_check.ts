@@ -173,7 +173,7 @@ async function runSanityCheck(
       ignorePoliciesRepo,
       objectExists,
       logger,
-      pools.hash,
+      pools.hashRunner,
       pools.hash.maxThreads,
       pools.s3,
       pools.s3.concurrency * 2,

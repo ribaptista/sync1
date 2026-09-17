@@ -181,7 +181,7 @@ export async function performSync(
           new IgnorePoliciesRepository(stateDbForScan),
           lastSyncedVersion,
           logger,
-          pools.hash,
+          pools.hashRunner,
           pools.hash.maxThreads,
           phaseProgress,
         );

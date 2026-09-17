@@ -334,7 +334,7 @@ async function dispatchHash(
   await hashJobs.dispatch(async () => {
     const fileTracker = progress.startFile(absolutePath, size);
     try {
-      const hash = await hashRunner.run(absolutePath);
+      const hash = await hashRunner.run(absolutePath, (n) => fileTracker.advance(n));
       onResolved(hash);
       logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
     } finally {

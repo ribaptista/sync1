@@ -120,7 +120,7 @@ async function runUpdateCache(
       ignorePoliciesRepo,
       lastSyncedVersion,
       logger,
-      pools.hash,
+      pools.hashRunner,
       pools.hash.maxThreads,
       reporterFor(progress),
     );

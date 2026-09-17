@@ -2,10 +2,18 @@ import PQueue from "p-queue";
 import { Piscina } from "piscina";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
+import { createHashRunner, type HashRunner } from "./hash-runner.js";
 
 export interface ConcurrencyPools {
   s3: PQueue;
   hash: Piscina;
+  /**
+   * The seam callers actually dispatch hashing through -- `hash` itself
+   * stays exposed only for its `maxThreads` (the natural in-flight limit)
+   * and `close()`. Going through the adapter is what carries per-file byte
+   * progress back out of the worker thread; see `createHashRunner`.
+   */
+  hashRunner: HashRunner;
   stream: PQueue;
   thumbnail: PQueue;
 }
@@ -18,12 +26,14 @@ export interface ConcurrencyPoolOptions {
 }
 
 export function createConcurrencyPools(opts: ConcurrencyPoolOptions): ConcurrencyPools {
+  const hash = new Piscina({
+    filename: fileURLToPath(new URL("./hash-worker.js", import.meta.url)),
+    maxThreads: opts.hashParallelism ?? os.cpus().length,
+  });
   return {
     s3: new PQueue({ concurrency: opts.s3MetadataParallelism ?? 8 }),
-    hash: new Piscina({
-      filename: fileURLToPath(new URL("./hash-worker.js", import.meta.url)),
-      maxThreads: opts.hashParallelism ?? os.cpus().length,
-    }),
+    hash,
+    hashRunner: createHashRunner(hash),
     stream: new PQueue({ concurrency: opts.fileStreamParallelism ?? 4 }),
     thumbnail: new PQueue({ concurrency: opts.thumbnailParallelism ?? 4 }),
   };
