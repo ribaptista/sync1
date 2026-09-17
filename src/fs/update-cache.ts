@@ -325,6 +325,7 @@ async function dispatchHash(
   hashJobs: BoundedTaskTracker,
   hashRunner: HashRunner,
   absolutePath: string,
+  relativePath: string,
   size: number,
   logger: Logger,
   progress: ProgressTracker,
@@ -332,7 +333,11 @@ async function dispatchHash(
 ): Promise<void> {
   progress.expectBytes(size);
   await hashJobs.dispatch(async () => {
-    const fileTracker = progress.startFile(absolutePath, size);
+    // The vault-relative path, not absolutePath: this one is rendered on
+    // the progress bar, where a long absolute prefix would be truncated
+    // away to leave a useless fragment. It also matches how every log line
+    // in here already names a path.
+    const fileTracker = progress.startFile(relativePath, size);
     try {
       const hash = await hashRunner.run(absolutePath, (n) => fileTracker.advance(n));
       onResolved(hash);
@@ -396,6 +401,7 @@ async function dispatchCreatedRow(
     hashJobs,
     hashRunner,
     resolution.absolutePath,
+    fsEntry.path,
     fsEntry.size,
     logger,
     progress,
@@ -543,6 +549,7 @@ async function dispatchExistingRow(
     hashJobs,
     hashRunner,
     resolution.absolutePath,
+    fsEntry.path,
     fsEntry.size,
     logger,
     progress,

@@ -137,7 +137,7 @@ async function processRow(
   const size = row.size!;
   progress.expectBytes(size);
   await hashJobs.dispatch(async () => {
-    const fileTracker = progress.startFile(absolutePath, size);
+    const fileTracker = progress.startFile(row.path, size);
     try {
       const rehash = await hashRunner.run(absolutePath, (n) => fileTracker.advance(n));
       logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");

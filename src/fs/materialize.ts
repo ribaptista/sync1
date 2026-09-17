@@ -136,7 +136,7 @@ export async function materializeGlob(
         progress.expectBytes(objectRow.size);
         await waitForRoom(streamPool, streamQueueLimit);
         void streamPool.add(async () => {
-          const fileTracker = progress.startFile(absolutePath, objectRow.size);
+          const fileTracker = progress.startFile(row.path, objectRow.size);
           try {
             const encrypted = await getObjectStream(s3.client, s3.bucket, key);
             if (!encrypted) {

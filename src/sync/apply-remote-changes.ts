@@ -309,7 +309,7 @@ async function applyRemoteContentChange(
   progress.expectBytes(objectRow.size);
   await waitForRoom(streamPool, streamQueueLimit);
   void streamPool.add(async () => {
-    const fileTracker = progress.startFile(absolutePath, objectRow.size);
+    const fileTracker = progress.startFile(entry.path, objectRow.size);
     try {
       const encrypted = await getObjectStream(
         s3.client,

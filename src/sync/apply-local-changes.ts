@@ -294,7 +294,7 @@ export async function applyLocalChangesToCandidate(
     await waitForRoom(streamPool, streamQueueLimit);
     void streamPool.add(async () => {
       const absolutePath = path.join(root, row.path);
-      const fileTracker = progress.startFile(absolutePath, size);
+      const fileTracker = progress.startFile(row.path, size);
       try {
         const context = Buffer.from(hash, "hex");
         // Counted on the *plaintext* side, before encryptStream: those bytes
