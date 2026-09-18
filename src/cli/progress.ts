@@ -161,6 +161,24 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
   private bytesDone = 0;
   private activity: { verb: string; path: string } | undefined;
 
+  // How often our state is actually pushed into the underlying bar -- and
+  // therefore into cli-progress's own ETA ring buffer (a fixed 10-sample
+  // window, node_modules/cli-progress/lib/eta.js). Matched to cli-progress's
+  // own `fps: 10` redraw rate, so this never slows down what's visible:
+  // MultiBar repaints every bar off its own independent ~100ms timer
+  // regardless of how often we call `.update()` (multi-bar.js), so pushing
+  // state in faster than that buys nothing on screen while still feeding
+  // that 10-sample buffer far faster than a representative rate needs --
+  // which is exactly what produced a nonsense ETA (`NFs`, or `0s` with tens
+  // of GB still left): dozens of file-discovery/-resolution events plus
+  // every in-flight hash's 100ms byte-counter poll (see hash-runner.ts) can
+  // otherwise flood all 10 samples within a handful of milliseconds, so the
+  // "recent rate" computed over that sliver is essentially noise.
+  private static readonly FLUSH_INTERVAL_MS = 100;
+  // `null`, not `0`, so "never flushed yet" can't be confused with "flushed
+  // at Date.now() === 0" (a frozen/fake clock in a test, say).
+  private lastFlushedAt: number | null = null;
+
   constructor(overallLabel: string) {
     this.multibar = new MultiBar(
       {
@@ -173,10 +191,10 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
     // Seeded to 1 (never 0) to avoid a divide-by-zero before the first real
     // total arrives -- same trick the plain item-count bar above uses.
     this.overall = this.multibar.create(1, 0);
-    this.render();
+    this.flush(true);
   }
 
-  // Built fresh on every render, not cached: `fitPath` reads
+  // Built fresh on every flush, not cached: `fitPath` reads
   // `process.stderr.columns` at call time specifically so a terminal
   // resize between renders is picked up, which a value computed once here
   // and reused would defeat.
@@ -186,8 +204,34 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
     return `${verb} ${fitPath(path, process.stderr.columns, verb)}...`;
   }
 
-  private render(): void {
+  /**
+   * Pushes the session's current state into the underlying bar -- the only
+   * thing that feeds cli-progress's own ETA sample buffer, see
+   * `FLUSH_INTERVAL_MS` above. `setTotal` always runs (cheap, and doesn't
+   * touch the eta buffer itself -- only `.update()`'s *value* does); the
+   * `.update()` call itself is what's throttled, unless `force` is set for
+   * one of three cases that must never wait out the window: the very first
+   * flush (so the bar isn't blank, and so a cold-start activity label
+   * reaches it instantly), any update carrying a new `activity` (rare by
+   * construction -- at most two per file, start and finish -- so bypassing
+   * them costs nothing toward the flood this exists to suppress, and a user
+   * watching the label for proof-of-life shouldn't wait on it), and
+   * `stop()`'s final flush (`MultiBar.stop()` re-renders each bar's
+   * *current* value one last time with `clearOnComplete: false`, so a
+   * throttled-away update must land before that happens, or the run could
+   * end on a stale mid-throttle snapshot).
+   */
+  private flush(force: boolean): void {
     this.overall.setTotal(Math.max(this.bytesTotal, 1));
+    const now = Date.now();
+    if (
+      !force &&
+      this.lastFlushedAt !== null &&
+      now - this.lastFlushedAt < MultiBarBytesProgressSession.FLUSH_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.lastFlushedAt = now;
     this.overall.update(this.bytesDone, {
       filesDone: String(this.filesDone),
       filesTotal: String(this.filesTotal),
@@ -204,7 +248,7 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
     if (totals.bytes !== undefined && totals.bytes > this.bytesTotal) {
       this.bytesTotal = totals.bytes;
     }
-    this.render();
+    this.flush(false);
   }
 
   setOverallProgress(current: {
@@ -214,11 +258,13 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
   }): void {
     if (current.files !== undefined) this.filesDone = current.files;
     if (current.bytes !== undefined) this.bytesDone = current.bytes;
-    if (current.activity !== undefined) this.activity = current.activity;
-    this.render();
+    const isNewActivity = current.activity !== undefined;
+    if (isNewActivity) this.activity = current.activity;
+    this.flush(isNewActivity);
   }
 
   stop(): void {
+    this.flush(true);
     this.multibar.stop();
   }
 }
