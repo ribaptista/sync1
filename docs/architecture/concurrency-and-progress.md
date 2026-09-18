@@ -172,6 +172,28 @@ measures:
   moment the stack outgrows the terminal's height the origin is lost and the display degrades into
   repeating bars — and a hash pool defaults to one thread per CPU.
 
+  "`cli-progress` already does this correctly for free" has one sharp edge: its ETA is a naive linear
+  rate over a **fixed 10-sample ring buffer** of `(value, timestamp)` pairs, refilled on every call to
+  the bar's own `.update()` — and `cli-progress`'s `fps: 10` only throttles the terminal _write_, not
+  that buffer. This codebase used to call `.update()` on every producer emit: every row a scan resolves
+  without needing work, and every in-flight hash's `SharedArrayBuffer` byte counter polled on its own
+  100ms timer (`src/concurrency/hash-runner.ts`) — with N threads hashing concurrently, up to N more
+  calls roughly every 100ms. That could shrink the buffer's captured window to single-digit
+  milliseconds, and a rate computed over a window that small is noise: a sliver with near-zero movement
+  sends the estimate toward infinity (displayed, thanks to a formatter that assumes a number, as the
+  literal mangled string `"NFs"`), and a sliver containing a burst of files finishing at once sends it
+  the other way, so `remaining/rate` rounds to `0` — `"ETA 0s"` while a run is nowhere near done.
+  Raising `etaBufferLength` doesn't fix this: the failure is driven by call _rate_, not burst size, so
+  no fixed buffer resists an arbitrary thread count, and a big enough buffer to help would also blur
+  the one place accuracy matters most — the run's final stretch, once only large files remain and the
+  true rate genuinely drops. Instead, `MultiBarBytesProgressSession` still updates its own bookkeeping
+  on every call (cheap), but throttles the push into the bar itself to once per 100ms — matched to
+  `cli-progress`'s own redraw rate, so nothing visible slows down — with three deliberate exceptions:
+  the very first flush (so the bar isn't blank and a cold-start activity label lands instantly), any
+  update carrying a new `activity` (rare by construction, so bypassing costs nothing), and `stop()`
+  (which forces one last flush before `MultiBar.stop()` re-renders each bar's current value, so a run
+  never ends on a stale throttled snapshot).
+
   `{activity}` is what replaced it: a single trailing label naming the file currently being worked on,
   written by whichever producer is running. It flips at **two** moments per file — `hashing <path>...`
   when that file's job starts and `hashed <path>...` when it finishes (`uploading`/`uploaded`,
