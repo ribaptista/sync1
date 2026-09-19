@@ -91,8 +91,8 @@ all).
 
 ```bash
 sync1 thumbnail_policy create "**/*.jpg" generate --root ~/Pictures \
-  --mime-types image/jpeg --image-width 320 --image-height 240 \
-  --tile-rows 4 --tile-columns 4 --tile-width 160 --tile-height 90 --jpeg-quality 80 --json
+  --mime-types image/jpeg --media-type image \
+  --image-width 320 --image-height 240 --jpeg-quality 80 --json
 
 sync1 update_cache --root ~/Pictures --json
 sync1 thumbnail state --root ~/Pictures --json

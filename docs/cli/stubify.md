@@ -39,6 +39,15 @@ after that succeeds — the mirror image of `materialize`'s ordering. An interru
 the stub and the real file present, which `update_cache`/`sync` already know how to resolve safely
 (the real file wins, the stray stub is cleaned up).
 
+## Never touches `_thumbnail/` contents
+
+A glob-matched row living under a `_thumbnail/` directory (at any depth, not just a direct child) is
+always excluded automatically — no flag to pass, no glob to remember writing by hand. A thumbnail exists
+specifically to preview an original that's deliberately _not_ kept materialized locally; stubifying the
+preview itself would defeat that. Counted separately under `thumbnail_dir_excluded`, not `skipped` — this
+is an expected, potentially large exclusion (every thumbnail under `<glob>`), not a per-file anomaly worth
+enumerating one by one. See [thumbnails.md](../architecture/thumbnails.md) for the full thumbnail design.
+
 ## Output
 
 ```json
@@ -46,6 +55,7 @@ the stub and the real file present, which `update_cache`/`sync` already know how
   "ok": true,
   "stubified": 2,
   "already_stub": 0,
+  "thumbnail_dir_excluded": 0,
   "skipped": [{ "path": "notes.txt", "reason": "not fully committed (has pending local changes)" }]
 }
 ```
