@@ -65,23 +65,17 @@ function writeStub(relativePath: string, hash: string): void {
   fs.writeFileSync(abs, `blake2b:${hash}`);
 }
 
-const GENERATE_JPEG: Omit<ThumbnailPolicyCreateInput, "glob"> = {
+const GENERATE_JPEG = {
   action: "generate",
+  mediaType: "image",
   mimeTypes: ["image/jpeg"],
   priority: 0,
   imageWidth: 320,
   imageHeight: 240,
-  tileRowCount: 2,
-  tileColumnCount: 2,
-  tileWidth: 160,
-  tileHeight: 90,
   jpegQuality: 80,
-};
+} satisfies Omit<Extract<ThumbnailPolicyCreateInput, { mediaType: "image" }>, "glob">;
 
-function createGeneratePolicy(
-  glob: string,
-  overrides: Partial<ThumbnailPolicyCreateInput> = {},
-): number {
+function createGeneratePolicy(glob: string, overrides: Partial<typeof GENERATE_JPEG> = {}): number {
   return policiesRepo.create({ ...GENERATE_JPEG, glob, ...overrides });
 }
 
@@ -335,12 +329,16 @@ describe("scanThumbnails", () => {
   });
 
   it("generates a video mosaic via generateVideoMosaic, sized from the matching policy's tile settings", async () => {
-    createGeneratePolicy("*.mp4", {
+    policiesRepo.create({
+      glob: "*.mp4",
+      action: "generate",
+      mediaType: "video",
       mimeTypes: ["video/*"],
+      priority: 0,
       tileRowCount: 3,
       tileColumnCount: 3,
-      tileWidth: 64,
-      tileHeight: 48,
+      tileSize: 48,
+      jpegQuality: 80,
     });
     writeFile("clip.mp4");
     seedCache("clip.mp4", "vid1");

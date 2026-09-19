@@ -1,69 +1,117 @@
 import type Database from "better-sqlite3";
 
 export type ThumbnailPolicyAction = "skip" | "generate";
+export type ThumbnailPolicyMediaType = "image" | "video";
 
 const MIME_TYPE_PATTERN = /^[a-zA-Z0-9.+-]+\/(\*|[a-zA-Z0-9.+-]+)$/;
 
-/** The six fields that describe how to generate a thumbnail -- NULL for a 'skip' row, all required for a 'generate' row. */
-export interface ThumbnailPolicyGenerateSettings {
-  imageWidth: number;
-  imageHeight: number;
-  tileRowCount: number;
-  tileColumnCount: number;
-  tileWidth: number;
-  tileHeight: number;
-  jpegQuality: number;
-}
-
-export interface ThumbnailPolicyRow {
+interface Base {
   id: number;
   glob: string;
-  action: ThumbnailPolicyAction;
-  priority: number | null;
   mimeTypes: string[];
-  imageWidth: number | null;
-  imageHeight: number | null;
-  tileRowCount: number | null;
-  tileColumnCount: number | null;
-  tileWidth: number | null;
-  tileHeight: number | null;
-  jpegQuality: number | null;
   createdAt: string;
 }
 
-interface GenerateFields {
-  imageWidth?: number;
-  imageHeight?: number;
-  tileRowCount?: number;
-  tileColumnCount?: number;
-  tileWidth?: number;
-  tileHeight?: number;
-  jpegQuality?: number;
-}
+/**
+ * Flat, not nested: every existing consumer reads a field like
+ * `policy.imageWidth` or `policy.tileSize` directly, and nesting a
+ * `generate: {...}` sub-object would force an `if (policy.action ===
+ * "generate")` unwrap everywhere for no safety gain over the discriminant
+ * already living on `action`/`mediaType`. A 'skip' row carries no
+ * `mediaType` at all (never applicable); a 'generate' row is *either* an
+ * image policy or a video policy, never both -- no more nonsense tile
+ * fields on an image-only policy, no more `!` non-null assertions
+ * scattered through consuming code.
+ */
+export type ThumbnailPolicyRow =
+  | (Base & { action: "skip"; priority: null })
+  | (Base & {
+      action: "generate";
+      mediaType: "image";
+      priority: number;
+      imageWidth: number;
+      imageHeight: number;
+      jpegQuality: number;
+    })
+  | (Base & {
+      action: "generate";
+      mediaType: "video";
+      priority: number;
+      tileRowCount: number;
+      tileColumnCount: number;
+      tileSize: number;
+      jpegQuality: number;
+    });
 
-export interface ThumbnailPolicyCreateInput extends GenerateFields {
-  glob: string;
-  action: ThumbnailPolicyAction;
-  mimeTypes: string[];
-  priority?: number;
-}
+/** What a `resolvePolicy` match actually is -- a 'skip' row is never useful past the fact that it matched. */
+export type ThumbnailPolicyGenerateRow = Extract<ThumbnailPolicyRow, { action: "generate" }>;
 
-export interface ThumbnailPolicyUpdate extends GenerateFields {
+export type ThumbnailPolicyCreateInput =
+  | { glob: string; action: "skip"; mimeTypes: string[] }
+  | {
+      glob: string;
+      action: "generate";
+      mediaType: "image";
+      mimeTypes: string[];
+      priority?: number;
+      imageWidth: number;
+      imageHeight: number;
+      jpegQuality: number;
+    }
+  | {
+      glob: string;
+      action: "generate";
+      mediaType: "video";
+      mimeTypes: string[];
+      priority?: number;
+      tileRowCount: number;
+      tileColumnCount: number;
+      tileSize: number;
+      jpegQuality: number;
+    };
+
+/**
+ * Deliberately NOT unioned like `ThumbnailPolicyCreateInput`: a patch is
+ * merged against an *existing* row whose branch may itself be changing, so
+ * "partial-if-staying, full-if-switching" is a fact about the merge
+ * (runtime, in `update()`), not the shape of `changes` in isolation -- and
+ * the one real caller (the CLI, built from independently-optional string
+ * flags) can never statically know the existing row's branch anyway.
+ */
+export interface ThumbnailPolicyUpdate {
   glob?: string;
   action?: ThumbnailPolicyAction;
   mimeTypes?: string[];
   priority?: number;
+  mediaType?: ThumbnailPolicyMediaType;
+  imageWidth?: number;
+  imageHeight?: number;
+  tileRowCount?: number;
+  tileColumnCount?: number;
+  tileSize?: number;
+  jpegQuality?: number;
 }
 
-const GENERATE_FIELD_NAMES = [
-  "imageWidth",
-  "imageHeight",
-  "tileRowCount",
-  "tileColumnCount",
-  "tileWidth",
-  "tileHeight",
-  "jpegQuality",
-] as const;
+/** The all-nullable shape both the SQL layer and `update()`'s merge work in -- every field a row could possibly have, regardless of which branch is actually live. */
+interface FlatPolicyFields {
+  glob: string;
+  action: ThumbnailPolicyAction;
+  priority: number | null;
+  mimeTypes: string[];
+  mediaType: ThumbnailPolicyMediaType | null;
+  imageWidth: number | null;
+  imageHeight: number | null;
+  tileRowCount: number | null;
+  tileColumnCount: number | null;
+  tileSize: number | null;
+  jpegQuality: number | null;
+}
+
+type TypeSpecificFieldName =
+  "imageWidth" | "imageHeight" | "tileRowCount" | "tileColumnCount" | "tileSize";
+
+const IMAGE_FIELD_NAMES = ["imageWidth", "imageHeight"] as const;
+const VIDEO_FIELD_NAMES = ["tileRowCount", "tileColumnCount", "tileSize"] as const;
 
 function validateMimeTypes(mimeTypes: string[]): void {
   if (mimeTypes.length === 0) {
@@ -79,40 +127,83 @@ function validateMimeTypes(mimeTypes: string[]): void {
 }
 
 /**
- * Checks the action/priority/generate-fields consistency invariant the
- * `thumbnail_policies` table's CHECK constraint also enforces, but ahead of
- * time with a friendly, field-naming error message: a `skip` row must have
- * no `priority` and no generate fields at all; a `generate` row must have a
- * `priority` and every one of the six generate fields.
+ * Every `mimeTypes` entry's *type* segment (never wildcarded, only the
+ * subtype can be `*` -- see `MIME_TYPE_PATTERN`) must equal `mediaType`.
+ * This is what makes a `resolvePolicy`-selected policy's `mediaType`
+ * **provably** agree with what actually got probed (`resolvePolicy` only
+ * ever returns a policy whose `mimeTypes` matched the file's real, sniffed
+ * mime type) -- not just usually-true. Only meaningful for a 'generate'
+ * row; a 'skip' row's `mimeTypes` legitimately mixes types (e.g.
+ * `["image/*", "video/*"]"`), since matching it never needs a media type
+ * at all.
  */
-function validateActionConsistency(
-  action: ThumbnailPolicyAction,
-  priority: number | null,
-  generate: Partial<Record<(typeof GENERATE_FIELD_NAMES)[number], number | null>>,
+function validateMediaTypeMimeConsistency(
+  mediaType: ThumbnailPolicyMediaType,
+  mimeTypes: string[],
 ): void {
-  if (action === "skip") {
-    if (priority !== null) {
+  for (const mimeType of mimeTypes) {
+    const [type] = mimeType.split("/");
+    if (type !== mediaType) {
+      throw new Error(
+        `mime type "${mimeType}" doesn't match media type "${mediaType}" -- every mime type on a '${mediaType}' policy must be "${mediaType}/..."`,
+      );
+    }
+  }
+}
+
+/**
+ * Checks the action/priority/media-type/generate-fields consistency
+ * invariant the `thumbnail_policies` table's own three-way CHECK
+ * constraint also enforces, but ahead of time with a friendly, field-
+ * naming error message. A 'skip' row must have no priority, no media
+ * type, and none of the six generate fields at all. A 'generate' row must
+ * have a priority and a media type; given that media type, it must have
+ * every field belonging to its own type (image fields ∪ jpegQuality, or
+ * video fields ∪ jpegQuality) and none of the other type's fields.
+ */
+function validateActionConsistency(flat: FlatPolicyFields): void {
+  if (flat.action === "skip") {
+    if (flat.priority != null) {
       throw new Error("a 'skip' policy can't have a priority");
     }
-    const present = GENERATE_FIELD_NAMES.filter((name) => generate[name] != null);
+    if (flat.mediaType != null) {
+      throw new Error("a 'skip' policy can't have a media type");
+    }
+    const present = [...IMAGE_FIELD_NAMES, ...VIDEO_FIELD_NAMES, "jpegQuality" as const].filter(
+      (name) => flat[name] != null,
+    );
     if (present.length > 0) {
       throw new Error(`a 'skip' policy can't set ${present.join(", ")}`);
     }
     return;
   }
 
-  if (priority === null) {
+  if (flat.priority == null) {
     throw new Error("a 'generate' policy needs a priority");
   }
-  const missing = GENERATE_FIELD_NAMES.filter((name) => generate[name] == null);
+  if (flat.mediaType == null) {
+    throw new Error("a 'generate' policy needs a media type");
+  }
+
+  const [ownFieldNames, otherFieldNames] =
+    flat.mediaType === "image"
+      ? [IMAGE_FIELD_NAMES, VIDEO_FIELD_NAMES]
+      : [VIDEO_FIELD_NAMES, IMAGE_FIELD_NAMES];
+
+  const missing = [...ownFieldNames, "jpegQuality" as const].filter((name) => flat[name] == null);
   if (missing.length > 0) {
-    throw new Error(`a 'generate' policy needs ${missing.join(", ")}`);
+    throw new Error(`a 'generate' '${flat.mediaType}' policy needs ${missing.join(", ")}`);
+  }
+
+  const present = otherFieldNames.filter((name) => flat[name] != null);
+  if (present.length > 0) {
+    throw new Error(`a 'generate' '${flat.mediaType}' policy can't set ${present.join(", ")}`);
   }
 }
 
 const ROW_COLUMNS =
-  "id, glob, action, priority, mime_types, image_width, image_height, " +
-  "tile_row_count, tile_column_count, tile_width, tile_height, jpeg_quality, created_at";
+  "id, glob, action, priority, mime_types, media_type, image_width, image_height, " +
+  "tile_row_count, tile_column_count, tile_size, jpeg_quality, created_at";
 
 interface RawRow {
   id: number;
@@ -120,31 +211,125 @@ interface RawRow {
   action: ThumbnailPolicyAction;
   priority: number | null;
   mime_types: string;
+  media_type: ThumbnailPolicyMediaType | null;
   image_width: number | null;
   image_height: number | null;
   tile_row_count: number | null;
   tile_column_count: number | null;
-  tile_width: number | null;
-  tile_height: number | null;
+  tile_size: number | null;
   jpeg_quality: number | null;
   created_at: string;
 }
 
 function fromRawRow(row: RawRow): ThumbnailPolicyRow {
-  return {
+  const base: Base = {
     id: row.id,
     glob: row.glob,
-    action: row.action,
-    priority: row.priority,
     mimeTypes: JSON.parse(row.mime_types) as string[],
-    imageWidth: row.image_width,
-    imageHeight: row.image_height,
-    tileRowCount: row.tile_row_count,
-    tileColumnCount: row.tile_column_count,
-    tileWidth: row.tile_width,
-    tileHeight: row.tile_height,
-    jpegQuality: row.jpeg_quality,
     createdAt: row.created_at,
+  };
+
+  if (row.action === "skip") {
+    return { ...base, action: "skip", priority: null };
+  }
+
+  // Non-null assertions below rely on the table's own three-way CHECK
+  // constraint: a 'generate' row's media-type-appropriate fields (plus
+  // priority and jpegQuality) are always NOT NULL, never on trust alone.
+  if (row.media_type === "image") {
+    return {
+      ...base,
+      action: "generate",
+      mediaType: "image",
+      priority: row.priority!,
+      imageWidth: row.image_width!,
+      imageHeight: row.image_height!,
+      jpegQuality: row.jpeg_quality!,
+    };
+  }
+  // media_type === "video" -- the CHECK constraint leaves no other
+  // possibility for a 'generate' row.
+  return {
+    ...base,
+    action: "generate",
+    mediaType: "video",
+    priority: row.priority!,
+    tileRowCount: row.tile_row_count!,
+    tileColumnCount: row.tile_column_count!,
+    tileSize: row.tile_size!,
+    jpegQuality: row.jpeg_quality!,
+  };
+}
+
+/** The inverse of `fromRawRow`'s narrowing -- flattens a validated row back to the all-nullable shape `update()`'s merge and the SQL layer both need. */
+function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
+  const base = { glob: row.glob, mimeTypes: row.mimeTypes };
+  if (row.action === "skip") {
+    return {
+      ...base,
+      action: "skip",
+      priority: null,
+      mediaType: null,
+      imageWidth: null,
+      imageHeight: null,
+      tileRowCount: null,
+      tileColumnCount: null,
+      tileSize: null,
+      jpegQuality: null,
+    };
+  }
+  if (row.mediaType === "image") {
+    return {
+      ...base,
+      action: "generate",
+      priority: row.priority,
+      mediaType: "image",
+      imageWidth: row.imageWidth,
+      imageHeight: row.imageHeight,
+      tileRowCount: null,
+      tileColumnCount: null,
+      tileSize: null,
+      jpegQuality: row.jpegQuality,
+    };
+  }
+  return {
+    ...base,
+    action: "generate",
+    priority: row.priority,
+    mediaType: "video",
+    imageWidth: null,
+    imageHeight: null,
+    tileRowCount: row.tileRowCount,
+    tileColumnCount: row.tileColumnCount,
+    tileSize: row.tileSize,
+    jpegQuality: row.jpegQuality,
+  };
+}
+
+/**
+ * Reads every possible field directly off `input`, not only the ones the
+ * real `ThumbnailPolicyCreateInput` union guarantees for its narrowed
+ * branch -- a legitimate, type-checked caller never has a field from the
+ * wrong branch to begin with, but this keeps `validateActionConsistency`
+ * (below) a genuine runtime safety net too, not just a compile-time one,
+ * for a caller that sidesteps the type (e.g. plain JS, or an explicit
+ * cast). Silently dropping an unexpected field here instead would defeat
+ * that safety net rather than exercise it.
+ */
+function flatFromCreateInput(input: ThumbnailPolicyCreateInput): FlatPolicyFields {
+  const loose = input as unknown as Partial<FlatPolicyFields>;
+  return {
+    glob: input.glob,
+    action: input.action,
+    mimeTypes: input.mimeTypes,
+    priority: loose.priority ?? null,
+    mediaType: loose.mediaType ?? null,
+    imageWidth: loose.imageWidth ?? null,
+    imageHeight: loose.imageHeight ?? null,
+    tileRowCount: loose.tileRowCount ?? null,
+    tileColumnCount: loose.tileColumnCount ?? null,
+    tileSize: loose.tileSize ?? null,
+    jpegQuality: loose.jpegQuality ?? null,
   };
 }
 
@@ -190,9 +375,10 @@ export class ThumbnailPoliciesRepository {
   }
 
   create(input: ThumbnailPolicyCreateInput): number {
-    const priority = input.priority ?? null;
-    validateActionConsistency(input.action, priority, input);
-    validateMimeTypes(input.mimeTypes);
+    const flat = flatFromCreateInput(input);
+    validateActionConsistency(flat);
+    validateMimeTypes(flat.mimeTypes);
+    if (flat.mediaType) validateMediaTypeMimeConsistency(flat.mediaType, flat.mimeTypes);
 
     const result = this.db
       .prepare<
@@ -201,7 +387,7 @@ export class ThumbnailPoliciesRepository {
           ThumbnailPolicyAction,
           number | null,
           string,
-          number | null,
+          ThumbnailPolicyMediaType | null,
           number | null,
           number | null,
           number | null,
@@ -212,64 +398,94 @@ export class ThumbnailPoliciesRepository {
         ]
       >(
         `INSERT INTO thumbnail_policies (
-          glob, action, priority, mime_types, image_width, image_height,
-          tile_row_count, tile_column_count, tile_width, tile_height, jpeg_quality, created_at
+          glob, action, priority, mime_types, media_type, image_width, image_height,
+          tile_row_count, tile_column_count, tile_size, jpeg_quality, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        input.glob,
-        input.action,
-        priority,
-        JSON.stringify(input.mimeTypes),
-        input.imageWidth ?? null,
-        input.imageHeight ?? null,
-        input.tileRowCount ?? null,
-        input.tileColumnCount ?? null,
-        input.tileWidth ?? null,
-        input.tileHeight ?? null,
-        input.jpegQuality ?? null,
+        flat.glob,
+        flat.action,
+        flat.priority,
+        JSON.stringify(flat.mimeTypes),
+        flat.mediaType,
+        flat.imageWidth,
+        flat.imageHeight,
+        flat.tileRowCount,
+        flat.tileColumnCount,
+        flat.tileSize,
+        flat.jpegQuality,
         new Date().toISOString(),
       );
     return Number(result.lastInsertRowid);
   }
 
-  /** Applies a partial update, merging onto the existing row and re-validating the resulting whole. Returns `false` for a nonexistent id. */
+  /**
+   * Applies a partial update, merging onto the existing row and
+   * re-validating the resulting whole. Returns `false` for a nonexistent
+   * id.
+   *
+   * Switching to a different branch -- 'skip'->'generate',
+   * 'generate'->'skip', or (staying 'generate' but) 'image'<->'video' --
+   * drops every field of the branch being left: each must come fresh from
+   * `changes`, exactly like the already-tested skip<->generate behavior.
+   * The one exception is `jpegQuality`, the single field both 'generate'
+   * branches share: it survives an 'image'<->'video' switch, since that
+   * switch never actually leaves the 'generate' action at all. Branch-
+   * switching a policy this way also requires resupplying `--mime-types`
+   * to match the new media type, or `validateMediaTypeMimeConsistency`
+   * rejects it below.
+   */
   update(id: number, changes: ThumbnailPolicyUpdate): boolean {
     const row = this.get(id);
     if (!row) return false;
+    const old = toFlatFields(row);
 
-    const action = changes.action ?? row.action;
-    const glob = changes.glob ?? row.glob;
-    const mimeTypes = changes.mimeTypes ?? row.mimeTypes;
-    const priority = changes.priority !== undefined ? changes.priority : row.priority;
-    const generate: Record<(typeof GENERATE_FIELD_NAMES)[number], number | null> = {
-      imageWidth: changes.imageWidth !== undefined ? changes.imageWidth : row.imageWidth,
-      imageHeight: changes.imageHeight !== undefined ? changes.imageHeight : row.imageHeight,
-      tileRowCount: changes.tileRowCount !== undefined ? changes.tileRowCount : row.tileRowCount,
-      tileColumnCount:
-        changes.tileColumnCount !== undefined ? changes.tileColumnCount : row.tileColumnCount,
-      tileWidth: changes.tileWidth !== undefined ? changes.tileWidth : row.tileWidth,
-      tileHeight: changes.tileHeight !== undefined ? changes.tileHeight : row.tileHeight,
-      jpegQuality: changes.jpegQuality !== undefined ? changes.jpegQuality : row.jpegQuality,
+    const action = changes.action ?? old.action;
+    const glob = changes.glob ?? old.glob;
+    const mimeTypes = changes.mimeTypes ?? old.mimeTypes;
+    const mediaType =
+      action === "generate"
+        ? (changes.mediaType ?? (old.action === "generate" ? old.mediaType : null))
+        : null;
+
+    const actionSwitched = action !== old.action;
+    const branchChanged = actionSwitched || (action === "generate" && mediaType !== old.mediaType);
+
+    const typeField = (name: TypeSpecificFieldName): number | null => {
+      if (changes[name] !== undefined) return changes[name];
+      return branchChanged ? null : old[name];
     };
-    // Switching action clears whichever side no longer applies, rather than
-    // carrying over stale values from the row's previous action.
-    const effectivePriority = action === "skip" ? null : priority;
-    const effectiveGenerate: Record<(typeof GENERATE_FIELD_NAMES)[number], number | null> =
-      action === "skip"
-        ? {
-            imageWidth: null,
-            imageHeight: null,
-            tileRowCount: null,
-            tileColumnCount: null,
-            tileWidth: null,
-            tileHeight: null,
-            jpegQuality: null,
-          }
-        : generate;
 
-    validateActionConsistency(action, effectivePriority, effectiveGenerate);
-    validateMimeTypes(mimeTypes);
+    // jpegQuality drops only when the *action* itself switches (skip<->
+    // generate); an image<->video switch leaves it alone, per the doc
+    // comment above.
+    const jpegQuality =
+      changes.jpegQuality !== undefined
+        ? changes.jpegQuality
+        : actionSwitched
+          ? null
+          : old.jpegQuality;
+
+    const priority =
+      action === "skip" ? null : changes.priority !== undefined ? changes.priority : old.priority;
+
+    const flat: FlatPolicyFields = {
+      glob,
+      action,
+      priority,
+      mimeTypes,
+      mediaType,
+      imageWidth: typeField("imageWidth"),
+      imageHeight: typeField("imageHeight"),
+      tileRowCount: typeField("tileRowCount"),
+      tileColumnCount: typeField("tileColumnCount"),
+      tileSize: typeField("tileSize"),
+      jpegQuality,
+    };
+
+    validateActionConsistency(flat);
+    validateMimeTypes(flat.mimeTypes);
+    if (flat.mediaType) validateMediaTypeMimeConsistency(flat.mediaType, flat.mimeTypes);
 
     const result = this.db
       .prepare<
@@ -278,7 +494,7 @@ export class ThumbnailPoliciesRepository {
           ThumbnailPolicyAction,
           number | null,
           string,
-          number | null,
+          ThumbnailPolicyMediaType | null,
           number | null,
           number | null,
           number | null,
@@ -289,22 +505,22 @@ export class ThumbnailPoliciesRepository {
         ]
       >(
         `UPDATE thumbnail_policies SET
-          glob = ?, action = ?, priority = ?, mime_types = ?, image_width = ?, image_height = ?,
-          tile_row_count = ?, tile_column_count = ?, tile_width = ?, tile_height = ?, jpeg_quality = ?
+          glob = ?, action = ?, priority = ?, mime_types = ?, media_type = ?, image_width = ?, image_height = ?,
+          tile_row_count = ?, tile_column_count = ?, tile_size = ?, jpeg_quality = ?
         WHERE id = ?`,
       )
       .run(
-        glob,
-        action,
-        effectivePriority,
-        JSON.stringify(mimeTypes),
-        effectiveGenerate.imageWidth,
-        effectiveGenerate.imageHeight,
-        effectiveGenerate.tileRowCount,
-        effectiveGenerate.tileColumnCount,
-        effectiveGenerate.tileWidth,
-        effectiveGenerate.tileHeight,
-        effectiveGenerate.jpegQuality,
+        flat.glob,
+        flat.action,
+        flat.priority,
+        JSON.stringify(flat.mimeTypes),
+        flat.mediaType,
+        flat.imageWidth,
+        flat.imageHeight,
+        flat.tileRowCount,
+        flat.tileColumnCount,
+        flat.tileSize,
+        flat.jpegQuality,
         id,
       );
     return result.changes > 0;

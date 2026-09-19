@@ -9,7 +9,10 @@ import {
 } from "../../../src/db/repositories/cache-entries-repository.js";
 import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
 import { StoragePoliciesRepository } from "../../../src/db/repositories/storage-policies-repository.js";
-import { ThumbnailPoliciesRepository } from "../../../src/db/repositories/thumbnail-policies-repository.js";
+import {
+  ThumbnailPoliciesRepository,
+  type ThumbnailPolicyCreateInput,
+} from "../../../src/db/repositories/thumbnail-policies-repository.js";
 
 describe("VersionsRepository", () => {
   it("inserts and reads back versions in sequence order", () => {
@@ -586,17 +589,26 @@ describe("StoragePoliciesRepository (state.db)", () => {
   });
 });
 
-const GENERATE_INPUT = {
+const IMAGE_GENERATE_INPUT = {
   glob: "**/*.jpg",
   action: "generate" as const,
+  mediaType: "image" as const,
   mimeTypes: ["image/jpeg"],
   priority: 0,
   imageWidth: 320,
   imageHeight: 240,
+  jpegQuality: 80,
+};
+
+const VIDEO_GENERATE_INPUT = {
+  glob: "**/*.mp4",
+  action: "generate" as const,
+  mediaType: "video" as const,
+  mimeTypes: ["video/mp4"],
+  priority: 0,
   tileRowCount: 4,
   tileColumnCount: 4,
-  tileWidth: 160,
-  tileHeight: 90,
+  tileSize: 90,
   jpegQuality: 80,
 };
 
@@ -613,27 +625,28 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(repo.list()).toEqual([]);
   });
 
-  it("creates, lists, gets, updates, and deletes both skip and generate rows", () => {
+  it("creates, lists, gets, updates, and deletes both an image and a skip row", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
 
-    const generateId = repo.create(GENERATE_INPUT);
+    const generateId = repo.create(IMAGE_GENERATE_INPUT);
     const skipId = repo.create(SKIP_INPUT);
 
     expect(repo.list().map((r) => r.id)).toEqual([generateId, skipId]);
 
+    // A 'generate'/'image' row carries none of the video-only fields at
+    // all -- not even as explicit nulls -- so the expected object below
+    // has no tileRowCount/tileColumnCount/tileSize/imageWidth-adjacent
+    // video keys to list.
     expect(repo.get(generateId)).toEqual({
       id: generateId,
       glob: "**/*.jpg",
       action: "generate",
+      mediaType: "image",
       priority: 0,
       mimeTypes: ["image/jpeg"],
       imageWidth: 320,
       imageHeight: 240,
-      tileRowCount: 4,
-      tileColumnCount: 4,
-      tileWidth: 160,
-      tileHeight: 90,
       jpegQuality: 80,
       createdAt: expect.any(String) as string,
     });
@@ -644,13 +657,6 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       action: "skip",
       priority: null,
       mimeTypes: ["image/*", "video/*"],
-      imageWidth: null,
-      imageHeight: null,
-      tileRowCount: null,
-      tileColumnCount: null,
-      tileWidth: null,
-      tileHeight: null,
-      jpegQuality: null,
       createdAt: expect.any(String) as string,
     });
 
@@ -663,6 +669,26 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(repo.delete(skipId)).toBe(false);
   });
 
+  it("creates, lists, and gets a video row", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+
+    const id = repo.create(VIDEO_GENERATE_INPUT);
+    expect(repo.get(id)).toEqual({
+      id,
+      glob: "**/*.mp4",
+      action: "generate",
+      mediaType: "video",
+      priority: 0,
+      mimeTypes: ["video/mp4"],
+      tileRowCount: 4,
+      tileColumnCount: 4,
+      tileSize: 90,
+      jpegQuality: 80,
+      createdAt: expect.any(String) as string,
+    });
+  });
+
   it("round-trips mimeTypes through the JSON-encoded column, preserving order", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
@@ -670,11 +696,11 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(repo.get(id)?.mimeTypes).toEqual(["video/*", "image/png", "image/jpeg"]);
   });
 
-  it("listGenerateByPriority orders by priority, listSkip returns only skip rows", () => {
+  it("listGenerateByPriority orders by priority across both media types, listSkip returns only skip rows", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    const lowId = repo.create({ ...GENERATE_INPUT, glob: "a/*", priority: 5 });
-    const highId = repo.create({ ...GENERATE_INPUT, glob: "b/*", priority: 1 });
+    const lowId = repo.create({ ...IMAGE_GENERATE_INPUT, glob: "a/*", priority: 5 });
+    const highId = repo.create({ ...VIDEO_GENERATE_INPUT, glob: "b/*", priority: 1 });
     const skipId = repo.create(SKIP_INPUT);
 
     expect(repo.listGenerateByPriority().map((r) => r.id)).toEqual([highId, lowId]);
@@ -684,18 +710,69 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
   it("rejects a 'skip' policy that sets a priority or any generate field", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    expect(() => repo.create({ ...SKIP_INPUT, priority: 1 })).toThrow(/priority/);
-    expect(() => repo.create({ ...SKIP_INPUT, jpegQuality: 80 })).toThrow(/jpegQuality/);
+    // Neither combination type-checks as a real ThumbnailPolicyCreateInput
+    // any more (the skip variant structurally has no such fields) -- the
+    // cast exercises the same runtime guard a non-TS caller could still
+    // trip, matching this repository's existing "friendly error ahead of
+    // the DB's own CHECK" philosophy.
+    expect(() =>
+      repo.create({ ...SKIP_INPUT, priority: 1 } as unknown as ThumbnailPolicyCreateInput),
+    ).toThrow(/priority/);
+    expect(() =>
+      repo.create({ ...SKIP_INPUT, jpegQuality: 80 } as unknown as ThumbnailPolicyCreateInput),
+    ).toThrow(/jpegQuality/);
   });
 
-  it("rejects a 'generate' policy missing a priority or any generate field", () => {
+  it("rejects a 'generate' policy missing a priority or any of its own type's fields", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    const { priority: _priority, ...withoutPriority } = GENERATE_INPUT;
+    const { priority: _priority, ...withoutPriority } = IMAGE_GENERATE_INPUT;
     expect(() => repo.create(withoutPriority)).toThrow(/priority/);
 
-    const { jpegQuality: _jpegQuality, ...withoutQuality } = GENERATE_INPUT;
-    expect(() => repo.create(withoutQuality)).toThrow(/jpegQuality/);
+    const { jpegQuality: _jpegQuality, ...withoutQuality } = IMAGE_GENERATE_INPUT;
+    expect(() => repo.create(withoutQuality as unknown as ThumbnailPolicyCreateInput)).toThrow(
+      /jpegQuality/,
+    );
+
+    const { tileSize: _tileSize, ...videoWithoutTileSize } = VIDEO_GENERATE_INPUT;
+    expect(() =>
+      repo.create(videoWithoutTileSize as unknown as ThumbnailPolicyCreateInput),
+    ).toThrow(/tileSize/);
+  });
+
+  it("rejects a 'generate' policy that sets fields from the other media type", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    expect(() =>
+      repo.create({
+        ...IMAGE_GENERATE_INPUT,
+        tileRowCount: 2,
+      } as unknown as ThumbnailPolicyCreateInput),
+    ).toThrow(/tileRowCount/);
+    expect(() =>
+      repo.create({
+        ...VIDEO_GENERATE_INPUT,
+        imageWidth: 100,
+      } as unknown as ThumbnailPolicyCreateInput),
+    ).toThrow(/imageWidth/);
+  });
+
+  it("rejects a 'generate' policy whose mime types don't match its media type", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    expect(() => repo.create({ ...IMAGE_GENERATE_INPUT, mimeTypes: ["video/mp4"] })).toThrow(
+      /doesn't match media type/,
+    );
+    expect(() => repo.create({ ...VIDEO_GENERATE_INPUT, mimeTypes: ["image/jpeg"] })).toThrow(
+      /doesn't match media type/,
+    );
+    // Only the type segment has to agree -- a wildcarded subtype is fine.
+    expect(repo.create({ ...IMAGE_GENERATE_INPUT, mimeTypes: ["image/*"] })).toEqual(
+      expect.any(Number),
+    );
+    // A 'skip' row's mimeTypes legitimately mixes types -- no media type to
+    // check consistency against in the first place.
+    expect(repo.create(SKIP_INPUT)).toEqual(expect.any(Number));
   });
 
   it("rejects an invalid mime type, and requires at least one", () => {
@@ -711,7 +788,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
   it("update() re-validates the merged whole, catching an update that would leave it inconsistent", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    const generateId = repo.create(GENERATE_INPUT);
+    const generateId = repo.create(IMAGE_GENERATE_INPUT);
 
     // Clearing jpegQuality alone (without also switching to 'skip') would
     // leave a 'generate' row missing a required field.
@@ -721,39 +798,113 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
   it("update() switching action clears the fields that no longer apply", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    const generateId = repo.create(GENERATE_INPUT);
+    const generateId = repo.create(IMAGE_GENERATE_INPUT);
 
     expect(repo.update(generateId, { action: "skip" })).toBe(true);
-    expect(repo.get(generateId)).toMatchObject({
+    expect(repo.get(generateId)).toEqual({
+      id: generateId,
+      glob: "**/*.jpg",
       action: "skip",
       priority: null,
-      imageWidth: null,
-      imageHeight: null,
-      tileRowCount: null,
-      tileColumnCount: null,
-      tileWidth: null,
-      tileHeight: null,
-      jpegQuality: null,
+      mimeTypes: ["image/jpeg"],
+      createdAt: expect.any(String) as string,
     });
 
     const skipId = repo.create(SKIP_INPUT);
     // Switching skip -> generate without supplying the newly-required fields
     // in the same call fails -- nothing carries over from the skip row's
     // (all-null) generate fields.
-    expect(() => repo.update(skipId, { action: "generate", priority: 0 })).toThrow(/imageWidth/);
+    expect(() =>
+      repo.update(skipId, { action: "generate", mediaType: "image", priority: 0 }),
+    ).toThrow(/imageWidth/);
     expect(
       repo.update(skipId, {
         action: "generate",
+        mediaType: "image",
         priority: 0,
+        mimeTypes: ["image/jpeg"], // must be resupplied -- the skip row's own mix of image/video types no longer matches 'image'
         imageWidth: 100,
         imageHeight: 100,
-        tileRowCount: 2,
-        tileColumnCount: 2,
-        tileWidth: 50,
-        tileHeight: 50,
         jpegQuality: 70,
       }),
     ).toBe(true);
-    expect(repo.get(skipId)).toMatchObject({ action: "generate", priority: 0, imageWidth: 100 });
+    expect(repo.get(skipId)).toMatchObject({
+      action: "generate",
+      mediaType: "image",
+      priority: 0,
+      imageWidth: 100,
+    });
+  });
+
+  it("update() switching image<->video drops the losing type's fields but carries jpegQuality and priority", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const id = repo.create({
+      glob: "**/*.jpg",
+      action: "generate",
+      mediaType: "image",
+      mimeTypes: ["image/jpeg"],
+      priority: 2,
+      imageWidth: 320,
+      imageHeight: 240,
+      jpegQuality: 85,
+    });
+
+    // Switching without supplying the new type's own fields fails --
+    // nothing about the video shape carries over from an image row.
+    expect(() => repo.update(id, { mediaType: "video", mimeTypes: ["video/mp4"] })).toThrow(
+      /tileRowCount/,
+    );
+
+    // image -> video: imageWidth/imageHeight are dropped (not part of the
+    // video shape at all); jpegQuality (85) and priority (2) both carry
+    // over untouched, since neither is overridden here.
+    expect(
+      repo.update(id, {
+        mediaType: "video",
+        mimeTypes: ["video/mp4"],
+        tileRowCount: 3,
+        tileColumnCount: 5,
+        tileSize: 64,
+      }),
+    ).toBe(true);
+    expect(repo.get(id)).toEqual({
+      id,
+      glob: "**/*.jpg",
+      action: "generate",
+      mediaType: "video",
+      priority: 2,
+      mimeTypes: ["video/mp4"],
+      tileRowCount: 3,
+      tileColumnCount: 5,
+      tileSize: 64,
+      jpegQuality: 85,
+      createdAt: expect.any(String) as string,
+    });
+
+    // video -> image, in the same call overriding jpegQuality this time --
+    // the override wins over the carry, tile fields are dropped, priority
+    // still carries since it was never touched.
+    expect(
+      repo.update(id, {
+        mediaType: "image",
+        mimeTypes: ["image/png"],
+        imageWidth: 50,
+        imageHeight: 60,
+        jpegQuality: 42,
+      }),
+    ).toBe(true);
+    expect(repo.get(id)).toEqual({
+      id,
+      glob: "**/*.jpg",
+      action: "generate",
+      mediaType: "image",
+      priority: 2,
+      mimeTypes: ["image/png"],
+      imageWidth: 50,
+      imageHeight: 60,
+      jpegQuality: 42,
+      createdAt: expect.any(String) as string,
+    });
   });
 });

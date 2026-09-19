@@ -168,7 +168,21 @@ function deleteThumbnailFile(root: string, thumb: ExistingThumbnailFile): void {
   if (fs.existsSync(absolutePath)) fs.rmSync(absolutePath);
 }
 
-/** Generates (or regenerates, deleting `staleThumbnail` first) one thumbnail. Per-file failures become `ThumbnailGenerationError`, caught by the caller. */
+/**
+ * Generates (or regenerates, deleting `staleThumbnail` first) one
+ * thumbnail. Per-file failures become `ThumbnailGenerationError`, caught
+ * by the caller.
+ *
+ * `policy` is still typed as the full `ThumbnailPolicyRow` union here (a
+ * later task narrows `resolvePolicy`'s "generate" branch to
+ * `ThumbnailPolicyGenerateRow` at the source, which would make the
+ * `action`/`mediaType` checks below statically redundant) -- until then,
+ * both checks are real, cheap runtime narrowing rather than a `!` lie:
+ * `scanThumbnails` only ever reaches this function for a "generate"
+ * resolution whose `mediaType` agrees with `decision.probed.kind` (per
+ * `validateMediaTypeMimeConsistency`), so neither throw should ever fire
+ * in practice.
+ */
 async function generateForDecision(
   root: string,
   decision: ProvisionalDecision,
@@ -177,6 +191,10 @@ async function generateForDecision(
   generator: ThumbnailGenerator,
   logger: Logger,
 ): Promise<void> {
+  if (policy.action !== "generate") {
+    throw new Error(`internal error: generateForDecision called with a '${policy.action}' policy`);
+  }
+
   if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
 
   const thumbExt = expectedThumbExtension(decision);
@@ -190,9 +208,14 @@ async function generateForDecision(
   const sourceAbsolutePath = path.join(root, decision.relativePath);
 
   if (decision.probed.kind === "image") {
+    if (policy.mediaType !== "image") {
+      throw new Error(
+        `internal error: matched policy media type "${policy.mediaType}" doesn't agree with probed kind "image" for "${decision.relativePath}"`,
+      );
+    }
     const size = computeContainFitSize(
       { width: decision.probed.width, height: decision.probed.height },
-      { width: policy.imageWidth!, height: policy.imageHeight! },
+      { width: policy.imageWidth, height: policy.imageHeight },
     );
     await generator.generateImageThumbnail(
       {
@@ -200,11 +223,16 @@ async function generateForDecision(
         destPath: destAbsolutePath,
         width: size.width,
         height: size.height,
-        jpegQuality: policy.jpegQuality!,
+        jpegQuality: policy.jpegQuality,
       },
       logger,
     );
   } else {
+    if (policy.mediaType !== "video") {
+      throw new Error(
+        `internal error: matched policy media type "${policy.mediaType}" doesn't agree with probed kind "video" for "${decision.relativePath}"`,
+      );
+    }
     await generator.generateVideoMosaic(
       {
         sourcePath: sourceAbsolutePath,
@@ -212,11 +240,16 @@ async function generateForDecision(
         sourceWidth: decision.probed.width,
         sourceHeight: decision.probed.height,
         durationSeconds: decision.probed.durationSeconds,
-        tileRowCount: policy.tileRowCount!,
-        tileColumnCount: policy.tileColumnCount!,
-        tileWidth: policy.tileWidth!,
-        tileHeight: policy.tileHeight!,
-        jpegQuality: policy.jpegQuality!,
+        tileRowCount: policy.tileRowCount,
+        tileColumnCount: policy.tileColumnCount,
+        // GenerateVideoMosaicInput still takes an independent
+        // tileWidth/tileHeight box -- it collapses to a single tileSize
+        // only once thumbnail-generate.ts itself is rewritten (a later,
+        // out-of-scope task). A policy no longer configures the box's two
+        // dimensions independently, so its one tileSize feeds both.
+        tileWidth: policy.tileSize,
+        tileHeight: policy.tileSize,
+        jpegQuality: policy.jpegQuality,
       },
       logger,
     );
