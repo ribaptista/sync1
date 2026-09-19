@@ -64,6 +64,14 @@ async function runThumbnailMode(
     overallUnit: "files",
   });
 
+  // `ensure` drives the one bar from its generation phase instead of the
+  // scan phase -- see scanThumbnails's own doc comment on
+  // onGenerationProgress for why these are two separate callbacks, not
+  // one shared cumulative count. `state`/`cleanup` never generate
+  // anything, so "files scanned" stays their only (and already correct)
+  // progress unit, exactly as before this task.
+  let lastGenerated = 0;
+
   try {
     return await scanThumbnails(
       root,
@@ -77,10 +85,21 @@ async function runThumbnailMode(
       pools.thumbnail,
       pools.thumbnail.concurrency * 2,
       opts.deleteStaleStubPreviews ?? false,
-      (n) => {
-        progress.setOverallTotal(n);
-        progress.advanceOverall(1);
-      },
+      mode === "ensure"
+        ? undefined
+        : (n) => {
+            progress.setOverallTotal(n);
+            progress.advanceOverall(1);
+          },
+      mode === "ensure"
+        ? (pending, generated) => {
+            progress.setOverallTotal(pending);
+            if (generated > lastGenerated) {
+              progress.advanceOverall(generated - lastGenerated);
+              lastGenerated = generated;
+            }
+          }
+        : undefined,
     );
   } finally {
     progress.stop();

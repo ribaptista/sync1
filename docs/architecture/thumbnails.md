@@ -296,8 +296,27 @@ a fresh temp directory, always removed in a `finally`, even when generation fail
 Classification (filesystem walk + mime probe + policy resolution) and generation both dispatch through
 the same named pool, `pools.thumbnail` (a fourth `PQueue` alongside the existing three — see
 [concurrency-and-progress.md](concurrency-and-progress.md)), sized by the global `--thumbnail-parallelism`
-flag (default 4). One overall progress bar (files processed) is enough here — this command deliberately
-stays on the plain item-count `ProgressSession` (see concurrency-and-progress.md's "Progress bars and
-`--verbose`" section), not the combined files+bytes+ETA `BytesProgressSession` used by
-`update_cache`/`sync`/`materialize`/`stubify`/`sanity_check`, since thumbnail generation isn't a
-byte-transfer/hash operation -- "files processed" is the natural progress unit for this command.
+flag (default 4). This command deliberately stays on the plain item-count `ProgressSession` (see
+concurrency-and-progress.md's "Progress bars and `--verbose`" section), not the combined files+bytes+ETA
+`BytesProgressSession` used by `update_cache`/`sync`/`materialize`/`stubify`/`sanity_check`, since
+thumbnail generation isn't a byte-transfer/hash operation -- "files processed" is the natural progress
+unit for this command.
+
+`state` and `cleanup` drive that one bar from the filesystem walk (`scanThumbnails`'s `onProgress`
+callback) exactly as any other command would — neither mode ever generates anything, so "files scanned"
+is the only meaningful progress unit for either. `ensure` used to drive the same bar the same way, which
+meant it filled during the (comparatively fast) walk and then sat static for however long the
+(comparatively slow) actual generation work took — confirmed a genuine gap, not a documented decision:
+the walk's own progress callback fired per row scanned, but the generation dispatch/join round had no
+progress reporting of its own at all.
+
+`ensure` now drives the bar from a _separate_ callback, `onGenerationProgress`, entirely independent of
+the walk's `onProgress` (the two units — "files scanned" and "thumbnails generated" — aren't
+commensurable, so there's no single running count that could serve both): the bar's total grows by one
+each time the reconciliation loop dispatches a new to-generate/to-regenerate job (known synchronously,
+right as `scanThumbnails` decides a candidate needs generating, not discovered incrementally over a long
+walk the way `onProgress`'s count is), and its value advances by one each time a generation attempt
+completes — successfully or not, from a `finally`, so a per-file failure still moves the bar rather than
+silently stalling it. `ensure`'s own walk phase doesn't drive the bar at all under this scheme; since the
+walk is the fast phase and generation is the slow one, this trades a moving bar during the part that
+barely takes any time for a moving bar during the part that actually does.

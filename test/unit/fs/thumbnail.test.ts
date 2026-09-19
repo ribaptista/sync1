@@ -483,6 +483,126 @@ describe("scanThumbnails", () => {
     });
   });
 
+  it("grows generation-pending on dispatch, and only advances generated once each generation resolves", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile("a.jpg");
+    writeFile("b.jpg");
+    seedCache("a.jpg", "hasha");
+    seedCache("b.jpg", "hashb");
+
+    const prober = fakeProber({ "a.jpg": JPEG_IMAGE, "b.jpg": JPEG_IMAGE });
+
+    let resolveA: (() => void) | undefined;
+    let resolveB: (() => void) | undefined;
+    const generator: ThumbnailGenerator = {
+      generateImageThumbnail: (input) =>
+        new Promise<void>((resolve) => {
+          const finish = () => {
+            fs.mkdirSync(path.dirname(input.destPath), { recursive: true });
+            fs.writeFileSync(input.destPath, "thumb");
+            resolve();
+          };
+          if (input.sourcePath.endsWith("a.jpg")) resolveA = finish;
+          else resolveB = finish;
+        }),
+      generateVideoMosaic: async () => {},
+    };
+
+    const updates: { pending: number; generated: number }[] = [];
+    const pool = new PQueue({ concurrency: 4 });
+    const statsPromise = scanThumbnails(
+      root,
+      "ensure",
+      undefined,
+      cacheRepo,
+      policiesRepo.list(),
+      prober,
+      generator,
+      silentLogger,
+      pool,
+      8,
+      false,
+      undefined,
+      (pending, generated) => updates.push({ pending, generated }),
+    );
+
+    // Both dispatched (pending grew to 2) before either generation call's
+    // own promise ever settles -- generated stays 0 the whole time.
+    await vi.waitFor(() => {
+      expect(resolveA).toBeDefined();
+      expect(resolveB).toBeDefined();
+    });
+    expect(updates.some((u) => u.pending === 2 && u.generated === 0)).toBe(true);
+    expect(updates.every((u) => u.generated === 0)).toBe(true);
+
+    resolveA!();
+    await vi.waitFor(() => {
+      expect(updates.some((u) => u.generated === 1)).toBe(true);
+    });
+    resolveB!();
+
+    const stats = await statsPromise;
+    expect(stats.toGenerate).toBe(2);
+    expect(updates.at(-1)).toEqual({ pending: 2, generated: 2 });
+  });
+
+  it("advances generation progress even when a per-file generation fails", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile("bad.jpg");
+    seedCache("bad.jpg", "a");
+
+    const prober = fakeProber({ "bad.jpg": JPEG_IMAGE });
+    const generator = fakeGenerator(new Set([path.join(root, "bad.jpg")]));
+
+    const updates: { pending: number; generated: number }[] = [];
+    const pool = new PQueue({ concurrency: 4 });
+    const stats = await scanThumbnails(
+      root,
+      "ensure",
+      undefined,
+      cacheRepo,
+      policiesRepo.list(),
+      prober,
+      generator,
+      silentLogger,
+      pool,
+      8,
+      false,
+      undefined,
+      (pending, generated) => updates.push({ pending, generated }),
+    );
+
+    expect(stats.errors).toBe(1);
+    expect(updates.at(-1)).toEqual({ pending: 1, generated: 1 });
+  });
+
+  it("never fires onGenerationProgress for state or cleanup, which never generate anything", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile("new.jpg");
+    seedCache("new.jpg", "abc");
+
+    const prober = fakeProber({ "new.jpg": JPEG_IMAGE });
+    const updates: unknown[] = [];
+    const pool = new PQueue({ concurrency: 4 });
+    await scanThumbnails(
+      root,
+      "state",
+      undefined,
+      cacheRepo,
+      policiesRepo.list(),
+      prober,
+      fakeGenerator(),
+      silentLogger,
+      pool,
+      8,
+      false,
+      undefined,
+      (pending, generated) => updates.push({ pending, generated }),
+    );
+
+    expect(updates).toEqual([]);
+  });
+
   it("generates a video mosaic via generateVideoMosaic, sized from the matching policy's tile settings", async () => {
     policiesRepo.create({
       glob: "*.mp4",

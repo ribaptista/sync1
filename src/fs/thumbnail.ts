@@ -387,6 +387,13 @@ async function generateForDecision(
  * and never aborts the run; anything else (in particular
  * `MediaToolMissingError`) propagates and aborts, since categorically
  * nothing can be thumbnailed at all without the tool.
+ *
+ * `onProgress` covers the filesystem-walk phase only (every mode).
+ * `onGenerationProgress` covers `ensure`'s own generation phase
+ * separately -- deliberately not folded into `onProgress`'s own
+ * cumulative count, since "files scanned" and "thumbnails generated" are
+ * different units caller-side progress reporting needs to track
+ * independently (see `runThumbnailMode` in `src/commands/thumbnail.ts`).
  */
 export async function scanThumbnails(
   root: string,
@@ -409,6 +416,16 @@ export async function scanThumbnails(
    */
   deleteStaleStubPreviews: boolean,
   onProgress?: (scanned: number) => void,
+  /**
+   * `ensure`-only: fires once per newly-discovered to-generate/to-
+   * regenerate candidate (as it's dispatched) and once per completed
+   * generation attempt (success or failure, from a `finally`) --
+   * `pending`/`generated` are always the running totals so far, not
+   * deltas, mirroring `onProgress`'s own cumulative-count shape. Never
+   * fires at all for `state`/`cleanup`, since neither mode ever
+   * generates anything.
+   */
+  onGenerationProgress?: (pending: number, generated: number) => void,
 ): Promise<ThumbnailScanStats> {
   const stats: ThumbnailScanStats = {
     upToDate: 0,
@@ -466,6 +483,8 @@ export async function scanThumbnails(
   await pool.onIdle();
 
   const claimedOriginals = new Set<string>();
+  let pendingGeneration = 0;
+  let completedGeneration = 0;
 
   for (const decision of decisions) {
     claimedOriginals.add(decision.relativePath);
@@ -543,6 +562,8 @@ export async function scanThumbnails(
       stats.toRegenerate++;
       if (mode === "ensure") {
         const staleThumbnail = existing[0];
+        pendingGeneration++;
+        onGenerationProgress?.(pendingGeneration, completedGeneration);
         await waitForRoom(pool, poolQueueLimit);
         void pool.add(async () => {
           try {
@@ -554,12 +575,17 @@ export async function scanThumbnails(
               { path: decision.relativePath, err: err.message },
               "thumbnail regeneration failed -- skipping",
             );
+          } finally {
+            completedGeneration++;
+            onGenerationProgress?.(pendingGeneration, completedGeneration);
           }
         });
       }
     } else {
       stats.toGenerate++;
       if (mode === "ensure") {
+        pendingGeneration++;
+        onGenerationProgress?.(pendingGeneration, completedGeneration);
         await waitForRoom(pool, poolQueueLimit);
         void pool.add(async () => {
           try {
@@ -571,6 +597,9 @@ export async function scanThumbnails(
               { path: decision.relativePath, err: err.message },
               "thumbnail generation failed -- skipping",
             );
+          } finally {
+            completedGeneration++;
+            onGenerationProgress?.(pendingGeneration, completedGeneration);
           }
         });
       }
