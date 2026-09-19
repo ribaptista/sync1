@@ -100,6 +100,26 @@ neither of which ship with Windows by default:
 - Visual Studio Build Tools, with the **"Desktop development with C++"** workload
 - Python 3
 
+## External media tools
+
+Thumbnail generation (`thumbnail`/`thumbnail_policy`) shells out to already-installed binaries rather
+than bundling a native-addon alternative — see
+[thumbnails.md](architecture/thumbnails.md#external-tools-not-a-new-npm-dependency) for why. Not needed
+for anything else this project does; skip this section entirely if thumbnails aren't in use.
+
+- **ImageMagick** (`identify`/`convert`) >= 7 — developed and tested against `7.1.2-18`. Needed for image
+  thumbnails and CR2 raw mime-type detection.
+- **ffmpeg**/**ffprobe** >= 4.4 — developed and tested against `8.0.1`. The `>= 4.4` floor is load-bearing,
+  not just a "developed against" note: that's the version `-autorotate` defaulted on, which video mosaic
+  generation's rotation handling depends on for correctness (a video display-rotated but not physically
+  re-encoded would come out wrong on an older ffmpeg that doesn't auto-rotate decoded frames by default).
+
+Neither is installed by `npm install` — install them via your platform's normal package manager (e.g.
+`apt install imagemagick ffmpeg` on Debian/Ubuntu, `brew install imagemagick ffmpeg` on macOS). Missing
+either one doesn't break anything else in sync1; only the `thumbnail`/`thumbnail_policy` commands need
+them, and they fail with a clear "not found on PATH" error (`MediaToolMissingError`) rather than a cryptic
+one if you try to use them without the tool installed.
+
 ## Running without building
 
 `npm run dev` (all platforms) runs the CLI directly from TypeScript source via `tsx`, without a build
