@@ -8,8 +8,49 @@ before relying on either platform for real. See
 
 ## Prerequisites (all platforms)
 
-- [Node.js](https://nodejs.org/) >= 20
+- [Node.js](https://nodejs.org/) >= 20 — see [Node version note](#node-version-note) below for a caveat
+  on Node 24 specifically
 - git
+
+## Node version note
+
+Node 24 has a known native-addon teardown bug that hits `better-sqlite3` specifically: on process/worker
+exit, `Database`'s destructor can race V8's own environment teardown, tripping a native assertion —
+`node::RemoveEnvironmentCleanupHook(...) ... Assertion failed: (env) != nullptr` in `Database::~Database()`
+— which aborts the process (SIGABRT / exit code 134) instead of exiting cleanly. It's intermittent (a
+teardown race, not deterministic) and unrelated to anything sync1 itself does with the database. It's most
+visible running this project's vitest e2e suite under Node 24: a worker aborts mid-run, and the reported
+totals silently undercount (e.g. `npm run verify` reporting "31 passed (38)" with zero actual test
+failures — the missing 7 simply never got a chance to report). A spawned `sync1` CLI subprocess can hit the
+same abort on its own way out, which surfaces in a test as a bogus nonzero exit code rather than an
+assertion.
+
+Confirmed directly: the same e2e suite that aborts intermittently under Node 24 (`v24.21.0`) ran clean,
+multiple repeated times, under Node 22 (`v22.23.2`, current LTS) with no behavior change otherwise —
+**Node 22 is the recommended version for running this project's test suite** until this is fixed upstream
+(in Node, V8, or `better-sqlite3`, not in this repo). Using Node 24 is fine for normal `sync1` usage — the
+abort is a test-teardown artifact of running many short-lived `Database` instances back to back under a
+worker pool, not something a single long-running `sync1` process is likely to hit — but if you do see a
+vitest run undercount its own totals, or a CLI e2e test fail with an unexplained nonzero exit code, re-run
+the specific missing/failing test file individually before treating it as a real regression; if it's this
+issue, it passes on retry (or under Node 22).
+
+If switching Node versions isn't an option, the abort is specifically a _cross-worker_ teardown race in
+vitest's default pooled-forks runner — confirmed directly: the same suite that aborts under Node 24's
+default pool ran clean, repeatedly, under Node 24 itself when forced onto a single worker process:
+
+```bash
+npx vitest run <test file> --pool=forks --poolOptions.forks.singleFork
+```
+
+This is a workaround, not a fix — it serializes the whole run onto one process (no cross-file
+parallelism), so it's meaningfully slower on the full suite. Reach for it when you need a clean signal from
+one specific e2e file on Node 24 without switching to Node 22 (e.g. a quick one-off check); prefer Node 22
+for anything longer, including the full `npm run verify` gate.
+
+Whichever Node version you use, `better-sqlite3`'s prebuilt binary is ABI-specific — after switching Node
+versions (e.g. via `nvm use`), run `npm rebuild better-sqlite3` before running anything that touches the
+database, or you'll hit a `NODE_MODULE_VERSION` mismatch error instead.
 
 ## Linux
 
