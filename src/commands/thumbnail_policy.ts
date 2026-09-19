@@ -19,6 +19,7 @@ import {
   ThumbnailPoliciesRepository,
   type ThumbnailPolicyRow,
   type ThumbnailPolicyAction,
+  type ThumbnailPolicyMediaType,
   type ThumbnailPolicyCreateInput,
   type ThumbnailPolicyUpdate,
 } from "../db/repositories/thumbnail-policies-repository.js";
@@ -29,12 +30,12 @@ interface RootOption extends OptionValues {
 }
 
 interface GenerateFieldOptions {
+  mediaType?: string;
   imageWidth?: string;
   imageHeight?: string;
   tileRows?: string;
   tileColumns?: string;
-  tileWidth?: string;
-  tileHeight?: string;
+  tileSize?: string;
   jpegQuality?: string;
 }
 
@@ -83,6 +84,13 @@ function parseAction(raw: string): ThumbnailPolicyAction {
   return raw;
 }
 
+function parseMediaType(raw: string): ThumbnailPolicyMediaType {
+  if (raw !== "image" && raw !== "video") {
+    throw new Error(`invalid media type "${raw}" — expected "image" or "video"`);
+  }
+  return raw;
+}
+
 function parsePriority(raw: string): number {
   const priority = Number(raw);
   if (!Number.isInteger(priority)) {
@@ -114,13 +122,21 @@ function parseMimeTypes(raw: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-const GENERATE_FLAG_NAMES: Array<[flag: string, key: keyof GenerateFieldOptions]> = [
+/** Image-only fields -- required together for a "generate" "image" policy, forbidden on a "generate" "video" one. */
+const IMAGE_FLAG_NAMES: Array<[flag: string, key: "imageWidth" | "imageHeight"]> = [
   ["--image-width", "imageWidth"],
   ["--image-height", "imageHeight"],
+];
+
+/** Video-only fields -- required together for a "generate" "video" policy, forbidden on a "generate" "image" one. `tileSize` replaces the old fixed tileWidth/tileHeight box: one shorter-side target, longer side derived per source. */
+const VIDEO_FLAG_NAMES: Array<[flag: string, key: "tileRows" | "tileColumns" | "tileSize"]> = [
   ["--tile-rows", "tileRows"],
   ["--tile-columns", "tileColumns"],
-  ["--tile-width", "tileWidth"],
-  ["--tile-height", "tileHeight"],
+  ["--tile-size", "tileSize"],
+];
+
+/** The one field both "generate" branches share, regardless of media type. */
+const SHARED_GENERATE_FLAG_NAMES: Array<[flag: string, key: "jpegQuality"]> = [
   ["--jpeg-quality", "jpegQuality"],
 ];
 
@@ -129,12 +145,11 @@ interface ParsedGenerateFields {
   imageHeight?: number;
   tileRowCount?: number;
   tileColumnCount?: number;
-  tileWidth?: number;
-  tileHeight?: number;
+  tileSize?: number;
   jpegQuality?: number;
 }
 
-/** Parses whichever of the six generate-only flags were actually provided (each independently optional -- callers decide what "all" or "none" means for their command). */
+/** Parses whichever of the generate-only flags were actually provided (each independently optional -- callers decide what "all" or "none" means for their command). */
 function parseGenerateFields(opts: GenerateFieldOptions): ParsedGenerateFields {
   const fields: ParsedGenerateFields = {};
   if (opts.imageWidth !== undefined)
@@ -145,43 +160,89 @@ function parseGenerateFields(opts: GenerateFieldOptions): ParsedGenerateFields {
     fields.tileRowCount = parsePositiveInt(opts.tileRows, "--tile-rows");
   if (opts.tileColumns !== undefined)
     fields.tileColumnCount = parsePositiveInt(opts.tileColumns, "--tile-columns");
-  if (opts.tileWidth !== undefined)
-    fields.tileWidth = parsePositiveInt(opts.tileWidth, "--tile-width");
-  if (opts.tileHeight !== undefined)
-    fields.tileHeight = parsePositiveInt(opts.tileHeight, "--tile-height");
+  if (opts.tileSize !== undefined) fields.tileSize = parsePositiveInt(opts.tileSize, "--tile-size");
   if (opts.jpegQuality !== undefined) fields.jpegQuality = parseJpegQuality(opts.jpegQuality);
   return fields;
 }
 
 /**
  * Fast, friendly, pre-network-round-trip check for `create`: a "skip"
- * policy must supply none of --priority or the six generate flags; a
- * "generate" policy must supply all six (--priority is still optional --
- * omitted, it's auto-assigned like storage_policy's own `nextPriority`).
- * The repository re-validates the same invariant regardless (its own CHECK
- * constraint enforces it at the SQL level too) -- this only exists to fail
- * before `setupMutationContext`'s password/KDF/network work for an
- * obviously-wrong combination of flags.
+ * policy must supply none of --priority, --media-type, or any generate
+ * flag; a "generate" policy must supply --media-type, then exactly that
+ * media type's own fields (plus --jpeg-quality) and none of the other
+ * type's (--priority is still optional -- omitted, it's auto-assigned
+ * like storage_policy's own `nextPriority`). The repository re-validates
+ * the same invariant regardless (its own CHECK constraint enforces it at
+ * the SQL level too) -- this only exists to fail before
+ * `setupMutationContext`'s password/KDF/network work for an obviously-
+ * wrong combination of flags.
  */
 function assertGenerateFlagsConsistentForCreate(
   action: ThumbnailPolicyAction,
   opts: CreateOptions,
 ): void {
-  const present = GENERATE_FLAG_NAMES.filter(([, key]) => opts[key] !== undefined).map(
-    ([flag]) => flag,
-  );
+  const allGenerateFlagNames = [
+    ...IMAGE_FLAG_NAMES,
+    ...VIDEO_FLAG_NAMES,
+    ...SHARED_GENERATE_FLAG_NAMES,
+  ];
+
   if (action === "skip") {
-    const allPresent = opts.priority !== undefined ? ["--priority", ...present] : present;
+    const present = allGenerateFlagNames
+      .filter(([, key]) => opts[key] !== undefined)
+      .map(([flag]) => flag);
+    const allPresent = [
+      ...(opts.priority !== undefined ? ["--priority"] : []),
+      ...(opts.mediaType !== undefined ? ["--media-type"] : []),
+      ...present,
+    ];
     if (allPresent.length > 0) {
       throw new Error(`a "skip" policy can't set ${allPresent.join(", ")}`);
     }
     return;
   }
-  const missing = GENERATE_FLAG_NAMES.filter(([, key]) => opts[key] === undefined).map(
+
+  if (opts.mediaType === undefined) {
+    throw new Error('a "generate" policy needs --media-type');
+  }
+  const mediaType = parseMediaType(opts.mediaType);
+  const [ownFlagNames, otherFlagNames] =
+    mediaType === "image"
+      ? [IMAGE_FLAG_NAMES, VIDEO_FLAG_NAMES]
+      : [VIDEO_FLAG_NAMES, IMAGE_FLAG_NAMES];
+
+  const missing = [...ownFlagNames, ...SHARED_GENERATE_FLAG_NAMES]
+    .filter(([, key]) => opts[key] === undefined)
+    .map(([flag]) => flag);
+  if (missing.length > 0) {
+    throw new Error(`a "generate" "${mediaType}" policy needs ${missing.join(", ")}`);
+  }
+
+  const present = otherFlagNames.filter(([, key]) => opts[key] !== undefined).map(([flag]) => flag);
+  if (present.length > 0) {
+    throw new Error(`a "generate" "${mediaType}" policy can't set ${present.join(", ")}`);
+  }
+}
+
+/**
+ * Cheap, edit-only pre-check: a single `edit` call can't set fields from
+ * both media types at once, regardless of what the existing row's branch
+ * is or is becoming. Full branch-aware validation -- what's *required*
+ * depends on the *existing* row, which isn't available here without a
+ * network round trip -- stays in the repository's own `update()`, same as
+ * today.
+ */
+function assertNoMixedMediaTypeFlagsForEdit(opts: EditOptions): void {
+  const imagePresent = IMAGE_FLAG_NAMES.filter(([, key]) => opts[key] !== undefined).map(
     ([flag]) => flag,
   );
-  if (missing.length > 0) {
-    throw new Error(`a "generate" policy needs ${missing.join(", ")}`);
+  const videoPresent = VIDEO_FLAG_NAMES.filter(([, key]) => opts[key] !== undefined).map(
+    ([flag]) => flag,
+  );
+  if (imagePresent.length > 0 && videoPresent.length > 0) {
+    throw new Error(
+      `can't set both image and video fields in the same edit: ${[...imagePresent, ...videoPresent].join(", ")}`,
+    );
   }
 }
 
@@ -216,6 +277,53 @@ function nextPriority(repo: ThumbnailPoliciesRepository): number {
   return Math.max(...existing.map((r) => r.priority ?? 0)) + 1;
 }
 
+/**
+ * Builds the real `ThumbnailPolicyCreateInput` union value from
+ * independently-parsed pieces. The `!` assertions on `generateFields`'
+ * own-type members are safe: `assertGenerateFlagsConsistentForCreate`
+ * already ran (and would have thrown) before this is ever called, so
+ * every field this branch needs is guaranteed present.
+ */
+function buildCreateInput(
+  glob: string,
+  action: ThumbnailPolicyAction,
+  mimeTypes: string[],
+  generateFields: ParsedGenerateFields,
+  opts: CreateOptions,
+  repo: ThumbnailPoliciesRepository,
+): ThumbnailPolicyCreateInput {
+  if (action === "skip") {
+    return { glob, action: "skip", mimeTypes };
+  }
+
+  const priority = opts.priority !== undefined ? parsePriority(opts.priority) : nextPriority(repo);
+  const mediaType = parseMediaType(opts.mediaType!);
+
+  if (mediaType === "image") {
+    return {
+      glob,
+      action: "generate",
+      mediaType: "image",
+      mimeTypes,
+      priority,
+      imageWidth: generateFields.imageWidth!,
+      imageHeight: generateFields.imageHeight!,
+      jpegQuality: generateFields.jpegQuality!,
+    };
+  }
+  return {
+    glob,
+    action: "generate",
+    mediaType: "video",
+    mimeTypes,
+    priority,
+    tileRowCount: generateFields.tileRowCount!,
+    tileColumnCount: generateFields.tileColumnCount!,
+    tileSize: generateFields.tileSize!,
+    jpegQuality: generateFields.jpegQuality!,
+  };
+}
+
 async function runCreate(
   glob: string,
   actionRaw: string,
@@ -230,11 +338,7 @@ async function runCreate(
   const { root, masterKey, s3 } = await setupMutationContext(opts);
   const { versionStamp, result: id } = await mutateStateDb(root, masterKey, s3, logger, (db) => {
     const repo = new ThumbnailPoliciesRepository(db);
-    const input: ThumbnailPolicyCreateInput = { glob, action, mimeTypes, ...generateFields };
-    if (action === "generate") {
-      input.priority =
-        opts.priority !== undefined ? parsePriority(opts.priority) : nextPriority(repo);
-    }
+    const input = buildCreateInput(glob, action, mimeTypes, generateFields, opts, repo);
     return repo.create(input);
   });
   return { id, action, versionStamp };
@@ -245,6 +349,7 @@ async function runEdit(
   opts: EditOptions,
   logger: Logger,
 ): Promise<{ versionStamp: string }> {
+  assertNoMixedMediaTypeFlagsForEdit(opts);
   const { root, masterKey, s3 } = await setupMutationContext(opts);
   const { versionStamp } = await mutateStateDb(root, masterKey, s3, logger, (db) => {
     const changes: ThumbnailPolicyUpdate = {};
@@ -252,6 +357,7 @@ async function runEdit(
     if (opts.action !== undefined) changes.action = parseAction(opts.action);
     if (opts.mimeTypes !== undefined) changes.mimeTypes = parseMimeTypes(opts.mimeTypes);
     if (opts.priority !== undefined) changes.priority = parsePriority(opts.priority);
+    if (opts.mediaType !== undefined) changes.mediaType = parseMediaType(opts.mediaType);
     Object.assign(changes, parseGenerateFields(opts));
     if (!new ThumbnailPoliciesRepository(db).update(id, changes)) {
       throw new Error(`no thumbnail policy with id ${id}`);
@@ -320,12 +426,15 @@ export function registerThumbnailPolicyCommand(program: Command): void {
       "--priority <n>",
       "generate policies only; lower is checked first (default: appended last)",
     )
-    .option("--image-width <n>", "generate policies only, for images")
-    .option("--image-height <n>", "generate policies only, for images")
-    .option("--tile-rows <n>", "generate policies only, for video mosaics")
-    .option("--tile-columns <n>", "generate policies only, for video mosaics")
-    .option("--tile-width <n>", "generate policies only, for video mosaics")
-    .option("--tile-height <n>", "generate policies only, for video mosaics")
+    .option("--media-type <image|video>", "generate policies only; which field set applies")
+    .option("--image-width <n>", "generate policies only, for image policies")
+    .option("--image-height <n>", "generate policies only, for image policies")
+    .option("--tile-rows <n>", "generate policies only, for video policies")
+    .option("--tile-columns <n>", "generate policies only, for video policies")
+    .option(
+      "--tile-size <n>",
+      "generate policies only, for video policies -- one mosaic tile's shorter side, in pixels",
+    )
     .option("--jpeg-quality <1-100>", "generate policies only")
     .action(async (glob: string, action: string, opts: CreateOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -368,12 +477,15 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     .option("--action <action>", "new action: skip or generate")
     .option("--mime-types <csv>", "new comma-separated mime types")
     .option("--priority <n>", "new priority (generate policies only)")
-    .option("--image-width <n>", "new image width (generate policies only)")
-    .option("--image-height <n>", "new image height (generate policies only)")
-    .option("--tile-rows <n>", "new tile row count (generate policies only)")
-    .option("--tile-columns <n>", "new tile column count (generate policies only)")
-    .option("--tile-width <n>", "new tile width (generate policies only)")
-    .option("--tile-height <n>", "new tile height (generate policies only)")
+    .option("--media-type <image|video>", "new media type (generate policies only)")
+    .option("--image-width <n>", "new image width (generate/image policies only)")
+    .option("--image-height <n>", "new image height (generate/image policies only)")
+    .option("--tile-rows <n>", "new tile row count (generate/video policies only)")
+    .option("--tile-columns <n>", "new tile column count (generate/video policies only)")
+    .option(
+      "--tile-size <n>",
+      "new mosaic tile shorter side, in pixels (generate/video policies only)",
+    )
     .option("--jpeg-quality <1-100>", "new jpeg quality (generate policies only)")
     .action(async (idRaw: string, opts: EditOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
