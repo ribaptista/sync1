@@ -21,6 +21,16 @@ describe("realMediaProber (real identify/ffprobe binaries)", () => {
     expect((result as { durationSeconds: number }).durationSeconds).toBeCloseTo(2, 0);
   });
 
+  it("detects a Canon CR2 raw file's mime type and dimensions (read-only format, no encoder)", async () => {
+    const result = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "tiny.CR2"));
+    expect(result).toEqual({
+      kind: "image",
+      mimeType: "image/x-canon-cr2",
+      width: 3906,
+      height: 2602,
+    });
+  });
+
   it("returns undefined (not an error) for a non-media file", async () => {
     const result = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "not-media.txt"));
     expect(result).toBeUndefined();

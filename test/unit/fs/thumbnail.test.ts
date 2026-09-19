@@ -153,6 +153,12 @@ function run(
 }
 
 const JPEG_IMAGE: ProbedMedia = { kind: "image", mimeType: "image/jpeg", width: 800, height: 600 };
+const CR2_IMAGE: ProbedMedia = {
+  kind: "image",
+  mimeType: "image/x-canon-cr2",
+  width: 3906,
+  height: 2602,
+};
 
 describe("scanThumbnails", () => {
   it("reports up-to-date when an existing thumbnail's hash matches cache.db's current hash", async () => {
@@ -481,6 +487,21 @@ describe("scanThumbnails", () => {
     expect(generator.videoCalls[0]).toMatchObject({
       destPath: path.join(root, `_thumbnail/clip.mp4.${VIDEO_PARAMS}.vid1.jpg`),
     });
+  });
+
+  it("forces a .jpg thumbnail extension for a RAW (CR2) source, regardless of the original's own .CR2 extension", async () => {
+    createGeneratePolicy("*.CR2", { mimeTypes: ["image/x-canon-cr2"] });
+    writeFile("photo.CR2");
+    seedCache("photo.CR2", "rawhash");
+
+    const prober = fakeProber({ "photo.CR2": CR2_IMAGE });
+    const generator = fakeGenerator();
+    const stats = await run("ensure", undefined, prober, generator);
+
+    expect(stats).toMatchObject({ toGenerate: 1, errors: 0 });
+    expect(generator.imageCalls).toHaveLength(1);
+    expect(generator.imageCalls[0]!.destPath).toMatch(/\.jpg$/);
+    expect(generator.imageCalls[0]!.destPath).not.toMatch(/\.CR2$/i);
   });
 
   it("never probes a path that matches no policy glob at all", async () => {

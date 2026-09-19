@@ -209,8 +209,20 @@ interface ProvisionalDecisionStub {
 
 type ProvisionalDecision = ProvisionalDecisionProbed | ProvisionalDecisionStub;
 
+/**
+ * Image mime types ImageMagick can read but not write (`identify -list
+ * format` shows each as `r--`) -- a thumbnail generated from one can
+ * never keep the original's own extension the way an ordinary image does,
+ * since asking `convert` to *write* that format would fail outright with
+ * no encoder available. Forced to `.jpg` instead, the same way a video
+ * mosaic always is regardless of its own container.
+ */
+const RAW_IMAGE_MIME_TYPES = new Set<string>(["image/x-canon-cr2"]);
+
 function expectedThumbExtension(decision: ProvisionalDecisionProbed): string {
-  return decision.probed.kind === "video" ? "jpg" : fileExtension(decision.relativePath);
+  if (decision.probed.kind === "video") return "jpg";
+  if (RAW_IMAGE_MIME_TYPES.has(decision.probed.mimeType)) return "jpg";
+  return fileExtension(decision.relativePath);
 }
 
 async function classifyProbed(

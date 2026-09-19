@@ -103,6 +103,35 @@ describe("generateImageThumbnail (real convert)", () => {
       height: extremeSize.height,
     });
   });
+
+  it("generates a JPEG thumbnail from a Canon CR2 raw source (write-incapable format, forced to a JPEG destPath by the caller)", async () => {
+    // tiny.CR2 is 3906x2602 (landscape, ratio 1.501) -- generateImageThumbnail
+    // itself is source-format-agnostic (just hands sourcePath/destPath to
+    // convert); the CR2-forces-.jpg-output decision lives one layer up, in
+    // expectedThumbExtension (src/fs/thumbnail.ts) -- this only proves
+    // convert can actually read a real CR2 and write a resized JPEG from
+    // it, which identify succeeding doesn't by itself guarantee.
+    const size = computeContainFitSize({ width: 3906, height: 2602 }, { width: 100, height: 100 });
+    const destPath = path.join(mkTempDir(), "thumb.jpg");
+    await realThumbnailGenerator.generateImageThumbnail(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.CR2"),
+        destPath,
+        width: size.width,
+        height: size.height,
+        jpegQuality: 80,
+      },
+      silentLogger,
+    );
+
+    const probed = await realMediaProber.detectMedia(destPath);
+    expect(probed).toEqual({
+      kind: "image",
+      mimeType: "image/jpeg",
+      width: size.width,
+      height: size.height,
+    });
+  });
 });
 
 describe("generateVideoMosaic (real ffmpeg)", () => {

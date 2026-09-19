@@ -71,6 +71,11 @@ const IMAGE_FORMAT_TO_MIME: Record<string, string> = {
   TIFF: "image/tiff",
   WEBP: "image/webp",
   HEIC: "image/heic",
+  // Canon RAW -- read-only in ImageMagick (`identify -list format` shows
+  // "CR2 DNG r--", no encoder), so a thumbnail generated from one is
+  // always forced to `.jpg` regardless of the source's own extension --
+  // see RAW_IMAGE_MIME_TYPES in src/fs/thumbnail.ts.
+  CR2: "image/x-canon-cr2",
 };
 
 async function probeImage(absolutePath: string): Promise<ProbedImage | undefined> {
