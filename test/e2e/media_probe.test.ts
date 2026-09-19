@@ -31,6 +31,26 @@ describe("realMediaProber (real identify/ffprobe binaries)", () => {
     });
   });
 
+  it("swaps width/height for a video with a -90-degree display rotation, unlike its raw stream dimensions", async () => {
+    // rotated-90.mp4's raw stream is 32x24 (landscape) with Display Matrix
+    // side data declaring rotation: -90 -- generated with -noautorotate
+    // before -i specifically so the rotation lands as declared metadata,
+    // not baked into the raw pixels (confirmed directly: the same recipe
+    // without -noautorotate produces raw dims already swapped to 24x32
+    // with no side_data_list at all, which would make this fixture
+    // vacuously pass without ever exercising the fix).
+    const result = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "rotated-90.mp4"));
+    expect(result).toMatchObject({ kind: "video", mimeType: "video/mp4", width: 24, height: 32 });
+  });
+
+  it("does not swap dimensions for a 180-degree display rotation", async () => {
+    // Proves 180 is handled as genuinely distinct from the 90-family case
+    // above -- side data is present (unlike tiny.mp4, which has none at
+    // all), but rotationSwapsDimensions correctly leaves it alone.
+    const result = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "rotated-180.mp4"));
+    expect(result).toMatchObject({ kind: "video", mimeType: "video/mp4", width: 32, height: 24 });
+  });
+
   it("returns undefined (not an error) for a non-media file", async () => {
     const result = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "not-media.txt"));
     expect(result).toBeUndefined();

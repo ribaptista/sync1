@@ -124,9 +124,40 @@ const VIDEO_FORMAT_TO_MIME: Record<string, string> = {
   ogg: "video/ogg",
 };
 
+interface FfprobeStream {
+  width?: number;
+  height?: number;
+  side_data_list?: Array<{ rotation?: number }>;
+  tags?: { rotate?: string };
+}
+
 interface FfprobeOutput {
-  streams?: Array<{ width?: number; height?: number }>;
+  streams?: FfprobeStream[];
   format?: { format_name?: string; duration?: string };
+}
+
+/**
+ * Reads a stream's declared display rotation, in degrees -- the Display
+ * Matrix side data ffmpeg >= 4.4-ish writes by default (`side_data_list[].
+ * rotation`) takes precedence when present; the legacy pre-Display-Matrix
+ * `tags.rotate` convention is checked only as a fallback. Exported because
+ * both branches, and their precedence, are otherwise unfixturable with
+ * real ffmpeg -- a real encode only ever produces one or the other, never
+ * both at once for the same file -- so a unit test exercising the
+ * precedence rule directly is the only real coverage either branch gets.
+ */
+export function resolveRotationDegrees(stream: FfprobeStream): number {
+  const sideDataRotation = stream.side_data_list?.find((e) => e.rotation !== undefined)?.rotation;
+  if (sideDataRotation !== undefined) return sideDataRotation;
+  const tagRotation = stream.tags?.rotate !== undefined ? Number(stream.tags.rotate) : undefined;
+  if (tagRotation !== undefined && Number.isFinite(tagRotation)) return tagRotation;
+  return 0;
+}
+
+/** Normalizes to [0, 360) first so -90/270 and -270/90 are recognized as equivalent. 180 (or -180) swaps neither dimension. */
+export function rotationSwapsDimensions(degrees: number): boolean {
+  const normalized = ((degrees % 360) + 360) % 360;
+  return normalized === 90 || normalized === 270;
 }
 
 async function probeVideo(absolutePath: string): Promise<ProbedVideo | undefined> {
@@ -139,6 +170,10 @@ async function probeVideo(absolutePath: string): Promise<ProbedVideo | undefined
       "v:0",
       "-show_entries",
       "stream=width,height",
+      "-show_entries",
+      "stream_side_data=rotation",
+      "-show_entries",
+      "stream_tags=rotate",
       "-show_entries",
       "format=format_name,duration",
       "-of",
@@ -166,18 +201,26 @@ async function probeVideo(absolutePath: string): Promise<ProbedVideo | undefined
   if (!mimeType) return undefined;
 
   const stream = parsed.streams?.[0];
-  const width = stream?.width;
-  const height = stream?.height;
+  const rawWidth = stream?.width;
+  const rawHeight = stream?.height;
   const durationSeconds =
     parsed.format?.duration !== undefined ? Number(parsed.format.duration) : undefined;
   if (
-    width === undefined ||
-    height === undefined ||
+    rawWidth === undefined ||
+    rawHeight === undefined ||
     durationSeconds === undefined ||
     !Number.isFinite(durationSeconds)
   ) {
     return undefined;
   }
+
+  // ffmpeg's own frame decoding auto-rotates (see generateVideoMosaic's
+  // explicit -autorotate), so the *displayed* dimensions -- what every
+  // downstream consumer (mosaic frame sizing) actually needs -- can
+  // disagree with the raw stream dimensions ffprobe reports by default.
+  const swapped = stream !== undefined && rotationSwapsDimensions(resolveRotationDegrees(stream));
+  const width = swapped ? rawHeight : rawWidth;
+  const height = swapped ? rawWidth : rawHeight;
 
   return { kind: "video", mimeType, width, height, durationSeconds };
 }

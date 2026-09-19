@@ -5,6 +5,7 @@ import path from "node:path";
 import { realMediaProber } from "../../src/media/probe.js";
 import {
   computeContainFitSize,
+  computeMosaicFrameSize,
   realThumbnailGenerator,
 } from "../../src/media/thumbnail-generate.js";
 
@@ -202,5 +203,56 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
 
     const probed = await realMediaProber.detectMedia(destPath);
     expect(probed).toEqual({ kind: "image", mimeType: "image/jpeg", width: 39, height: 10 });
+  });
+
+  it("produces a portrait mosaic (not stretched/squished) from a landscape-encoded, -90-rotated source -- the exact bug this plan started from", async () => {
+    // Full-stack proof that the rotation fix (probeVideo swapping
+    // width/height for a display-rotated stream) and the tile-sizing
+    // redesign (computeMosaicFrameSize, no fixed box to disagree with a
+    // source's real orientation) work together correctly, composed the
+    // same way generateForDecision composes them in production: probe
+    // first, feed the *probed* (rotation-corrected) dimensions into
+    // frame-size computation, not the raw encoded ones.
+    const probed = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "rotated-90.mp4"));
+    expect(probed).toMatchObject({ kind: "video", width: 24, height: 32 }); // already swapped
+
+    const destPath = path.join(mkTempDir(), "mosaic.jpg");
+    const { width: sourceWidth, height: sourceHeight } = probed as {
+      width: number;
+      height: number;
+    };
+    const frame = computeMosaicFrameSize({ width: sourceWidth, height: sourceHeight }, 10);
+    expect(frame.height).toBeGreaterThan(frame.width); // portrait, matching the display-rotated source
+
+    // xstack requires at least 2 inputs, so a 1x1 "mosaic" isn't a valid
+    // composite -- 2 rows x 1 column stacks two already-portrait frames
+    // vertically, which only makes the result more definitively portrait.
+    await realThumbnailGenerator.generateVideoMosaic(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "rotated-90.mp4"),
+        destPath,
+        sourceWidth,
+        sourceHeight,
+        durationSeconds: 2,
+        tileRowCount: 2,
+        tileColumnCount: 1,
+        tileSize: 10,
+        jpegQuality: 80,
+      },
+      silentLogger,
+    );
+
+    // No crash (the old fixed-box design's pad step would have thrown
+    // here on an orientation mismatch), and the composited mosaic itself
+    // came out portrait-shaped, matching the frame size computed above --
+    // not the pre-fix behavior of silently treating the source as if it
+    // were still landscape.
+    const mosaicProbed = await realMediaProber.detectMedia(destPath);
+    expect(mosaicProbed).toEqual({
+      kind: "image",
+      mimeType: "image/jpeg",
+      width: frame.width,
+      height: frame.height * 2,
+    });
   });
 });
