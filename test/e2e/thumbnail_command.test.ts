@@ -25,6 +25,8 @@ interface ThumbnailStatsJson {
   to_delete: number;
   missing_cache_entry: number;
   stubbed_original: number;
+  stubbed_preserved: number;
+  stale_stub_previews: Array<{ path: string; thumbnail_path: string }>;
   errors: number;
 }
 

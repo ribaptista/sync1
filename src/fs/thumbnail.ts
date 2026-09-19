@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type PQueue from "p-queue";
 import type { Logger } from "../logger.js";
-import { walk, type WalkEntry } from "./walker.js";
+import { walk } from "./walker.js";
 import { matchesAnyGlob, literalPrefixOf } from "./glob-match.js";
 import { waitForRoom } from "../concurrency/pools.js";
 import type { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
@@ -16,6 +16,21 @@ import {
 
 export type ThumbnailRunMode = "state" | "ensure" | "cleanup";
 
+/**
+ * A stubbed original whose existing thumbnail's hash no longer matches the
+ * stub's own current content hash -- the file was edited after the
+ * thumbnail was generated, then stubified before a sync ever regenerated
+ * it. Unregenerable without materializing the file first, so it's neither
+ * silently kept (misleading -- it's not actually a preview of the current
+ * content) nor silently deleted (destroying the only copy of a preview
+ * that can never be recreated from the stub alone) -- see
+ * `--delete-stale-stub-previews` on `thumbnail cleanup`.
+ */
+export interface StaleStubPreview {
+  path: string;
+  thumbnailPath: string;
+}
+
 export interface ThumbnailScanStats {
   upToDate: number;
   toGenerate: number;
@@ -23,6 +38,8 @@ export interface ThumbnailScanStats {
   toDelete: number;
   missingCacheEntry: number;
   stubbedOriginal: number;
+  stubbedPreserved: number;
+  staleStubPreviews: StaleStubPreview[];
   errors: number;
 }
 
@@ -127,26 +144,39 @@ function resolvePolicy(
   return best ? { action: "generate", policy: best } : undefined;
 }
 
-interface ProvisionalDecision {
+/**
+ * A "real" (or "both", real-with-dangling-stub) candidate: fully probed,
+ * carries a resolved policy. A "stub" candidate never touches a prober or
+ * policy resolution at all -- see `classifyStub` below for why that's
+ * correct, not merely a shortcut.
+ */
+interface ProvisionalDecisionProbed {
+  kind: "probed";
   relativePath: string;
-  isStub: boolean;
   cacheHash: string | null;
   probed: ProbedMedia;
   resolution: { action: "skip" } | { action: "generate"; policy: ThumbnailPolicyRow };
 }
 
-function expectedThumbExtension(decision: ProvisionalDecision): string {
+interface ProvisionalDecisionStub {
+  kind: "stub";
+  relativePath: string;
+  cacheHash: string | null;
+}
+
+type ProvisionalDecision = ProvisionalDecisionProbed | ProvisionalDecisionStub;
+
+function expectedThumbExtension(decision: ProvisionalDecisionProbed): string {
   return decision.probed.kind === "video" ? "jpg" : fileExtension(decision.relativePath);
 }
 
-async function classifyOne(
-  fsEntry: WalkEntry,
+async function classifyProbed(
   relativePath: string,
   root: string,
   cacheRepo: CacheEntriesRepository,
   policies: readonly ThumbnailPolicyRow[],
   prober: MediaProber,
-): Promise<ProvisionalDecision | undefined> {
+): Promise<ProvisionalDecisionProbed | undefined> {
   const probed = await prober.detectMedia(path.join(root, relativePath));
   if (!probed) return undefined;
 
@@ -155,12 +185,30 @@ async function classifyOne(
 
   const cacheRow = cacheRepo.get(relativePath);
   return {
+    kind: "probed",
     relativePath,
-    isStub: fsEntry.representation === "stub",
     cacheHash: cacheRow?.hash ?? null,
     probed,
     resolution,
   };
+}
+
+/**
+ * A stub has no real bytes on disk to probe, so mime type -- hence policy
+ * resolution, hence the expected thumbnail extension -- can't be recovered
+ * for it. That's fine: none of that is needed for *preserving* an existing
+ * thumbnail, only for *generating* one, which never happens for a stub
+ * (see `scanThumbnails`'s reconciliation loop). All preservation needs is
+ * the stub's own self-declared content hash, already sitting in cache.db --
+ * `update-cache.ts` populates a stub's cache row straight from
+ * `readStubHash`, exactly as reliable as a real file's hash would be.
+ */
+function classifyStub(
+  relativePath: string,
+  cacheRepo: CacheEntriesRepository,
+): ProvisionalDecisionStub {
+  const cacheRow = cacheRepo.get(relativePath);
+  return { kind: "stub", relativePath, cacheHash: cacheRow?.hash ?? null };
 }
 
 function deleteThumbnailFile(root: string, thumb: ExistingThumbnailFile): void {
@@ -185,7 +233,7 @@ function deleteThumbnailFile(root: string, thumb: ExistingThumbnailFile): void {
  */
 async function generateForDecision(
   root: string,
-  decision: ProvisionalDecision,
+  decision: ProvisionalDecisionProbed,
   policy: ThumbnailPolicyRow,
   staleThumbnail: ExistingThumbnailFile | undefined,
   generator: ThumbnailGenerator,
@@ -252,25 +300,31 @@ async function generateForDecision(
 
 /**
  * Single filesystem walk shared by `state`/`ensure`/`cleanup` (never three
- * separate ones): classifies every candidate original against
- * `thumbnail_policies` (dispatched to `pool`, mime-probed only for a path
- * that already matches some policy's glob) while separately collecting
- * every existing `_thumbnail/` file it encounters along the way. Once the
- * walk (and its dispatched classification jobs) fully settles, every
+ * separate ones): classifies every candidate original -- against
+ * `thumbnail_policies` for a real (or "both") entry, dispatched to `pool`
+ * and mime-probed only once its path already matches some policy's glob;
+ * or, for a stub, synchronously via a pure cache.db-hash lookup, no
+ * probing or policy resolution at all (a stub has no real bytes to probe,
+ * and none of that is needed for the only thing a stub decision can ever
+ * do here: preserve, flag-stale, or leave-as-orphan an *existing*
+ * thumbnail -- see `classifyStub`) -- while separately collecting every
+ * existing `_thumbnail/` file it encounters along the way. Once the walk
+ * (and its dispatched classification jobs) fully settles, every
  * provisional decision is reconciled against the collected existing-
- * thumbnail map -- see the four buckets on `ThumbnailScanStats` -- and
- * whatever's left unclaimed in that map (an original deleted/renamed, or
- * simply outside this run's own `--glob`) becomes an orphan, also
- * counted under `toDelete`.
+ * thumbnail map, and whatever's left unclaimed in that map (an original
+ * deleted/renamed, or simply outside this run's own `--glob`) becomes an
+ * orphan, also counted under `toDelete`.
  *
  * `state` only tallies; `ensure` dispatches actual generation for
  * to-generate/to-regenerate entries back through the same `pool` (deleting
- * the stale file first when regenerating, within that same job); `cleanup`
- * synchronously deletes every `toDelete` file. A per-file
- * `ThumbnailGenerationError` is caught, tallied under `errors`, and never
- * aborts the run; anything else (in particular `MediaToolMissingError`)
- * propagates and aborts, since categorically nothing can be thumbnailed at
- * all without the tool.
+ * the stale file first when regenerating, within that same job) -- never
+ * for a stub, which is never a generation candidate; `cleanup`
+ * synchronously deletes every `toDelete` file, and additionally a stale
+ * stub preview's thumbnail when `deleteStaleStubPreviews` is set. A
+ * per-file `ThumbnailGenerationError` is caught, tallied under `errors`,
+ * and never aborts the run; anything else (in particular
+ * `MediaToolMissingError`) propagates and aborts, since categorically
+ * nothing can be thumbnailed at all without the tool.
  */
 export async function scanThumbnails(
   root: string,
@@ -283,6 +337,15 @@ export async function scanThumbnails(
   logger: Logger,
   pool: PQueue,
   poolQueueLimit: number,
+  /**
+   * Only meaningful for `cleanup`; `state`/`ensure`'s call sites always
+   * pass `false` explicitly (neither mode deletes anything at all) rather
+   * than relying on `mode === "cleanup"` alone to also imply this --
+   * deleting the only copy of an unregenerable preview is a materially
+   * bigger decision than the other `cleanup` buckets, so it gets its own
+   * explicit opt-in at every call site.
+   */
+  deleteStaleStubPreviews: boolean,
   onProgress?: (scanned: number) => void,
 ): Promise<ThumbnailScanStats> {
   const stats: ThumbnailScanStats = {
@@ -292,6 +355,8 @@ export async function scanThumbnails(
     toDelete: 0,
     missingCacheEntry: 0,
     stubbedOriginal: 0,
+    stubbedPreserved: 0,
+    staleStubPreviews: [],
     errors: 0,
   };
 
@@ -321,9 +386,15 @@ export async function scanThumbnails(
     if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
     if (!anyGlobMatches(relativePath, policies)) continue;
 
+    if (fsEntry.representation === "stub") {
+      // Synchronous, no subprocess -- no pool dispatch needed.
+      decisions.push(classifyStub(relativePath, cacheRepo));
+      continue;
+    }
+
     await waitForRoom(pool, poolQueueLimit);
     void pool.add(async () => {
-      const decision = await classifyOne(fsEntry, relativePath, root, cacheRepo, policies, prober);
+      const decision = await classifyProbed(relativePath, root, cacheRepo, policies, prober);
       if (decision) decisions.push(decision);
       logger.debug({ pool: "thumbnail", inFlight: pool.pending, queued: pool.size }, "completed");
     });
@@ -337,6 +408,41 @@ export async function scanThumbnails(
   for (const decision of decisions) {
     claimedOriginals.add(decision.relativePath);
     const existing = existingThumbnails.get(decision.relativePath) ?? [];
+
+    if (decision.kind === "stub") {
+      if (decision.cacheHash === null) {
+        stats.missingCacheEntry++;
+        continue;
+      }
+
+      const match = existing.find((t) => t.hash === decision.cacheHash);
+      if (match) {
+        // Preserved -- any *other* existing entries are genuine leftover
+        // duplicates (e.g. from an earlier config change), cleaned up the
+        // same as any other extra, not reported as stale.
+        stats.stubbedPreserved++;
+        for (const thumb of existing) {
+          if (thumb === match) continue;
+          stats.toDelete++;
+          if (mode === "cleanup") deleteThumbnailFile(root, thumb);
+        }
+      } else if (existing.length > 0) {
+        // Stale, not orphaned: the stub's current content hash doesn't
+        // match any existing thumbnail, so none can be trusted as a
+        // preview of the file's actual current content -- but none can be
+        // regenerated either, without materializing the file first.
+        for (const thumb of existing) {
+          stats.staleStubPreviews.push({
+            path: decision.relativePath,
+            thumbnailPath: thumb.relativePath,
+          });
+          if (mode === "cleanup" && deleteStaleStubPreviews) deleteThumbnailFile(root, thumb);
+        }
+      } else {
+        stats.stubbedOriginal++;
+      }
+      continue;
+    }
 
     if (decision.resolution.action === "skip") {
       for (const thumb of existing) {
@@ -363,11 +469,6 @@ export async function scanThumbnails(
         stats.toDelete++;
         if (mode === "cleanup") deleteThumbnailFile(root, thumb);
       }
-      continue;
-    }
-
-    if (decision.isStub) {
-      stats.stubbedOriginal++;
       continue;
     }
 

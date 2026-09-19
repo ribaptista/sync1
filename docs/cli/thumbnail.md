@@ -24,16 +24,17 @@ act on, reported without acting.
 ```bash
 sync1 thumbnail state --root <local-path> [--glob <pattern>] [--json] [--thumbnail-parallelism <n>]
 sync1 thumbnail ensure --root <local-path> [--glob <pattern>] [--json] [--thumbnail-parallelism <n>]
-sync1 thumbnail cleanup --root <local-path> [--glob <pattern>] [--json] [--thumbnail-parallelism <n>]
+sync1 thumbnail cleanup --root <local-path> [--glob <pattern>] [--delete-stale-stub-previews] [--json] [--thumbnail-parallelism <n>]
 ```
 
 ## Options
 
-| Flag                          | Required | Description                                                                                          |
-| ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------- |
-| `--root <path>`               | yes      | Local directory to scan. Must already be initialized/attached.                                       |
-| `--glob <pattern>`            | no       | Glob (supports `**`) scoping which files to consider. Also prunes the filesystem walk when possible. |
-| `--thumbnail-parallelism <n>` | no       | Max concurrent classification/generation jobs. Default 4.                                            |
+| Flag                           | Required | Description                                                                                                                                                                                                                      |
+| ------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--root <path>`                | yes      | Local directory to scan. Must already be initialized/attached.                                                                                                                                                                   |
+| `--glob <pattern>`             | no       | Glob (supports `**`) scoping which files to consider. Also prunes the filesystem walk when possible.                                                                                                                             |
+| `--thumbnail-parallelism <n>`  | no       | Max concurrent classification/generation jobs. Default 4.                                                                                                                                                                        |
+| `--delete-stale-stub-previews` | no       | `cleanup` only. Also deletes a stubbed original's existing thumbnail once its stub's own content hash no longer matches that thumbnail — see "Stale stub previews" below. Without this flag, `cleanup` leaves those files alone. |
 
 A `--glob` narrower than the one used on a previous run can cause a valid, up-to-date thumbnail outside
 this run's scope to be flagged (and, under `cleanup`, deleted) as an orphan — this is a deliberate,
@@ -51,22 +52,40 @@ documented consequence of scoping by directory rather than a bug; see
   "to_delete": 0,
   "missing_cache_entry": 0,
   "stubbed_original": 1,
+  "stubbed_preserved": 3,
+  "stale_stub_previews": [
+    { "path": "clip.mp4", "thumbnail_path": "_thumbnail/clip.mp4.a1b2c3.jpg" }
+  ],
   "errors": 0
 }
 ```
 
-`ok` is `false` (nonzero exit) when `errors > 0` — a per-file generation failure never aborts the run, but
-does mark it as not fully successful. `stubbed_original` counts files that need a fresh/updated thumbnail
-but can't get one because the original is currently a stub (not blocked if its existing thumbnail is
-already up to date — see [thumbnails.md](../architecture/thumbnails.md)). `missing_cache_entry` counts
-files matching a `generate` policy whose content hash isn't in `cache.db` yet — run `update_cache` first,
-then retry.
+`ok` is `false` (nonzero exit) when `errors > 0` **or** `stale_stub_previews` is non-empty — a per-file
+generation failure, or an unregenerable stale preview sitting on disk, both mark the run as not fully
+successful, even though neither one aborts it. `stubbed_original` counts files that need a fresh/updated
+thumbnail but can't get one because the original is currently a stub and has no existing thumbnail at all.
+`stubbed_preserved` counts stubbed originals whose existing thumbnail is still a valid preview of the
+stub's current content (matching hash) — never touched, in any mode, including `cleanup`. `missing_cache_entry`
+counts files matching a `generate` policy whose content hash isn't in `cache.db` yet — run `update_cache`
+first, then retry.
+
+### Stale stub previews
+
+A stub has no real bytes on disk, so its existing thumbnail can only be _preserved_ (hash matches) or
+_flagged stale_ (hash doesn't match) — never regenerated in place, since regenerating needs the real file.
+A stale entry means the file was edited after its thumbnail was generated, then stubified before a sync
+ever regenerated that thumbnail: the preview on disk no longer reflects the file's current content, but
+the only way to get a correct one is to `materialize` the file first. Because deleting the last copy of an
+unregenerable preview is a bigger decision than the other `cleanup` buckets, it needs its own explicit
+opt-in — `cleanup --delete-stale-stub-previews` — rather than happening automatically. `state`/`ensure`
+report `stale_stub_previews` the same way but never delete anything themselves (neither mode deletes at
+all).
 
 ## Exit codes
 
-- `0` — success, no per-file generation errors.
-- `1` — the root isn't initialized/attached, or at least one per-file generation error occurred
-  (`errors > 0` in the output).
+- `0` — success, no per-file generation errors, no stale stub previews.
+- `1` — the root isn't initialized/attached, at least one per-file generation error occurred
+  (`errors > 0`), or at least one stale stub preview was found (`stale_stub_previews` non-empty).
 
 ## Example
 

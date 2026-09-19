@@ -124,6 +124,7 @@ function run(
   glob: string | undefined,
   prober: MediaProber,
   generator: ThumbnailGenerator,
+  deleteStaleStubPreviews = false,
 ): Promise<ThumbnailScanStats> {
   const pool = new PQueue({ concurrency: 4 });
   return scanThumbnails(
@@ -137,6 +138,7 @@ function run(
     silentLogger,
     pool,
     8,
+    deleteStaleStubPreviews,
   );
 }
 
@@ -252,26 +254,67 @@ describe("scanThumbnails", () => {
     expect(stats).toMatchObject({ missingCacheEntry: 1, toGenerate: 1 });
   });
 
-  it("blocks generation for a stubbed original only when generation would actually be needed", async () => {
+  it("reports stubbedOriginal for a stub with no existing thumbnail, never probing it (no real bytes to probe)", async () => {
     createGeneratePolicy("*.jpg");
-
-    // Stub with no existing thumbnail at all -- blocked, needs materializing first.
     writeStub("stubbed-new.jpg", "abc");
     seedCache("stubbed-new.jpg", "abc");
 
-    // Stub whose existing thumbnail is already up to date -- correctly
-    // reported as up to date, never blocked, even though it's still a stub.
+    // A fakeProber keyed by string would happily "succeed" for this path
+    // even though no real file exists on disk -- deliberately NOT
+    // registering an entry for it here, so the test would fail loudly
+    // (an unhandled fake-prober lookup) if classifyStub ever probed a
+    // stub, instead of silently passing for the wrong reason.
+    const prober = fakeProber({});
+    const stats = await run("state", undefined, prober, fakeGenerator());
+
+    expect(stats).toMatchObject({ stubbedOriginal: 1, stubbedPreserved: 0, toGenerate: 0 });
+    expect(stats.staleStubPreviews).toEqual([]);
+    expect(prober.detectMedia).not.toHaveBeenCalled();
+  });
+
+  it("reports stubbedPreserved for a stub whose existing thumbnail's hash matches its own cache.db hash, never probing it", async () => {
+    createGeneratePolicy("*.jpg");
     writeStub("stubbed-current.jpg", "def");
     seedCache("stubbed-current.jpg", "def");
     writeFile("_thumbnail/stubbed-current.jpg.def.jpg");
 
-    const prober = fakeProber({
-      "stubbed-new.jpg": JPEG_IMAGE,
-      "stubbed-current.jpg": JPEG_IMAGE,
-    });
+    const prober = fakeProber({});
     const stats = await run("state", undefined, prober, fakeGenerator());
 
-    expect(stats).toMatchObject({ stubbedOriginal: 1, upToDate: 1, toGenerate: 0 });
+    expect(stats).toMatchObject({ stubbedPreserved: 1, stubbedOriginal: 0, upToDate: 0 });
+    expect(stats.staleStubPreviews).toEqual([]);
+    expect(prober.detectMedia).not.toHaveBeenCalled();
+    // Never deleted, even under cleanup -- a preserved preview is exactly
+    // the thing this fix protects.
+    const cleanupStats = await run("cleanup", undefined, fakeProber({}), fakeGenerator());
+    expect(cleanupStats).toMatchObject({ stubbedPreserved: 1, toDelete: 0 });
+    expect(fs.existsSync(path.join(root, "_thumbnail/stubbed-current.jpg.def.jpg"))).toBe(true);
+  });
+
+  it("reports a stale stub preview when the stub's current hash doesn't match its existing thumbnail, and only deletes it under cleanup with --delete-stale-stub-previews", async () => {
+    createGeneratePolicy("*.jpg");
+    // The stub's own cache.db hash ("newhash") no longer matches the
+    // thumbnail generated back when the file was still real ("oldhash") --
+    // it was edited, then stubified, before a sync ever regenerated it.
+    writeStub("stale.jpg", "newhash");
+    seedCache("stale.jpg", "newhash");
+    writeFile("_thumbnail/stale.jpg.oldhash.jpg");
+
+    const prober = fakeProber({});
+    const stateStats = await run("state", undefined, prober, fakeGenerator());
+    expect(stateStats).toMatchObject({ stubbedOriginal: 0, stubbedPreserved: 0 });
+    expect(stateStats.staleStubPreviews).toEqual([
+      { path: "stale.jpg", thumbnailPath: "_thumbnail/stale.jpg.oldhash.jpg" },
+    ]);
+    expect(prober.detectMedia).not.toHaveBeenCalled();
+
+    const cleanupNoFlag = await run("cleanup", undefined, fakeProber({}), fakeGenerator());
+    expect(cleanupNoFlag.staleStubPreviews).toHaveLength(1);
+    expect(fs.existsSync(path.join(root, "_thumbnail/stale.jpg.oldhash.jpg"))).toBe(true);
+
+    const cleanupWithFlag = await run("cleanup", undefined, fakeProber({}), fakeGenerator(), true);
+    expect(cleanupWithFlag.staleStubPreviews).toHaveLength(1);
+    expect(fs.existsSync(path.join(root, "_thumbnail/stale.jpg.oldhash.jpg"))).toBe(false);
   });
 
   it("sweeps an orphaned thumbnail whose original no longer exists on disk", async () => {

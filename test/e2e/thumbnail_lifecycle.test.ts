@@ -26,6 +26,8 @@ interface ThumbnailStatsJson {
   to_delete: number;
   missing_cache_entry: number;
   stubbed_original: number;
+  stubbed_preserved: number;
+  stale_stub_previews: Array<{ path: string; thumbnail_path: string }>;
   errors: number;
 }
 
@@ -228,6 +230,171 @@ describe("thumbnail lifecycle (end to end)", () => {
         .find((line) => line.length > 0) ?? "{}",
     ) as { cache: { hash: string | null } | null; state: { hash: string | null } | null };
     expect(inspectParsed.state?.hash).toEqual(expect.any(String));
+
+    fs.rmSync(root, { recursive: true, force: true });
+  }, 60000);
+
+  it("preserves a stubbed original's up-to-date thumbnail across stubify, reporting it as stubbed_preserved", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    fs.copyFileSync(path.join(FIXTURES_DIR, "tiny.jpg"), path.join(root, "photo.jpg"));
+
+    await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "**/*.jpg",
+        "generate",
+        "--root",
+        root,
+        "--mime-types",
+        "image/jpeg",
+        ...IMAGE_GENERATE_FLAGS,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    await runCli(["update_cache", "--root", root, "--json"]);
+    const ensure = await runCli(["thumbnail", "ensure", "--root", root, "--json"]);
+    expect(JSON.parse(ensure.stdout) as ThumbnailStatsJson).toMatchObject({ to_generate: 1 });
+    const thumbFile = fs.readdirSync(path.join(root, "_thumbnail"))[0]!;
+    const thumbPath = path.join(root, "_thumbnail", thumbFile);
+    expect(fs.existsSync(thumbPath)).toBe(true);
+
+    // Fully commit, then replace the real file with a stub -- the whole
+    // point of a thumbnail is previewing content that's deliberately not
+    // kept materialized locally, so its thumbnail must survive this.
+    const sync = await runCli(["sync", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(sync.exitCode).toBe(0);
+    const stubify = await runCli(["stubify", "photo.jpg", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(stubify.exitCode).toBe(0);
+    expect(fs.existsSync(path.join(root, "photo.jpg"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "photo.jpg.stub"))).toBe(true);
+
+    const stateAfterStubify = await runCli(["thumbnail", "state", "--root", root, "--json"]);
+    expect(JSON.parse(stateAfterStubify.stdout) as ThumbnailStatsJson).toMatchObject({
+      stubbed_preserved: 1,
+      stubbed_original: 0,
+      to_delete: 0,
+    });
+    expect(fs.existsSync(thumbPath)).toBe(true);
+
+    // cleanup never deletes a preserved preview either.
+    const cleanup = await runCli(["thumbnail", "cleanup", "--root", root, "--json"]);
+    expect(JSON.parse(cleanup.stdout) as ThumbnailStatsJson).toMatchObject({
+      stubbed_preserved: 1,
+      to_delete: 0,
+    });
+    expect(fs.existsSync(thumbPath)).toBe(true);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  }, 60000);
+
+  it("flags a stubbed original's thumbnail as a stale stub preview once the stub's content changes, and only deletes it via cleanup --delete-stale-stub-previews", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    fs.copyFileSync(path.join(FIXTURES_DIR, "tiny.jpg"), path.join(root, "photo.jpg"));
+
+    await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "**/*.jpg",
+        "generate",
+        "--root",
+        root,
+        "--mime-types",
+        "image/jpeg",
+        ...IMAGE_GENERATE_FLAGS,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    await runCli(["update_cache", "--root", root, "--json"]);
+    const ensure = await runCli(["thumbnail", "ensure", "--root", root, "--json"]);
+    expect(JSON.parse(ensure.stdout) as ThumbnailStatsJson).toMatchObject({ to_generate: 1 });
+    const thumbFile = fs.readdirSync(path.join(root, "_thumbnail"))[0]!;
+    const thumbPath = path.join(root, "_thumbnail", thumbFile);
+
+    await runCli(["sync", "--root", root, "--json"], { env: { SYNC1_PASSWORD: PASSWORD } });
+
+    // Edit the file's content *after* its thumbnail was generated, commit
+    // that edit too, then stubify -- the stub's own hash now disagrees
+    // with the thumbnail filename's embedded hash, with no real bytes left
+    // locally to regenerate from.
+    fs.writeFileSync(path.join(root, "photo.jpg"), "a completely different file, not a real jpeg");
+    const syncEdit = await runCli(["sync", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(syncEdit.exitCode).toBe(0);
+    const stubify = await runCli(["stubify", "photo.jpg", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(stubify.exitCode).toBe(0);
+    expect(fs.existsSync(path.join(root, "photo.jpg"))).toBe(false);
+
+    const state = await runCli(["thumbnail", "state", "--root", root, "--json"]);
+    const stateParsed = JSON.parse(state.stdout) as ThumbnailStatsJson;
+    expect(stateParsed).toMatchObject({ ok: false, stubbed_preserved: 0, stubbed_original: 0 });
+    expect(stateParsed.stale_stub_previews).toEqual([
+      { path: "photo.jpg", thumbnail_path: `_thumbnail/${thumbFile}` },
+    ]);
+    expect(fs.existsSync(thumbPath)).toBe(true);
+
+    const cleanupNoFlag = await runCli(["thumbnail", "cleanup", "--root", root, "--json"]);
+    const cleanupNoFlagParsed = JSON.parse(cleanupNoFlag.stdout) as ThumbnailStatsJson;
+    expect(cleanupNoFlagParsed.stale_stub_previews).toHaveLength(1);
+    expect(fs.existsSync(thumbPath)).toBe(true); // left alone without the flag
+
+    const cleanupWithFlag = await runCli([
+      "thumbnail",
+      "cleanup",
+      "--root",
+      root,
+      "--delete-stale-stub-previews",
+      "--json",
+    ]);
+    const cleanupWithFlagParsed = JSON.parse(cleanupWithFlag.stdout) as ThumbnailStatsJson;
+    expect(cleanupWithFlagParsed.stale_stub_previews).toHaveLength(1);
+    expect(fs.existsSync(thumbPath)).toBe(false); // actually removed with the flag
 
     fs.rmSync(root, { recursive: true, force: true });
   }, 60000);

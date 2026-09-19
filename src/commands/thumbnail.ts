@@ -20,6 +20,7 @@ import type { Logger } from "../logger.js";
 interface ThumbnailRunOptions extends OptionValues {
   root: string;
   glob?: string;
+  deleteStaleStubPreviews?: boolean;
 }
 
 interface GlobalOptions extends GlobalConcurrencyOptions {
@@ -75,6 +76,7 @@ async function runThumbnailMode(
       logger,
       pools.thumbnail,
       pools.thumbnail.concurrency * 2,
+      opts.deleteStaleStubPreviews ?? false,
       (n) => {
         progress.setOverallTotal(n);
         progress.advanceOverall(1);
@@ -89,7 +91,7 @@ async function runThumbnailMode(
 }
 
 function emitStats(json: boolean, mode: ThumbnailRunMode, stats: ThumbnailScanStats): boolean {
-  const ok = stats.errors === 0;
+  const ok = stats.errors === 0 && stats.staleStubPreviews.length === 0;
   if (json) {
     emitJson({
       ok,
@@ -99,6 +101,11 @@ function emitStats(json: boolean, mode: ThumbnailRunMode, stats: ThumbnailScanSt
       to_delete: stats.toDelete,
       missing_cache_entry: stats.missingCacheEntry,
       stubbed_original: stats.stubbedOriginal,
+      stubbed_preserved: stats.stubbedPreserved,
+      stale_stub_previews: stats.staleStubPreviews.map((s) => ({
+        path: s.path,
+        thumbnail_path: s.thumbnailPath,
+      })),
       errors: stats.errors,
     });
   } else {
@@ -106,8 +113,14 @@ function emitStats(json: boolean, mode: ThumbnailRunMode, stats: ThumbnailScanSt
       `thumbnail ${mode}: ${stats.upToDate} up to date, ${stats.toGenerate} to generate, ` +
         `${stats.toRegenerate} to regenerate, ${stats.toDelete} to delete, ` +
         `${stats.missingCacheEntry} missing cache entry, ${stats.stubbedOriginal} stubbed original, ` +
+        `${stats.stubbedPreserved} stubbed preserved, ${stats.staleStubPreviews.length} stale stub preview(s), ` +
         `${stats.errors} error(s)\n`,
     );
+    for (const s of stats.staleStubPreviews) {
+      process.stdout.write(
+        `  stale stub preview: "${s.path}" -> "${s.thumbnailPath}" -- stub content changed since this thumbnail was generated; materialize and regenerate, or pass --delete-stale-stub-previews to cleanup to discard it\n`,
+      );
+    }
   }
   return ok;
 }
@@ -117,30 +130,41 @@ function registerThumbnailSubcommand(
   mode: ThumbnailRunMode,
   description: string,
 ): void {
-  thumbnail
+  const command = thumbnail
     .command(mode)
     .description(description)
     .requiredOption("--root <path>", "local directory to scan")
-    .option("--glob <pattern>", "glob pattern scoping which files to consider")
-    .action(async (opts: ThumbnailRunOptions, command: Command) => {
-      const globalOpts = command.optsWithGlobals<GlobalOptions>();
-      const json = globalOpts.json ?? false;
-      const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
-      const logger = createLoggerForRun({
-        verbose: globalOpts.verbose ?? false,
-        showProgress,
-      }).child({ command: `thumbnail_${mode}` });
+    .option("--glob <pattern>", "glob pattern scoping which files to consider");
 
-      try {
-        const stats = await runThumbnailMode(mode, opts, globalOpts, logger, showProgress);
-        const ok = emitStats(json, mode, stats);
-        if (!ok) process.exitCode = EXIT_GENERIC_ERROR;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.debug({ err: message }, `thumbnail ${mode} failed`);
-        emitError(json, message, exitCodeForError(err));
-      }
-    });
+  // Only `cleanup` ever deletes anything, so this is the only subcommand
+  // where the flag would mean something -- see scanThumbnails's own doc
+  // comment for why it isn't implied by `mode === "cleanup"` alone.
+  if (mode === "cleanup") {
+    command.option(
+      "--delete-stale-stub-previews",
+      "also delete a stubbed original's existing thumbnail when the stub's content hash no longer matches it (unregenerable without materializing the file first)",
+    );
+  }
+
+  command.action(async (opts: ThumbnailRunOptions, cmd: Command) => {
+    const globalOpts = cmd.optsWithGlobals<GlobalOptions>();
+    const json = globalOpts.json ?? false;
+    const showProgress = shouldShowProgress({ json, progress: globalOpts.progress ?? true });
+    const logger = createLoggerForRun({
+      verbose: globalOpts.verbose ?? false,
+      showProgress,
+    }).child({ command: `thumbnail_${mode}` });
+
+    try {
+      const stats = await runThumbnailMode(mode, opts, globalOpts, logger, showProgress);
+      const ok = emitStats(json, mode, stats);
+      if (!ok) process.exitCode = EXIT_GENERIC_ERROR;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.debug({ err: message }, `thumbnail ${mode} failed`);
+      emitError(json, message, exitCodeForError(err));
+    }
+  });
 }
 
 export function registerThumbnailCommand(program: Command): void {
