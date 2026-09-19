@@ -170,8 +170,12 @@ describe("thumbnail lifecycle (end to end)", () => {
     // in the same root _thumbnail/ dir.
     const rootThumbs = fs.readdirSync(path.join(root, "_thumbnail"));
     expect(rootThumbs).toHaveLength(2);
-    expect(rootThumbs.some((f) => /^photo\.jpg\.[0-9a-f]+\.jpg$/.test(f))).toBe(true);
-    expect(rootThumbs.some((f) => /^clip\.mp4\.[0-9a-f]+\.jpg$/.test(f))).toBe(true);
+    expect(rootThumbs.some((f) => /^photo\.jpg\.p1-iw16-ih16-q80\.[0-9a-f]+\.jpg$/.test(f))).toBe(
+      true,
+    );
+    expect(rootThumbs.some((f) => /^clip\.mp4\.p1-tr2-tc2-ts16-q80\.[0-9a-f]+\.jpg$/.test(f))).toBe(
+      true,
+    );
     expect(fs.existsSync(path.join(root, "private", "_thumbnail"))).toBe(false);
 
     const cleanup1 = await runCli(["thumbnail", "cleanup", "--root", root, "--json"]);
@@ -207,7 +211,7 @@ describe("thumbnail lifecycle (end to end)", () => {
 
     const remainingThumbs = fs.readdirSync(path.join(root, "_thumbnail"));
     expect(remainingThumbs).toHaveLength(1);
-    expect(remainingThumbs[0]).toMatch(/^clip\.mp4\.[0-9a-f]+\.jpg$/);
+    expect(remainingThumbs[0]).toMatch(/^clip\.mp4\.p1-tr2-tc2-ts16-q80\.[0-9a-f]+\.jpg$/);
 
     // A plain update_cache + sync picks up the surviving thumbnail as
     // ordinary tracked content -- no special-casing anywhere in that path.

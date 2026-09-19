@@ -79,6 +79,16 @@ function createGeneratePolicy(glob: string, overrides: Partial<typeof GENERATE_J
   return policiesRepo.create({ ...GENERATE_JPEG, glob, ...overrides });
 }
 
+// Matches expectedParamsSegment's own encoding for GENERATE_JPEG's default
+// fields (imageWidth 320, imageHeight 240, jpegQuality 80) and for the
+// video policy created directly in the mosaic test below (tileRowCount 3,
+// tileColumnCount 3, tileSize 48, jpegQuality 80) -- every thumbnail
+// filename asserted against in this file now carries one of these two
+// segments, since parseThumbnailEntry requires a shape-valid params
+// segment to recognize a thumbnail file at all.
+const IMAGE_PARAMS = "p1-iw320-ih240-q80";
+const VIDEO_PARAMS = "p1-tr3-tc3-ts48-q80";
+
 function createSkipPolicy(glob: string, mimeTypes = ["image/jpeg"]): number {
   return policiesRepo.create({ glob, action: "skip", mimeTypes });
 }
@@ -149,7 +159,7 @@ describe("scanThumbnails", () => {
     createGeneratePolicy("*.jpg");
     writeFile("photo.jpg");
     seedCache("photo.jpg", "abc123");
-    writeFile("_thumbnail/photo.jpg.abc123.jpg");
+    writeFile(`_thumbnail/photo.jpg.${IMAGE_PARAMS}.abc123.jpg`);
 
     const prober = fakeProber({ "photo.jpg": JPEG_IMAGE });
     const generator = fakeGenerator();
@@ -174,43 +184,102 @@ describe("scanThumbnails", () => {
     expect(ensureStats).toMatchObject({ toGenerate: 1 });
     expect(generator.imageCalls).toHaveLength(1);
     expect(generator.imageCalls[0]).toMatchObject({
-      destPath: path.join(root, "_thumbnail/new.jpg.def456.jpg"),
+      destPath: path.join(root, `_thumbnail/new.jpg.${IMAGE_PARAMS}.def456.jpg`),
       width: 320,
       height: 240,
     });
-    expect(fs.existsSync(path.join(root, "_thumbnail/new.jpg.def456.jpg"))).toBe(true);
+    expect(fs.existsSync(path.join(root, `_thumbnail/new.jpg.${IMAGE_PARAMS}.def456.jpg`))).toBe(
+      true,
+    );
   });
 
   it("reports toRegenerate for a stale existing thumbnail, and ensure deletes the old one before generating the new one", async () => {
     createGeneratePolicy("*.jpg");
     writeFile("changed.jpg");
     seedCache("changed.jpg", "newhash");
-    writeFile("_thumbnail/changed.jpg.oldhash.jpg");
+    writeFile(`_thumbnail/changed.jpg.${IMAGE_PARAMS}.oldhash.jpg`);
 
     const prober = fakeProber({ "changed.jpg": JPEG_IMAGE });
     const generator = fakeGenerator();
     const stats = await run("ensure", undefined, prober, generator);
 
     expect(stats).toMatchObject({ toRegenerate: 1, upToDate: 0 });
-    expect(fs.existsSync(path.join(root, "_thumbnail/changed.jpg.oldhash.jpg"))).toBe(false);
-    expect(fs.existsSync(path.join(root, "_thumbnail/changed.jpg.newhash.jpg"))).toBe(true);
+    expect(
+      fs.existsSync(path.join(root, `_thumbnail/changed.jpg.${IMAGE_PARAMS}.oldhash.jpg`)),
+    ).toBe(false);
+    expect(
+      fs.existsSync(path.join(root, `_thumbnail/changed.jpg.${IMAGE_PARAMS}.newhash.jpg`)),
+    ).toBe(true);
+  });
+
+  it("regenerates when a policy's own configured parameters change, even though the original file's content hash hasn't", async () => {
+    // This is the actual bug the params-segment filename encoding fixes:
+    // before it, a filename was keyed only on content hash, so a policy
+    // edit (jpeg quality, image box, tile size) with the file itself
+    // untouched left the stale thumbnail looking "up to date" forever.
+    const policyId = createGeneratePolicy("*.jpg", { imageWidth: 320, imageHeight: 240 });
+    writeFile("photo.jpg");
+    seedCache("photo.jpg", "samehash");
+    writeFile(`_thumbnail/photo.jpg.${IMAGE_PARAMS}.samehash.jpg`);
+
+    const prober = fakeProber({ "photo.jpg": JPEG_IMAGE });
+    const upToDateStats = await run("state", undefined, prober, fakeGenerator());
+    expect(upToDateStats).toMatchObject({ upToDate: 1, toRegenerate: 0 });
+
+    policiesRepo.update(policyId, { imageWidth: 200 });
+    const afterConfigChange = await run("state", undefined, prober, fakeGenerator());
+    expect(afterConfigChange).toMatchObject({ upToDate: 0, toRegenerate: 1 });
+
+    const generator = fakeGenerator();
+    const ensureStats = await run("ensure", undefined, prober, generator);
+    expect(ensureStats).toMatchObject({ toRegenerate: 1 });
+    expect(
+      fs.existsSync(path.join(root, `_thumbnail/photo.jpg.${IMAGE_PARAMS}.samehash.jpg`)),
+    ).toBe(false);
+    expect(
+      fs.existsSync(path.join(root, "_thumbnail/photo.jpg.p1-iw200-ih240-q80.samehash.jpg")),
+    ).toBe(true);
+  });
+
+  it("never recognizes a pre-existing thumbnail filename that has no params segment, leaving it untouched even under cleanup", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile("photo.jpg");
+    seedCache("photo.jpg", "abc123");
+    // The pre-this-change three-dot-part shape -- fewer than the four
+    // parts parseThumbnailEntry now requires, so this is never reverse-
+    // parsed as belonging to "photo.jpg" at all, not even as an orphan.
+    writeFile("_thumbnail/photo.jpg.abc123.jpg");
+
+    const prober = fakeProber({ "photo.jpg": JPEG_IMAGE });
+    const stats = await run("state", undefined, prober, fakeGenerator());
+    // Not recognized as an existing thumbnail for photo.jpg, so it's
+    // treated as if none exists at all.
+    expect(stats).toMatchObject({ toGenerate: 1, upToDate: 0, toDelete: 0 });
+
+    const cleanupStats = await run("cleanup", undefined, prober, fakeGenerator());
+    expect(cleanupStats).toMatchObject({ toDelete: 0 });
+    expect(fs.existsSync(path.join(root, "_thumbnail/photo.jpg.abc123.jpg"))).toBe(true);
   });
 
   it("reports toDelete for a skip-matched original with an existing thumbnail, and only cleanup removes it", async () => {
     createSkipPolicy("private/**");
     writeFile("private/secret.jpg");
     seedCache("private/secret.jpg", "abc");
-    writeFile("_thumbnail/secret.jpg.abc.jpg".replace("_thumbnail", "private/_thumbnail"));
+    writeFile(`private/_thumbnail/secret.jpg.${IMAGE_PARAMS}.abc.jpg`);
 
     const prober = fakeProber({ "private/secret.jpg": JPEG_IMAGE });
 
     const ensureStats = await run("ensure", undefined, prober, fakeGenerator());
     expect(ensureStats).toMatchObject({ toDelete: 1 });
-    expect(fs.existsSync(path.join(root, "private/_thumbnail/secret.jpg.abc.jpg"))).toBe(true); // ensure never touches bucket d
+    expect(
+      fs.existsSync(path.join(root, `private/_thumbnail/secret.jpg.${IMAGE_PARAMS}.abc.jpg`)),
+    ).toBe(true); // ensure never touches bucket d
 
     const cleanupStats = await run("cleanup", undefined, prober, fakeGenerator());
     expect(cleanupStats).toMatchObject({ toDelete: 1 });
-    expect(fs.existsSync(path.join(root, "private/_thumbnail/secret.jpg.abc.jpg"))).toBe(false);
+    expect(
+      fs.existsSync(path.join(root, `private/_thumbnail/secret.jpg.${IMAGE_PARAMS}.abc.jpg`)),
+    ).toBe(false);
   });
 
   it("skip beats generate even when the generate policy has the lowest priority", async () => {
@@ -276,7 +345,7 @@ describe("scanThumbnails", () => {
     createGeneratePolicy("*.jpg");
     writeStub("stubbed-current.jpg", "def");
     seedCache("stubbed-current.jpg", "def");
-    writeFile("_thumbnail/stubbed-current.jpg.def.jpg");
+    writeFile(`_thumbnail/stubbed-current.jpg.${IMAGE_PARAMS}.def.jpg`);
 
     const prober = fakeProber({});
     const stats = await run("state", undefined, prober, fakeGenerator());
@@ -288,7 +357,9 @@ describe("scanThumbnails", () => {
     // the thing this fix protects.
     const cleanupStats = await run("cleanup", undefined, fakeProber({}), fakeGenerator());
     expect(cleanupStats).toMatchObject({ stubbedPreserved: 1, toDelete: 0 });
-    expect(fs.existsSync(path.join(root, "_thumbnail/stubbed-current.jpg.def.jpg"))).toBe(true);
+    expect(
+      fs.existsSync(path.join(root, `_thumbnail/stubbed-current.jpg.${IMAGE_PARAMS}.def.jpg`)),
+    ).toBe(true);
   });
 
   it("reports a stale stub preview when the stub's current hash doesn't match its existing thumbnail, and only deletes it under cleanup with --delete-stale-stub-previews", async () => {
@@ -298,35 +369,42 @@ describe("scanThumbnails", () => {
     // it was edited, then stubified, before a sync ever regenerated it.
     writeStub("stale.jpg", "newhash");
     seedCache("stale.jpg", "newhash");
-    writeFile("_thumbnail/stale.jpg.oldhash.jpg");
+    writeFile(`_thumbnail/stale.jpg.${IMAGE_PARAMS}.oldhash.jpg`);
 
     const prober = fakeProber({});
     const stateStats = await run("state", undefined, prober, fakeGenerator());
     expect(stateStats).toMatchObject({ stubbedOriginal: 0, stubbedPreserved: 0 });
     expect(stateStats.staleStubPreviews).toEqual([
-      { path: "stale.jpg", thumbnailPath: "_thumbnail/stale.jpg.oldhash.jpg" },
+      { path: "stale.jpg", thumbnailPath: `_thumbnail/stale.jpg.${IMAGE_PARAMS}.oldhash.jpg` },
     ]);
     expect(prober.detectMedia).not.toHaveBeenCalled();
 
     const cleanupNoFlag = await run("cleanup", undefined, fakeProber({}), fakeGenerator());
     expect(cleanupNoFlag.staleStubPreviews).toHaveLength(1);
-    expect(fs.existsSync(path.join(root, "_thumbnail/stale.jpg.oldhash.jpg"))).toBe(true);
+    expect(fs.existsSync(path.join(root, `_thumbnail/stale.jpg.${IMAGE_PARAMS}.oldhash.jpg`))).toBe(
+      true,
+    );
 
     const cleanupWithFlag = await run("cleanup", undefined, fakeProber({}), fakeGenerator(), true);
     expect(cleanupWithFlag.staleStubPreviews).toHaveLength(1);
-    expect(fs.existsSync(path.join(root, "_thumbnail/stale.jpg.oldhash.jpg"))).toBe(false);
+    expect(fs.existsSync(path.join(root, `_thumbnail/stale.jpg.${IMAGE_PARAMS}.oldhash.jpg`))).toBe(
+      false,
+    );
   });
 
   it("sweeps an orphaned thumbnail whose original no longer exists on disk", async () => {
     createGeneratePolicy("*.jpg");
-    writeFile("_thumbnail/gone.jpg.anyhash.jpg"); // original "gone.jpg" was never created / already deleted
+    // original "gone.jpg" was never created / already deleted
+    writeFile(`_thumbnail/gone.jpg.${IMAGE_PARAMS}.anyhash.jpg`);
 
     const stats = await run("state", undefined, fakeProber({}), fakeGenerator());
     expect(stats).toMatchObject({ toDelete: 1 });
 
     const cleanupStats = await run("cleanup", undefined, fakeProber({}), fakeGenerator());
     expect(cleanupStats).toMatchObject({ toDelete: 1 });
-    expect(fs.existsSync(path.join(root, "_thumbnail/gone.jpg.anyhash.jpg"))).toBe(false);
+    expect(fs.existsSync(path.join(root, `_thumbnail/gone.jpg.${IMAGE_PARAMS}.anyhash.jpg`))).toBe(
+      false,
+    );
   });
 
   it("--glob scopes which candidates are probed at all, both by directory pruning and by full-pattern matching", async () => {
@@ -367,7 +445,7 @@ describe("scanThumbnails", () => {
     expect(stats.toGenerate).toBe(2);
     expect(generator.imageCalls).toHaveLength(1);
     expect(generator.imageCalls[0]).toMatchObject({
-      destPath: path.join(root, "_thumbnail/good.jpg.b.jpg"),
+      destPath: path.join(root, `_thumbnail/good.jpg.${IMAGE_PARAMS}.b.jpg`),
     });
   });
 
@@ -401,7 +479,7 @@ describe("scanThumbnails", () => {
     expect(stats).toMatchObject({ toGenerate: 1 });
     expect(generator.videoCalls).toHaveLength(1);
     expect(generator.videoCalls[0]).toMatchObject({
-      destPath: path.join(root, "_thumbnail/clip.mp4.vid1.jpg"),
+      destPath: path.join(root, `_thumbnail/clip.mp4.${VIDEO_PARAMS}.vid1.jpg`),
     });
   });
 

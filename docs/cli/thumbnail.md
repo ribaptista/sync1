@@ -54,7 +54,7 @@ documented consequence of scoping by directory rather than a bug; see
   "stubbed_original": 1,
   "stubbed_preserved": 3,
   "stale_stub_previews": [
-    { "path": "clip.mp4", "thumbnail_path": "_thumbnail/clip.mp4.a1b2c3.jpg" }
+    { "path": "clip.mp4", "thumbnail_path": "_thumbnail/clip.mp4.p1-tr4-tc4-ts90-q80.a1b2c3.jpg" }
   ],
   "errors": 0
 }

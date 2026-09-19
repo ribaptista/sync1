@@ -6,7 +6,10 @@ import { walk } from "./walker.js";
 import { matchesAnyGlob, literalPrefixOf } from "./glob-match.js";
 import { waitForRoom } from "../concurrency/pools.js";
 import type { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
-import type { ThumbnailPolicyRow } from "../db/repositories/thumbnail-policies-repository.js";
+import type {
+  ThumbnailPolicyRow,
+  ThumbnailPolicyGenerateRow,
+} from "../db/repositories/thumbnail-policies-repository.js";
 import type { MediaProber, ProbedMedia } from "../media/probe.js";
 import {
   computeContainFitSize,
@@ -45,24 +48,57 @@ export interface ThumbnailScanStats {
 
 const THUMBNAIL_DIR_NAME = "_thumbnail";
 
+/**
+ * Encodes a policy's raw *configured* generation parameters (never a
+ * per-file computed/derived size) into a filename segment, so a policy
+ * config change naturally produces a different expected filename even
+ * when the original's own content hash hasn't changed -- the existing
+ * orphan-reconciliation logic already handles that case for free (a
+ * mismatched expected filename means "not up to date"), no separate
+ * regeneration-detection mechanism needed. Literal abbreviated fields
+ * rather than a hash of them: worst case (`p1-tr9999-tc9999-ts65535-
+ * q100`, 29 bytes) leaves well over a hundred spare bytes of the 255-byte
+ * path-component limit even after the hash and extension, so length was
+ * never the binding constraint -- a human being able to `ls _thumbnail/`
+ * and read off what config produced a file, with no database
+ * cross-reference, is worth far more than the ~13 bytes a hash would
+ * reclaim. `PARAMS_VERSION` exists so a future incompatible change to
+ * this segment's own shape can be told apart from today's, rather than
+ * silently misparsed.
+ */
+const PARAMS_VERSION = "p1";
+const PARAMS_SEGMENT_RE = /^p1-[a-z]+\d+(?:-[a-z]+\d+)*$/;
+
+function expectedParamsSegment(policy: ThumbnailPolicyGenerateRow): string {
+  return policy.mediaType === "image"
+    ? `${PARAMS_VERSION}-iw${policy.imageWidth}-ih${policy.imageHeight}-q${policy.jpegQuality}`
+    : `${PARAMS_VERSION}-tr${policy.tileRowCount}-tc${policy.tileColumnCount}-ts${policy.tileSize}-q${policy.jpegQuality}`;
+}
+
 interface ExistingThumbnailFile {
   /** relative to the vault root -- the thumbnail file's own path */
   relativePath: string;
   /** relative to the vault root -- the original this thumbnail is for */
   originalRelativePath: string;
+  paramsSegment: string;
   hash: string;
   thumbExt: string;
 }
 
 /**
  * Recognizes a walked entry as living directly inside a `_thumbnail/`
- * directory and reverse-parses its filename (`<original-name>.<hash>.
- * <thumb-ext>`) back into the original it belongs to. Returns `undefined`
- * both for anything not under a `_thumbnail/` dir at all, and for a
- * filename shape we don't recognize (fewer than the three required
- * dot-separated parts) -- never touched or tallied, matching this
- * project's general "never act on something we don't recognize the shape
- * of" discipline.
+ * directory and reverse-parses its filename (`<original-name>.
+ * <params-segment>.<hash>.<thumb-ext>`) back into the original it belongs
+ * to. Returns `undefined` both for anything not under a `_thumbnail/` dir
+ * at all, and for a filename shape we don't recognize -- fewer than the
+ * four required dot-separated parts, or a third-from-last part that
+ * doesn't match `PARAMS_SEGMENT_RE` -- never touched or tallied, matching
+ * this project's general "never act on something we don't recognize the
+ * shape of" discipline. The `PARAMS_SEGMENT_RE` check specifically is what
+ * keeps this from *mis*-parsing a pre-this-change filename (three
+ * dot-parts, e.g. `sunset.jpg.<hash>.jpg`) as if its "params" slot were
+ * the literal token `jpg` -- that filename now correctly falls through as
+ * unrecognized instead.
  */
 function parseThumbnailEntry(relativePath: string): ExistingThumbnailFile | undefined {
   const dir = path.dirname(relativePath);
@@ -70,18 +106,20 @@ function parseThumbnailEntry(relativePath: string): ExistingThumbnailFile | unde
 
   const filename = path.basename(relativePath);
   const parts = filename.split(".");
-  if (parts.length < 3) return undefined;
+  if (parts.length < 4) return undefined;
 
   const thumbExt = parts[parts.length - 1]!;
   const hash = parts[parts.length - 2]!;
-  const originalName = parts.slice(0, -2).join(".");
+  const paramsSegment = parts[parts.length - 3]!;
+  if (!PARAMS_SEGMENT_RE.test(paramsSegment)) return undefined;
+  const originalName = parts.slice(0, -3).join(".");
   if (originalName.length === 0) return undefined;
 
   const originalDir = path.dirname(dir);
   const originalRelativePath =
     originalDir === "." ? originalName : `${originalDir}/${originalName}`;
 
-  return { relativePath, originalRelativePath, hash, thumbExt };
+  return { relativePath, originalRelativePath, paramsSegment, hash, thumbExt };
 }
 
 function fileExtension(relativePath: string): string {
@@ -92,13 +130,14 @@ function fileExtension(relativePath: string): string {
 
 function thumbnailRelativePath(
   originalRelativePath: string,
+  paramsSegment: string,
   hash: string,
   thumbExt: string,
 ): string {
   const dir = path.dirname(originalRelativePath);
   const base = path.basename(originalRelativePath);
   const thumbDir = dir === "." ? THUMBNAIL_DIR_NAME : `${dir}/${THUMBNAIL_DIR_NAME}`;
-  return `${thumbDir}/${base}.${hash}.${thumbExt}`;
+  return `${thumbDir}/${base}.${paramsSegment}.${hash}.${thumbExt}`;
 }
 
 function mimeTypeMatches(pattern: string, mimeType: string): boolean {
@@ -124,7 +163,8 @@ function anyGlobMatches(relativePath: string, policies: readonly ThumbnailPolicy
   return policies.some((p) => matchesAnyGlob(relativePath, [p.glob]).matched);
 }
 
-type PolicyResolution = { action: "skip" } | { action: "generate"; policy: ThumbnailPolicyRow };
+type PolicyResolution =
+  { action: "skip" } | { action: "generate"; policy: ThumbnailPolicyGenerateRow };
 
 /** Any matching 'skip' wins outright (monotonic OR, like ignore_policies); otherwise the lowest-priority matching 'generate' row wins. `undefined` = not a candidate at all. */
 function resolvePolicy(
@@ -138,7 +178,10 @@ function resolvePolicy(
   if (skipMatch) return { action: "skip" };
 
   const generateMatches = policies
-    .filter((p) => p.action === "generate" && policyMatches(p, relativePath, mimeType))
+    .filter(
+      (p): p is ThumbnailPolicyGenerateRow =>
+        p.action === "generate" && policyMatches(p, relativePath, mimeType),
+    )
     .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
   const best = generateMatches[0];
   return best ? { action: "generate", policy: best } : undefined;
@@ -155,7 +198,7 @@ interface ProvisionalDecisionProbed {
   relativePath: string;
   cacheHash: string | null;
   probed: ProbedMedia;
-  resolution: { action: "skip" } | { action: "generate"; policy: ThumbnailPolicyRow };
+  resolution: PolicyResolution;
 }
 
 interface ProvisionalDecisionStub {
@@ -221,33 +264,34 @@ function deleteThumbnailFile(root: string, thumb: ExistingThumbnailFile): void {
  * thumbnail. Per-file failures become `ThumbnailGenerationError`, caught
  * by the caller.
  *
- * `policy` is still typed as the full `ThumbnailPolicyRow` union here (a
- * later task narrows `resolvePolicy`'s "generate" branch to
- * `ThumbnailPolicyGenerateRow` at the source, which would make the
- * `action`/`mediaType` checks below statically redundant) -- until then,
- * both checks are real, cheap runtime narrowing rather than a `!` lie:
- * `scanThumbnails` only ever reaches this function for a "generate"
- * resolution whose `mediaType` agrees with `decision.probed.kind` (per
- * `validateMediaTypeMimeConsistency`), so neither throw should ever fire
- * in practice.
+ * `policy` is `ThumbnailPolicyGenerateRow` -- `resolvePolicy`'s "generate"
+ * branch is narrowed at the source, so there's no 'skip' branch left to
+ * guard against here. The `mediaType` checks below are still real,
+ * necessary runtime narrowing, not dead code: `ThumbnailPolicyGenerateRow`
+ * is itself still a union of an "image" branch and a "video" branch, and
+ * nothing in the type system connects that to `decision.probed.kind` --
+ * `scanThumbnails` only ever reaches this function for a resolution whose
+ * `mediaType` agrees with what was actually probed (guaranteed at the
+ * data level by `validateMediaTypeMimeConsistency`, not provable from
+ * types alone), so these throws are defense-in-depth against a state.db
+ * reached by some future path that bypasses the repository, not expected
+ * to ever fire in practice.
  */
 async function generateForDecision(
   root: string,
   decision: ProvisionalDecisionProbed,
-  policy: ThumbnailPolicyRow,
+  policy: ThumbnailPolicyGenerateRow,
   staleThumbnail: ExistingThumbnailFile | undefined,
   generator: ThumbnailGenerator,
   logger: Logger,
 ): Promise<void> {
-  if (policy.action !== "generate") {
-    throw new Error(`internal error: generateForDecision called with a '${policy.action}' policy`);
-  }
-
   if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
 
   const thumbExt = expectedThumbExtension(decision);
+  const paramsSegment = expectedParamsSegment(policy);
   const destRelativePath = thumbnailRelativePath(
     decision.relativePath,
+    paramsSegment,
     decision.cacheHash!,
     thumbExt,
   );
@@ -457,9 +501,14 @@ export async function scanThumbnails(
       continue;
     }
 
+    const policy = decision.resolution.policy;
     const expectedExt = expectedThumbExtension(decision);
+    const expectedParams = expectedParamsSegment(policy);
     const upToDateMatch = existing.find(
-      (t) => t.hash === decision.cacheHash && t.thumbExt === expectedExt,
+      (t) =>
+        t.hash === decision.cacheHash &&
+        t.thumbExt === expectedExt &&
+        t.paramsSegment === expectedParams,
     );
 
     if (upToDateMatch) {
@@ -472,7 +521,6 @@ export async function scanThumbnails(
       continue;
     }
 
-    const policy = decision.resolution.policy;
     if (existing.length > 0) {
       stats.toRegenerate++;
       if (mode === "ensure") {
