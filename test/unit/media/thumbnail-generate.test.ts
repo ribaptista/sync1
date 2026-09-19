@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { computeContainFitSize } from "../../../src/media/thumbnail-generate.js";
+import {
+  computeContainFitSize,
+  computeMosaicFrameSize,
+} from "../../../src/media/thumbnail-generate.js";
 
 describe("computeContainFitSize", () => {
   it("does a standard contain fit for an ordinary landscape source into a square box", () => {
@@ -59,5 +62,54 @@ describe("computeContainFitSize", () => {
     const result = computeContainFitSize({ width: 5000, height: 1 }, { width: 1, height: 1 });
     expect(result.width).toBeGreaterThanOrEqual(1);
     expect(result.height).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("computeMosaicFrameSize", () => {
+  it("scales a matching-orientation (landscape) source so its short side hits shortSide exactly", () => {
+    // 400x300, ratio 4:3 -- min dimension is height (300). scale = 150/300 =
+    // 0.5, applied uniformly: 400*0.5=200, 300*0.5=150. Both axes land
+    // exactly on an integer, nothing to round.
+    expect(computeMosaicFrameSize({ width: 400, height: 300 }, 150)).toEqual({
+      width: 200,
+      height: 150,
+    });
+  });
+
+  it("has no orientation concept at all -- a transposed source with the same shortSide produces the exact transpose", () => {
+    // 700x500 (landscape): min=500, scale=100/500=0.2 -> {140,100}.
+    expect(computeMosaicFrameSize({ width: 700, height: 500 }, 100)).toEqual({
+      width: 140,
+      height: 100,
+    });
+    // 500x700 (portrait, same two numbers transposed): min=500 (now the
+    // width), same scale 0.2 -> {100,140}, the exact transpose of the
+    // landscape result above. Unlike computeContainFitSize, there's no
+    // internal box-orientation swap to get right or wrong -- the formula
+    // has no pairing between the source's shape and anything else, so
+    // transposing the input just transposes the output.
+    expect(computeMosaicFrameSize({ width: 500, height: 700 }, 100)).toEqual({
+      width: 100,
+      height: 140,
+    });
+  });
+
+  it("rounds the long axis independently when the scale doesn't divide evenly, while the short axis lands exactly on shortSide", () => {
+    // 37x82 (portrait): min is width (37). scale = 41/37 = 1.108108...
+    // width = 37*scale = 41 exactly (always true of the short axis: min *
+    // (shortSide/min) == shortSide, modulo float noise that doesn't land
+    // here). height = 82*scale = 90.864864... -- Math.round takes it to
+    // 91, independent of the (exact) width computation.
+    expect(computeMosaicFrameSize({ width: 37, height: 82 }, 41)).toEqual({
+      width: 41,
+      height: 91,
+    });
+  });
+
+  it("scales a square source uniformly on both axes", () => {
+    expect(computeMosaicFrameSize({ width: 500, height: 500 }, 125)).toEqual({
+      width: 125,
+      height: 125,
+    });
   });
 });

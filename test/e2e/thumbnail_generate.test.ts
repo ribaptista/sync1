@@ -106,8 +106,15 @@ describe("generateImageThumbnail (real convert)", () => {
 });
 
 describe("generateVideoMosaic (real ffmpeg)", () => {
-  it("generates a mosaic JPEG sized exactly rows*tileWidth by columns*tileHeight", async () => {
+  it("generates a mosaic JPEG sized exactly rows*frameHeight by columns*frameWidth", async () => {
     const destPath = path.join(mkTempDir(), "mosaic.jpg");
+    // tiny.mp4 is 32x24 (landscape, min dimension 24). tileSize 12 (the old
+    // fixture's tileHeight, its box's own short side) reuses the same
+    // effective scale the old fixed-box fixture exercised: scale =
+    // 12/24 = 0.5, frame = {width: round(32*0.5)=16, height:
+    // round(24*0.5)=12} -- identical to the old {tileWidth:16,
+    // tileHeight:12} box, so the composited mosaic size is unchanged from
+    // before this rename: 2 cols * 16 = 32, 2 rows * 12 = 24.
     await realThumbnailGenerator.generateVideoMosaic(
       {
         sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
@@ -117,8 +124,7 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
         durationSeconds: 2,
         tileRowCount: 2,
         tileColumnCount: 2,
-        tileWidth: 16,
-        tileHeight: 12,
+        tileSize: 12,
         jpegQuality: 80,
       },
       silentLogger,
@@ -134,6 +140,17 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
       .readdirSync(os.tmpdir())
       .filter((n) => n.startsWith("sync1-mosaic-"));
 
+    // tileSize 10 reuses the old fixture's tileWidth/tileHeight (both 10,
+    // a square box) as the single shorter-side target. Source 32x24: min
+    // dimension is height (24), scale = 10/24 = 0.41666...  frame.height =
+    // round(24*0.41666...) = 10 exactly (the short axis always lands
+    // exactly on tileSize); frame.width = round(32*0.41666...) =
+    // round(13.333...) = 13. This genuinely changes the composited size
+    // from the old fixed-box result: the old {tileWidth:10, tileHeight:10}
+    // square box letterboxed (via `pad`) the fit-to-{10,8} frame up to
+    // 10x10, giving 3*10=30 wide; the new no-pad scheme has no box to pad
+    // into, so the frame keeps its own 13-wide shape and the mosaic comes
+    // out 3*13=39 wide, 1*10=10 tall.
     await realThumbnailGenerator.generateVideoMosaic(
       {
         sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
@@ -143,8 +160,7 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
         durationSeconds: 2,
         tileRowCount: 1,
         tileColumnCount: 3,
-        tileWidth: 10,
-        tileHeight: 10,
+        tileSize: 10,
         jpegQuality: 50,
       },
       silentLogger,
@@ -156,6 +172,6 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
     expect(tmpEntriesAfter.length).toBe(tmpEntriesBefore.length);
 
     const probed = await realMediaProber.detectMedia(destPath);
-    expect(probed).toEqual({ kind: "image", mimeType: "image/jpeg", width: 30, height: 10 });
+    expect(probed).toEqual({ kind: "image", mimeType: "image/jpeg", width: 39, height: 10 });
   });
 });

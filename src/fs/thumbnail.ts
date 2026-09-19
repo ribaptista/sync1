@@ -242,13 +242,7 @@ async function generateForDecision(
         durationSeconds: decision.probed.durationSeconds,
         tileRowCount: policy.tileRowCount,
         tileColumnCount: policy.tileColumnCount,
-        // GenerateVideoMosaicInput still takes an independent
-        // tileWidth/tileHeight box -- it collapses to a single tileSize
-        // only once thumbnail-generate.ts itself is rewritten (a later,
-        // out-of-scope task). A policy no longer configures the box's two
-        // dimensions independently, so its one tileSize feeds both.
-        tileWidth: policy.tileSize,
-        tileHeight: policy.tileSize,
+        tileSize: policy.tileSize,
         jpegQuality: policy.jpegQuality,
       },
       logger,

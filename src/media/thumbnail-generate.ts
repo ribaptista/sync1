@@ -58,6 +58,26 @@ export function computeContainFitSize(source: Dimensions, box: Dimensions): Dime
   };
 }
 
+/**
+ * Computes the frame size for one mosaic tile: `shortSide` is a policy's
+ * configured `tileSize`, the pixel length of a tile's *shorter* side --
+ * scale is derived from whichever of `source`'s own dimensions is smaller,
+ * and both axes are scaled by that same factor, so the long side falls out
+ * of `source`'s own aspect ratio rather than being configured directly.
+ * Deliberately has no orientation concept at all (no portrait/landscape
+ * branch, unlike `computeContainFitSize` above) -- every frame sampled from
+ * one video shares that video's aspect ratio, so there's no "declared box
+ * vs. source orientation" pairing left to get wrong, structurally, not by
+ * convention.
+ */
+export function computeMosaicFrameSize(source: Dimensions, shortSide: number): Dimensions {
+  const scale = shortSide / Math.min(source.width, source.height);
+  return {
+    width: Math.max(1, Math.round(source.width * scale)),
+    height: Math.max(1, Math.round(source.height * scale)),
+  };
+}
+
 /** Thrown for a per-file generation failure (bad/corrupt source, unsupported output format, etc.) -- non-fatal, caller logs and skips this file. */
 export class ThumbnailGenerationError extends Error {
   constructor(message: string) {
@@ -183,8 +203,8 @@ export interface GenerateVideoMosaicInput {
   durationSeconds: number;
   tileRowCount: number;
   tileColumnCount: number;
-  tileWidth: number;
-  tileHeight: number;
+  /** One tile's shorter-side target in pixels -- see `computeMosaicFrameSize`; the longer side is derived, never configured independently. */
+  tileSize: number;
   jpegQuality: number;
 }
 
@@ -196,18 +216,25 @@ function mapJpegQualityToFfmpegQScale(jpegQuality: number): number {
 /**
  * Samples `tileRowCount * tileColumnCount` frames at evenly-spaced,
  * center-of-bucket timestamps (deliberately avoiding literal first/last
- * frames, often black/blank/credits), fits and letterboxes each into an
- * exact `tileWidth x tileHeight` cell (via `computeContainFitSize` plus an
- * ffmpeg `pad`, since the composite grid needs every cell identically
- * sized), then composites the grid via ffmpeg's `xstack` filter into one
- * JPEG. Temp per-frame PNGs are written under a fresh temp dir, always
- * removed in `finally`.
+ * frames, often black/blank/credits), scales each to `frame` (via
+ * `computeMosaicFrameSize`, computed once -- every frame sampled from this
+ * one source shares its aspect ratio, so `frame` is constant across the
+ * whole run, not recomputed per frame), then composites the grid via
+ * ffmpeg's `xstack` filter into one JPEG. No `pad`: since every sampled
+ * frame already lands on `frame`'s exact dimensions (same source, same
+ * aspect ratio, same scale), there's no leftover space to letterbox --
+ * unlike the fixed-box mosaic design this replaced, which needed `pad`
+ * precisely because a declared tile box could disagree with the source's
+ * own orientation. `-autorotate 1` is passed explicitly rather than relying
+ * on ffmpeg's own default (on since ~4.4, unconfirmed as pinned anywhere in
+ * this project) -- see `docs/architecture/thumbnails.md`. Temp per-frame
+ * PNGs are written under a fresh temp dir, always removed in `finally`.
  */
 async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logger): Promise<void> {
   const tileCount = input.tileRowCount * input.tileColumnCount;
-  const fit = computeContainFitSize(
+  const frame = computeMosaicFrameSize(
     { width: input.sourceWidth, height: input.sourceHeight },
-    { width: input.tileWidth, height: input.tileHeight },
+    input.tileSize,
   );
 
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "sync1-mosaic-"));
@@ -220,6 +247,13 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logg
         "ffmpeg",
         [
           "-y",
+          // Bare flag, no value: confirmed empirically that this build's
+          // CLI treats "-autorotate 1" as two separate tokens (the boolean
+          // flag, then a stray "1" ffmpeg then tries to apply to the
+          // *output* file, erroring "input option ... applied to output
+          // url"), unlike e.g. "-tile-rows <n>"-style options. Mirrors
+          // "-noautorotate" (also bare) used elsewhere for fixture setup.
+          "-autorotate",
           "-ss",
           timestampSeconds.toFixed(3),
           "-i",
@@ -229,7 +263,7 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logg
           "-update",
           "1",
           "-vf",
-          `scale=${fit.width}:${fit.height},pad=${input.tileWidth}:${input.tileHeight}:(ow-iw)/2:(oh-ih)/2:color=black`,
+          `scale=${frame.width}:${frame.height}`,
           framePath,
         ],
         "ffmpeg (frame extraction)",
@@ -242,7 +276,7 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logg
       .map((_, i) => {
         const row = Math.floor(i / input.tileColumnCount);
         const col = i % input.tileColumnCount;
-        return `${col * input.tileWidth}_${row * input.tileHeight}`;
+        return `${col * frame.width}_${row * frame.height}`;
       })
       .join("|");
 
