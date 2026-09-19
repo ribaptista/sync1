@@ -9,7 +9,11 @@ import {
   ThumbnailPoliciesRepository,
   type ThumbnailPolicyCreateInput,
 } from "../../../src/db/repositories/thumbnail-policies-repository.js";
-import { scanThumbnails, type ThumbnailScanStats } from "../../../src/fs/thumbnail.js";
+import {
+  scanThumbnails,
+  isUnderThumbnailDir,
+  type ThumbnailScanStats,
+} from "../../../src/fs/thumbnail.js";
 import type { MediaProber, ProbedMedia } from "../../../src/media/probe.js";
 import {
   ThumbnailGenerationError,
@@ -159,6 +163,30 @@ const CR2_IMAGE: ProbedMedia = {
   width: 3906,
   height: 2602,
 };
+
+describe("isUnderThumbnailDir", () => {
+  it("is true for a file directly inside a root-level _thumbnail/ dir", () => {
+    expect(isUnderThumbnailDir("_thumbnail/photo.jpg.p1-iw16-ih16-q80.abc.jpg")).toBe(true);
+  });
+
+  it("is true for a file inside a nested _thumbnail/ dir", () => {
+    expect(isUnderThumbnailDir("Photos/2024/_thumbnail/photo.jpg.p1-iw16-ih16-q80.abc.jpg")).toBe(
+      true,
+    );
+  });
+
+  it("is false for an ordinary file with no _thumbnail segment at all", () => {
+    expect(isUnderThumbnailDir("Photos/2024/photo.jpg")).toBe(false);
+  });
+
+  it("is false when _thumbnail only appears as part of a longer segment name, not as its own segment", () => {
+    expect(isUnderThumbnailDir("my_thumbnail_archive/photo.jpg")).toBe(false);
+  });
+
+  it("is true for the _thumbnail directory entry itself", () => {
+    expect(isUnderThumbnailDir("_thumbnail")).toBe(true);
+  });
+});
 
 describe("scanThumbnails", () => {
   it("reports up-to-date when an existing thumbnail's hash matches cache.db's current hash", async () => {

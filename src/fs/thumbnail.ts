@@ -46,7 +46,13 @@ export interface ThumbnailScanStats {
   errors: number;
 }
 
-const THUMBNAIL_DIR_NAME = "_thumbnail";
+/** Exported for `stubify.ts`: the thumbnail dir's name is hardcoded, so `stubify` can exclude it automatically -- see `isUnderThumbnailDir`. */
+export const THUMBNAIL_DIR_NAME = "_thumbnail";
+
+/** True for any path with a `_thumbnail` path segment anywhere in it, not just a direct child -- e.g. both `_thumbnail/photo.jpg...jpg` and `sub/_thumbnail/photo.jpg...jpg`. */
+export function isUnderThumbnailDir(relativePath: string): boolean {
+  return relativePath.split("/").includes(THUMBNAIL_DIR_NAME);
+}
 
 /**
  * Encodes a policy's raw *configured* generation parameters (never a

@@ -139,6 +139,63 @@ describe("materialize / stubify", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  it("stubify never touches a _thumbnail/ file, even under a broad glob that would otherwise match it", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    fs.writeFileSync(path.join(root, "photo.jpg"), "the real original");
+    fs.mkdirSync(path.join(root, "_thumbnail"));
+    // A thumbnail is never generated *for itself*, but its on-disk shape
+    // is indistinguishable from any other tracked file to a plain glob
+    // scan -- what actually excludes it is isUnderThumbnailDir, not
+    // anything about the glob pattern used here.
+    fs.writeFileSync(
+      path.join(root, "_thumbnail", "photo.jpg.p1-iw16-ih16-q80.abc123.jpg"),
+      "preview bytes",
+    );
+    await runCli(["sync", "--root", root, "--json"], { env: { SYNC1_PASSWORD: PASSWORD } });
+
+    const stubify = await runCli(["stubify", "**/*", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(stubify.exitCode).toBe(0);
+    const parsed = JSON.parse(stubify.stdout) as {
+      ok: boolean;
+      stubified: number;
+      thumbnail_dir_excluded: number;
+      skipped: unknown[];
+    };
+    expect(parsed).toMatchObject({ ok: true, stubified: 1, thumbnail_dir_excluded: 1 });
+
+    // The original got stubified as expected...
+    expect(fs.existsSync(path.join(root, "photo.jpg"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "photo.jpg.stub"))).toBe(true);
+    // ...but the thumbnail file was never touched -- still real, no stub
+    // ever written for it.
+    expect(
+      fs.existsSync(path.join(root, "_thumbnail", "photo.jpg.p1-iw16-ih16-q80.abc123.jpg")),
+    ).toBe(true);
+    expect(
+      fs.existsSync(path.join(root, "_thumbnail", "photo.jpg.p1-iw16-ih16-q80.abc123.jpg.stub")),
+    ).toBe(false);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   it("stubify refuses a file with uncommitted local changes", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
     const bucket = await createFreshBucket(s3);

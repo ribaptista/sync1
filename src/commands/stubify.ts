@@ -50,11 +50,13 @@ export function registerStubifyCommand(program: Command): void {
             ok: stats.skipped.length === 0,
             stubified: stats.stubified,
             already_stub: stats.alreadyStub,
+            thumbnail_dir_excluded: stats.thumbnailDirExcluded,
             skipped: stats.skipped,
           });
         } else {
           process.stdout.write(
-            `stubify: ${stats.stubified} stubified, ${stats.alreadyStub} already stub\n`,
+            `stubify: ${stats.stubified} stubified, ${stats.alreadyStub} already stub, ` +
+              `${stats.thumbnailDirExcluded} thumbnail dir excluded\n`,
           );
           for (const s of stats.skipped) process.stdout.write(`  skipped ${s.path}: ${s.reason}\n`);
         }

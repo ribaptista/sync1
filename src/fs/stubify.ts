@@ -6,6 +6,7 @@ import {
   type CacheEntryRow,
 } from "../db/repositories/cache-entries-repository.js";
 import { writeStubAtomic, stubPathFor } from "./stub.js";
+import { isUnderThumbnailDir } from "./thumbnail.js";
 import { BoundedTaskTracker } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
 import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
@@ -18,6 +19,17 @@ export interface StubifySkip {
 export interface StubifyStats {
   stubified: number;
   alreadyStub: number;
+  /**
+   * Glob-matched rows under a `_thumbnail/` dir, excluded automatically --
+   * never counted under `skipped`, since that array is for genuine per-file
+   * anomalies worth enumerating one by one, while this is a systemic,
+   * expected, potentially-high-volume exclusion (every thumbnail a vault
+   * has, if `glob` is broad) -- more like a plain ignored-style counter
+   * than a per-file skip reason. A thumbnail is a preview of a
+   * *non-materialized* original; stubifying it would defeat its entire
+   * purpose.
+   */
+  thumbnailDirExcluded: number;
   skipped: StubifySkip[];
 }
 
@@ -39,6 +51,13 @@ export interface StubifyStats {
  * Crash-safety mirrors materialize's, in reverse: the stub is written
  * (atomically, via tmp + rename) *before* the real file is deleted, so an
  * interrupted stubify also lands in the safe "both exist" state.
+ *
+ * A glob-matched row under a `_thumbnail/` dir is always excluded,
+ * automatically -- there's no flag to remember, since the thumbnail dir
+ * name is hardcoded (`isUnderThumbnailDir`, from thumbnail.ts). A
+ * thumbnail exists specifically to preview an original a user has chosen
+ * not to keep materialized locally; stubifying the thumbnail itself would
+ * defeat that.
  */
 export async function stubifyGlob(
   root: string,
@@ -49,7 +68,12 @@ export async function stubifyGlob(
   maxInFlightHashes: number,
   onProgress?: OnProgress,
 ): Promise<StubifyStats> {
-  const stats: StubifyStats = { stubified: 0, alreadyStub: 0, skipped: [] };
+  const stats: StubifyStats = {
+    stubified: 0,
+    alreadyStub: 0,
+    thumbnailDirExcluded: 0,
+    skipped: [],
+  };
   const hashJobs = new BoundedTaskTracker(maxInFlightHashes);
 
   // filesDone/filesTotal track every glob-matched row (mirroring this
@@ -82,6 +106,14 @@ export async function stubifyGlob(
  * dispatch branch made "did I call rowResolved() on every exit" hard to
  * eyeball inline when it was all one loop body. Five explicit, obvious
  * call sites beat one easy-to-miss flag.
+ *
+ * The `_thumbnail/`-exclusion check sits after the file-type check
+ * (unlike ordinary stubify skips, this needs no rehash or existence
+ * check at all) specifically so it only ever counts *file* rows -- a
+ * `_thumbnail` directory row itself already exits above, uncounted by
+ * any stat, same as any other directory; counting it under
+ * `thumbnailDirExcluded` too would inflate that number with entries that
+ * were never stubify candidates in the first place.
  */
 async function processRow(
   row: CacheEntryRow,
@@ -94,6 +126,11 @@ async function processRow(
   progress: ProgressTracker,
 ): Promise<void> {
   if (row.type !== "file") {
+    progress.rowResolved();
+    return;
+  }
+  if (isUnderThumbnailDir(row.path)) {
+    stats.thumbnailDirExcluded++;
     progress.rowResolved();
     return;
   }
