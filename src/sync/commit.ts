@@ -125,7 +125,19 @@ export async function performSync(
   // forwarding outward. `advanceBase()` folds the just-finished phase's
   // last reported update into `base` and resets the tracker for the next
   // phase to start from zero again.
-  let base: ProgressUpdate = { filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0 };
+  const ZERO_PHASE: ProgressUpdate = {
+    filesDone: 0,
+    filesTotal: 0,
+    bytesDone: 0,
+    bytesTotal: 0,
+    // Never true for the stitched total, however confidently an individual
+    // phase settles its own: phases 2 and 3 operate on sets that don't
+    // exist until phase 1 has finished, so the combined denominator is
+    // genuinely unknowable while the run is in progress and must keep
+    // rendering as approximate.
+    totalsFinal: false,
+  };
+  let base: ProgressUpdate = ZERO_PHASE;
   let lastPhaseUpdate: ProgressUpdate = base;
   const phaseProgress: OnProgress = (u) => {
     lastPhaseUpdate = u;
@@ -134,6 +146,7 @@ export async function performSync(
       filesTotal: base.filesTotal + u.filesTotal,
       bytesDone: base.bytesDone + u.bytesDone,
       bytesTotal: base.bytesTotal + u.bytesTotal,
+      totalsFinal: false,
       // Passed through verbatim, never summed with anything from `base` --
       // it's a per-file label, not a numeric tally. Also never carried
       // across advanceBase() below: each phase builds its own tracker with
@@ -150,8 +163,9 @@ export async function performSync(
       filesTotal: base.filesTotal + lastPhaseUpdate.filesTotal,
       bytesDone: base.bytesDone + lastPhaseUpdate.bytesDone,
       bytesTotal: base.bytesTotal + lastPhaseUpdate.bytesTotal,
+      totalsFinal: false,
     };
-    lastPhaseUpdate = { filesDone: 0, filesTotal: 0, bytesDone: 0, bytesTotal: 0 };
+    lastPhaseUpdate = ZERO_PHASE;
   };
 
   try {

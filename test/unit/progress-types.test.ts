@@ -183,4 +183,96 @@ describe("createProgressTracker", () => {
     tracker.rowDiscovered();
     expect(onProgress).toHaveBeenCalledTimes(1);
   });
+
+  it("totals start out provisional and only an estimate marked final says otherwise", () => {
+    const updates: { totalsFinal: boolean }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["hashing", "hashed"]);
+
+    tracker.rowDiscovered();
+    expect(updates.at(-1)?.totalsFinal).toBe(false);
+
+    tracker.setEstimatedTotals({ files: 10, bytes: 1000 });
+    expect(updates.at(-1)?.totalsFinal).toBe(false);
+
+    tracker.setEstimatedTotals({ files: 10, bytes: 1000, final: true });
+    expect(updates.at(-1)?.totalsFinal).toBe(true);
+  });
+
+  it("an estimate raises the emitted totals above what's been observed so far", () => {
+    const updates: { filesTotal: number; bytesTotal: number }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["hashing", "hashed"]);
+
+    tracker.rowDiscovered();
+    tracker.expectBytes(100);
+    expect(updates.at(-1)).toMatchObject({ filesTotal: 1, bytesTotal: 100 });
+
+    // The enumeration pass has run ahead of the real one.
+    tracker.setEstimatedTotals({ files: 50, bytes: 5000 });
+    expect(updates.at(-1)).toMatchObject({ filesTotal: 50, bytesTotal: 5000 });
+  });
+
+  it("observation overtakes an estimate that under-counted, with no correction call needed", () => {
+    const updates: { filesTotal: number; bytesTotal: number }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["hashing", "hashed"]);
+
+    tracker.setEstimatedTotals({ files: 2, bytes: 200 });
+    tracker.rowDiscovered();
+    tracker.rowDiscovered();
+    tracker.rowDiscovered(); // a third row the enumeration pass never saw
+    tracker.expectBytes(500);
+
+    expect(updates.at(-1)).toMatchObject({ filesTotal: 3, bytesTotal: 500 });
+  });
+
+  it("a lowered estimate never drags a total below what's already done", () => {
+    const updates: {
+      filesDone: number;
+      filesTotal: number;
+      bytesDone: number;
+      bytesTotal: number;
+    }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["hashing", "hashed"]);
+
+    tracker.setEstimatedTotals({ files: 100, bytes: 10_000 });
+    tracker.rowDiscovered();
+    tracker.rowResolved();
+    tracker.expectBytes(400);
+    tracker.startFile("a.jpg", 400).finish();
+
+    // Even an absurd revision to zero can't invert done-vs-total: the
+    // observed counters are a floor the estimate is never consulted below.
+    tracker.setEstimatedTotals({ files: 0, bytes: 0 });
+    const last = updates.at(-1)!;
+    expect(last.filesTotal).toBeGreaterThanOrEqual(last.filesDone);
+    expect(last.bytesTotal).toBeGreaterThanOrEqual(last.bytesDone);
+    expect(last).toMatchObject({ filesTotal: 1, bytesTotal: 400 });
+  });
+
+  it("settle() lands on the observed truth when the estimate over-counted", () => {
+    const updates: { filesTotal: number; bytesTotal: number; totalsFinal: boolean }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["hashing", "hashed"]);
+
+    // Enumeration saw 10 files / 1000 bytes; the run only ever found 8/800
+    // (two vanished between the two passes).
+    tracker.setEstimatedTotals({ files: 10, bytes: 1000 });
+    for (let i = 0; i < 8; i++) tracker.rowDiscovered();
+    tracker.expectBytes(800);
+    expect(updates.at(-1)).toMatchObject({ filesTotal: 10, bytesTotal: 1000 });
+
+    tracker.settle();
+    expect(updates.at(-1)).toMatchObject({ filesTotal: 8, bytesTotal: 800, totalsFinal: true });
+  });
+
+  it("settle() keeps the observed total when the estimate under-counted", () => {
+    const updates: { filesTotal: number; bytesTotal: number }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["hashing", "hashed"]);
+
+    tracker.setEstimatedTotals({ files: 1, bytes: 10 });
+    tracker.rowDiscovered();
+    tracker.rowDiscovered();
+    tracker.expectBytes(900);
+
+    tracker.settle();
+    expect(updates.at(-1)).toMatchObject({ filesTotal: 2, bytesTotal: 900 });
+  });
 });

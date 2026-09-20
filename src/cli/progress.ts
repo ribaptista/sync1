@@ -17,14 +17,31 @@ export function shouldShowProgress(opts: ShouldShowProgressOptions): boolean {
 }
 
 export interface ProgressSession {
-  setOverallTotal(total: number): void;
+  /**
+   * Grows the total, or -- with `final` -- sets it outright. Grow-only is
+   * the right default for a total discovered by a running scan (it only
+   * ever climbs); `final` is for a total that was *counted* rather than
+   * discovered, which may legitimately come in lower than a provisional
+   * figure already on screen. Clamped to never land below what's already
+   * done, so an over-count corrected at the end can't render past 100%.
+   */
+  setOverallTotal(total: number, opts?: { final?: boolean }): void;
   advanceOverall(n?: number): void;
+  /**
+   * Sets the current position outright, for a producer that already
+   * tracks its own running tally (a pool whose jobs complete out of
+   * order, say). The delta-based `advanceOverall` is the wrong primitive
+   * there -- turning an absolute count back into deltas at the call site
+   * is bookkeeping that exists only to be got wrong.
+   */
+  setOverallProgress(value: number): void;
   stop(): void;
 }
 
 class NullProgressSession implements ProgressSession {
   setOverallTotal(): void {}
   advanceOverall(): void {}
+  setOverallProgress(): void {}
   stop(): void {}
 }
 
@@ -32,26 +49,53 @@ class MultiBarProgressSession implements ProgressSession {
   private readonly multibar: MultiBar;
   private readonly overall: SingleBar;
   private overallValue = 0;
+  // Tracked here rather than read back off the bar so the rendered
+  // `{totalLabel}` payload and the bar's own arithmetic total can't drift.
+  private overallTotal = 1;
+  private totalsFinal = false;
 
   constructor(overallLabel: string, overallUnit: string) {
     this.multibar = new MultiBar(
       {
         clearOnComplete: false,
         hideCursor: true,
-        format: `${overallLabel} |{bar}| {value}/{total} ${overallUnit}`,
+        // `{totalLabel}`, not cli-progress's built-in `{total}`: the total
+        // needs a "~" prefix while it's still provisional, and only a
+        // custom payload token can carry one.
+        format: `${overallLabel} |{bar}| {value}/{totalLabel} ${overallUnit}`,
       },
       Presets.shades_classic,
     );
-    this.overall = this.multibar.create(1, 0);
+    // Seeded to 1 (never 0) to avoid a divide-by-zero before the first real
+    // total arrives.
+    this.overall = this.multibar.create(this.overallTotal, 0, {
+      totalLabel: this.totalLabel(),
+    });
   }
 
-  setOverallTotal(total: number): void {
-    if (total > this.overall.getTotal()) this.overall.setTotal(total);
+  private totalLabel(): string {
+    return `${this.totalsFinal ? "" : "~"}${this.overallTotal}`;
+  }
+
+  setOverallTotal(total: number, opts?: { final?: boolean }): void {
+    if (opts?.final === true) {
+      this.totalsFinal = true;
+      this.overallTotal = Math.max(total, this.overallValue);
+    } else if (total > this.overallTotal) {
+      this.overallTotal = total;
+    }
+    this.overall.setTotal(this.overallTotal);
+    this.overall.update(this.overallValue, { totalLabel: this.totalLabel() });
   }
 
   advanceOverall(n = 1): void {
     this.overallValue += n;
-    this.overall.update(this.overallValue);
+    this.overall.update(this.overallValue, { totalLabel: this.totalLabel() });
+  }
+
+  setOverallProgress(value: number): void {
+    this.overallValue = value;
+    this.overall.update(this.overallValue, { totalLabel: this.totalLabel() });
   }
 
   stop(): void {
@@ -97,7 +141,7 @@ export function startProgressSession(opts: {
  * session clearing anything itself.
  */
 export interface BytesProgressSession {
-  setOverallTotals(totals: { files?: number; bytes?: number }): void;
+  setOverallTotals(totals: { files?: number; bytes?: number; final?: boolean }): void;
   setOverallProgress(current: {
     files?: number;
     bytes?: number;
@@ -159,6 +203,7 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
   private filesDone = 0;
   private bytesTotal = 0;
   private bytesDone = 0;
+  private totalsFinal = false;
   private activity: { verb: string; path: string } | undefined;
 
   // How often our state is actually pushed into the underlying bar -- and
@@ -184,7 +229,11 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
       {
         clearOnComplete: false,
         hideCursor: true,
-        format: `${overallLabel} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- ETA {eta_formatted} {activity}`,
+        // `{etaPrefix}` carries the "~" for the ETA the same way
+        // `{filesTotal}`/`{sizeTotal}` carry their own: cli-progress
+        // computes `{eta_formatted}` internally, so the marker has to sit
+        // beside it rather than inside it.
+        format: `${overallLabel} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- {etaPrefix}ETA {eta_formatted} {activity}`,
       },
       Presets.shades_classic,
     );
@@ -232,23 +281,42 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
       return;
     }
     this.lastFlushedAt = now;
+    const approx = this.totalsFinal ? "" : "~";
     this.overall.update(this.bytesDone, {
       filesDone: String(this.filesDone),
-      filesTotal: String(this.filesTotal),
+      filesTotal: approx + String(this.filesTotal),
       sizeDone: prettyBytes(this.bytesDone),
-      sizeTotal: prettyBytes(this.bytesTotal),
+      sizeTotal: approx + prettyBytes(this.bytesTotal),
+      etaPrefix: approx,
       activity: this.activityLabel(),
     });
   }
 
-  setOverallTotals(totals: { files?: number; bytes?: number }): void {
-    if (totals.files !== undefined && totals.files > this.filesTotal) {
-      this.filesTotal = totals.files;
+  setOverallTotals(totals: { files?: number; bytes?: number; final?: boolean }): void {
+    // Grow-only while provisional, absolute once final -- see
+    // ProgressSession.setOverallTotal for why the two differ. Clamped to
+    // `done` so a final total that came in under what already finished
+    // (an enumeration pass that over-counted, then the file vanished)
+    // still can't render the bar past 100%.
+    const becameFinal = totals.final === true && !this.totalsFinal;
+    if (totals.final === true) this.totalsFinal = true;
+
+    if (becameFinal || this.totalsFinal) {
+      if (totals.files !== undefined) this.filesTotal = Math.max(totals.files, this.filesDone);
+      if (totals.bytes !== undefined) this.bytesTotal = Math.max(totals.bytes, this.bytesDone);
+    } else {
+      if (totals.files !== undefined && totals.files > this.filesTotal) {
+        this.filesTotal = totals.files;
+      }
+      if (totals.bytes !== undefined && totals.bytes > this.bytesTotal) {
+        this.bytesTotal = totals.bytes;
+      }
     }
-    if (totals.bytes !== undefined && totals.bytes > this.bytesTotal) {
-      this.bytesTotal = totals.bytes;
-    }
-    this.flush(false);
+    // Forced only on the provisional->final edge, never on an ordinary
+    // revision: the format itself changes there (the "~" disappears), and
+    // a revision-driven force would reintroduce exactly the flood of
+    // `.update()` calls FLUSH_INTERVAL_MS exists to suppress.
+    this.flush(becameFinal);
   }
 
   setOverallProgress(current: {
@@ -288,7 +356,11 @@ export function startBytesProgressSession(opts: {
  */
 export function reporterFor(session: BytesProgressSession): OnProgress {
   return (update: ProgressUpdate) => {
-    session.setOverallTotals({ files: update.filesTotal, bytes: update.bytesTotal });
+    session.setOverallTotals({
+      files: update.filesTotal,
+      bytes: update.bytesTotal,
+      final: update.totalsFinal,
+    });
     session.setOverallProgress({
       files: update.filesDone,
       bytes: update.bytesDone,

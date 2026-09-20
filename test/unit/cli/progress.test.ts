@@ -148,7 +148,7 @@ describe("startBytesProgressSession", () => {
     expect(multibarCreateMock).not.toHaveBeenCalled();
   });
 
-  it("setOverallTotals only grows the bar's total, never shrinks it", () => {
+  it("a provisional setOverallTotals only grows the bar's total, never shrinks it", () => {
     const session = startBytesProgressSession({ show: true, overallLabel: "x" });
     barSetTotalMock.mockClear(); // clear the constructor's own initial render
 
@@ -160,6 +160,59 @@ describe("startBytesProgressSession", () => {
 
     session.setOverallTotals({ bytes: 2000, files: 20 }); // grows
     expect(barSetTotalMock).toHaveBeenLastCalledWith(2000);
+  });
+
+  it("a final setOverallTotals sets the total absolutely, including downward", () => {
+    // The whole point of `final`: an enumeration pass that over-counted
+    // (a file vanished mid-run) has to be able to correct the denominator
+    // down, or the bar stalls just short of 100% forever.
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 1000, files: 10 });
+    barSetTotalMock.mockClear();
+
+    session.setOverallTotals({ bytes: 800, files: 8, final: true });
+    expect(barSetTotalMock).toHaveBeenLastCalledWith(800);
+  });
+
+  it("a final total is still clamped to what's already done, never below it", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+      session.setOverallTotals({ bytes: 1000 });
+      vi.setSystemTime(Date.now() + 100);
+      session.setOverallProgress({ bytes: 900 });
+      barSetTotalMock.mockClear();
+
+      // A nonsense final total below `done` would render past 100%.
+      session.setOverallTotals({ bytes: 400, final: true });
+      expect(barSetTotalMock).toHaveBeenLastCalledWith(900);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops the approximate marker once totals are final", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+      session.setOverallTotals({ bytes: 1000, files: 10 });
+      vi.setSystemTime(Date.now() + 100);
+      session.setOverallProgress({ bytes: 500, files: 5 });
+      expect(barUpdateMock).toHaveBeenLastCalledWith(
+        500,
+        expect.objectContaining({ sizeTotal: `~${prettyBytes(1000)}`, etaPrefix: "~" }),
+      );
+
+      // The provisional->final edge force-flushes: the rendered format
+      // itself changes, so it must not wait out the throttle window.
+      session.setOverallTotals({ bytes: 1000, files: 10, final: true });
+      expect(barUpdateMock).toHaveBeenLastCalledWith(
+        500,
+        expect.objectContaining({ sizeTotal: prettyBytes(1000), etaPrefix: "" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("setOverallProgress sets an absolute value and updates the payload with pretty-printed sizes", () => {
@@ -177,9 +230,11 @@ describe("startBytesProgressSession", () => {
 
       expect(barUpdateMock).toHaveBeenLastCalledWith(1_000_000, {
         filesDone: "5",
-        filesTotal: "10",
+        // "~" because nothing has declared these totals final yet.
+        filesTotal: "~10",
         sizeDone: prettyBytes(1_000_000),
-        sizeTotal: prettyBytes(2_000_000),
+        sizeTotal: `~${prettyBytes(2_000_000)}`,
+        etaPrefix: "~",
         activity: "", // no activity reported yet
       });
     } finally {
@@ -200,9 +255,10 @@ describe("startBytesProgressSession", () => {
       session.setOverallProgress({ bytes: 700 }); // files omitted
       expect(barUpdateMock).toHaveBeenLastCalledWith(700, {
         filesDone: "5", // unchanged from the previous call
-        filesTotal: "10",
+        filesTotal: "~10",
         sizeDone: prettyBytes(700),
-        sizeTotal: prettyBytes(1000),
+        sizeTotal: `~${prettyBytes(1000)}`,
+        etaPrefix: "~",
         activity: "",
       });
     } finally {
@@ -328,6 +384,73 @@ describe("startBytesProgressSession", () => {
   });
 });
 
+describe("startProgressSession", () => {
+  // Same fresh-import dance as startBytesProgressSession above, for the
+  // same vi.resetModules() reason.
+  let startProgressSession: typeof import("../../../src/cli/progress.js").startProgressSession;
+
+  beforeEach(async () => {
+    barUpdateMock.mockClear();
+    barSetTotalMock.mockClear();
+    multibarCreateMock.mockClear();
+    vi.mocked(MultiBar).mockImplementation(
+      () =>
+        ({
+          create: multibarCreateMock,
+          stop: multibarStopMock,
+          remove: multibarRemoveMock,
+        }) as unknown as MultiBar,
+    );
+    ({ startProgressSession } = await import("../../../src/cli/progress.js"));
+  });
+
+  it("setOverallProgress sets the position outright, unlike advanceOverall's delta", () => {
+    const session = startProgressSession({ show: true, overallLabel: "x", overallUnit: "objects" });
+
+    session.advanceOverall(); // delta: 0 -> 1
+    expect(barUpdateMock).toHaveBeenLastCalledWith(1, expect.anything());
+
+    // A pool reporting its own running tally out of order: 7 means 7, not
+    // "seven more than whatever the bar happened to be showing".
+    session.setOverallProgress(7);
+    expect(barUpdateMock).toHaveBeenLastCalledWith(7, expect.anything());
+
+    session.advanceOverall(2); // still a delta, now from 7
+    expect(barUpdateMock).toHaveBeenLastCalledWith(9, expect.anything());
+  });
+
+  it("marks a provisional total with ~ and drops it once the total is final", () => {
+    const session = startProgressSession({ show: true, overallLabel: "x", overallUnit: "objects" });
+
+    session.setOverallTotal(10);
+    expect(barUpdateMock).toHaveBeenLastCalledWith(0, { totalLabel: "~10" });
+
+    session.setOverallTotal(10, { final: true });
+    expect(barUpdateMock).toHaveBeenLastCalledWith(0, { totalLabel: "10" });
+  });
+
+  it("a provisional total only grows, but a final one may correct downward", () => {
+    const session = startProgressSession({ show: true, overallLabel: "x", overallUnit: "objects" });
+
+    session.setOverallTotal(100);
+    session.setOverallTotal(50); // provisional and smaller -- ignored
+    expect(barSetTotalMock).toHaveBeenLastCalledWith(100);
+
+    session.setOverallTotal(50, { final: true });
+    expect(barSetTotalMock).toHaveBeenLastCalledWith(50);
+  });
+
+  it("a final total is clamped to what's already done", () => {
+    const session = startProgressSession({ show: true, overallLabel: "x", overallUnit: "objects" });
+
+    session.setOverallTotal(100);
+    session.setOverallProgress(80);
+    session.setOverallTotal(20, { final: true }); // nonsense -- would render past 100%
+
+    expect(barSetTotalMock).toHaveBeenLastCalledWith(80);
+  });
+});
+
 describe("fitPath", () => {
   it("returns the path unchanged when it fits exactly within budget", () => {
     // columns=100, verb="hashing" (7 chars) -> budget = 100 - 55 - 7 = 38
@@ -372,10 +495,15 @@ describe("reporterFor", () => {
       filesTotal: 10,
       bytesDone: 300,
       bytesTotal: 1000,
+      totalsFinal: false,
       activity: { verb: "uploading", path: "a.jpg" },
     });
 
-    expect(session.setOverallTotals).toHaveBeenCalledWith({ files: 10, bytes: 1000 });
+    expect(session.setOverallTotals).toHaveBeenCalledWith({
+      files: 10,
+      bytes: 1000,
+      final: false,
+    });
     expect(session.setOverallProgress).toHaveBeenCalledWith({
       files: 3,
       bytes: 300,
@@ -390,7 +518,13 @@ describe("reporterFor", () => {
       stop: vi.fn(),
     };
 
-    reporterFor(session)({ filesDone: 1, filesTotal: 1, bytesDone: 0, bytesTotal: 0 });
+    reporterFor(session)({
+      filesDone: 1,
+      filesTotal: 1,
+      bytesDone: 0,
+      bytesTotal: 0,
+      totalsFinal: false,
+    });
 
     expect(session.setOverallProgress).toHaveBeenCalledWith({
       files: 1,

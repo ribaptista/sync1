@@ -557,7 +557,15 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     // Two updates now, not one: rowDiscovered() and rowResolved() each emit
     // their own update, even for a delete (fully synchronous, no byte work
     // at all) -- the last one is what matters, and equals the final tally.
-    expect(updates.at(-1)).toEqual({ filesDone: 1, filesTotal: 1, bytesDone: 0, bytesTotal: 0 });
+    expect(updates.at(-1)).toEqual({
+      filesDone: 1,
+      filesTotal: 1,
+      bytesDone: 0,
+      bytesTotal: 0,
+      // Provisional: this phase never enumerated ahead of itself, so
+      // nothing ever declared its totals exact.
+      totalsFinal: false,
+    });
     // The regression test for the discovered/resolved split itself: every
     // row -- even a synchronous one like this delete -- passes through a
     // real intermediate state where it's been counted as discovered but not

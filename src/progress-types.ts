@@ -31,6 +31,13 @@ export interface ProgressUpdate {
   bytesDone: number;
   bytesTotal: number;
   /**
+   * False while either total is still a projection an enumeration pass
+   * supplied and the run might yet contradict; true once the totals are
+   * the run's own observed truth. Renderers use it to mark the total (and
+   * the ETA derived from it) as approximate -- see `src/cli/progress.ts`.
+   */
+  totalsFinal: boolean;
+  /**
    * The most recent per-file event this tracker observed, already resolved
    * to its word (e.g. `{ verb: "hashing", path: "a.jpg" }`) -- rendered
    * verbatim by the bar, which carries no vocabulary of its own. Absent
@@ -108,6 +115,32 @@ export interface ProgressTracker {
    * `FileTracker` for reporting that file's progress and completion.
    */
   startFile(path: string, size: number): FileTracker;
+  /**
+   * A projection of this run's eventual totals, from an enumeration pass
+   * that counted the work without doing any of it -- absolute, not a
+   * delta, and free to move in *either* direction as that pass revises
+   * itself. Safe to lower precisely because it's kept separate from the
+   * observed counters above rather than overwriting them: every emitted
+   * total is `max(observed, estimated)`, and `observed >= done` already
+   * holds by construction, so no estimate -- however wrong, even zero --
+   * can ever drag a total below what's already finished. An estimate is
+   * therefore never load-bearing for correctness, only for usefulness,
+   * which is what makes it safe to feed from a concurrent pass nobody is
+   * verifying.
+   *
+   * `final: true` means "this is exact, not a projection" -- for the
+   * commands that can count their work outright (a SQL count, say) with
+   * nothing left to revise.
+   */
+  setEstimatedTotals(totals: { files?: number; bytes?: number; final?: boolean }): void;
+  /**
+   * The run is over, so whatever it actually observed *is* the truth:
+   * drops any remaining estimate and marks the totals final. Call it from
+   * a `finally` -- it's what makes a run end at exactly 100% when the
+   * enumeration pass over- or under-counted because the tree shifted
+   * underneath it, instead of stalling at 99.7% forever.
+   */
+  settle(): void;
 }
 
 /**
@@ -125,24 +158,33 @@ export function createProgressTracker(
   verbs: ActivityVerbs,
 ): ProgressTracker {
   let filesDone = 0;
-  let filesTotal = 0;
-  let bytesTotal = 0;
+  // "observed*" is what this run has actually seen and is grow-only, as it
+  // always was; the "estimated*" pair is the separate projection channel
+  // described on setEstimatedTotals. Emitting max() of the two is the whole
+  // reason a projection may be revised downward without the bar ever
+  // rendering a total below `done`.
+  let observedFiles = 0;
+  let observedBytes = 0;
+  let estimatedFiles = 0;
+  let estimatedBytes = 0;
+  let totalsFinal = false;
   let completedBytes = 0;
   let inFlightBytes = 0;
 
   function emit(activity?: { verb: string; path: string }): void {
     onProgress?.({
       filesDone,
-      filesTotal,
+      filesTotal: Math.max(observedFiles, estimatedFiles),
       bytesDone: completedBytes + inFlightBytes,
-      bytesTotal,
+      bytesTotal: Math.max(observedBytes, estimatedBytes),
+      totalsFinal,
       activity,
     });
   }
 
   return {
     rowDiscovered() {
-      filesTotal++;
+      observedFiles++;
       emit();
     },
     rowResolved() {
@@ -150,7 +192,22 @@ export function createProgressTracker(
       emit();
     },
     expectBytes(size) {
-      bytesTotal += size;
+      observedBytes += size;
+      emit();
+    },
+    setEstimatedTotals(totals) {
+      if (totals.files !== undefined) estimatedFiles = totals.files;
+      if (totals.bytes !== undefined) estimatedBytes = totals.bytes;
+      // Only ever latches on: a total that has been declared exact can't
+      // become provisional again, and `settle()` below is the only other
+      // way in.
+      if (totals.final === true) totalsFinal = true;
+      emit();
+    },
+    settle() {
+      estimatedFiles = observedFiles;
+      estimatedBytes = observedBytes;
+      totalsFinal = true;
       emit();
     },
     startFile(path, size) {
