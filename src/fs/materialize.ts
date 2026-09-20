@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
 import type PQueue from "p-queue";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
@@ -14,6 +13,7 @@ import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { stubPathFor } from "./stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "./decrypt-to-file.js";
+import { inTreeTempPath } from "./temp-path.js";
 import { waitForRoom } from "../concurrency/pools.js";
 import { createProgressTracker, type OnProgress } from "../progress-types.js";
 
@@ -207,7 +207,7 @@ export async function materializeGlob(
                   }
 
                   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-                  const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+                  const tmpPath = inTreeTempPath(absolutePath);
                   let computedHash: string;
                   try {
                     computedHash = await decryptStreamToFile(

@@ -73,10 +73,39 @@ stderr ("may leave the vault in an unfinished state"), best-effort-delete whatev
 itself_ holds, and `process.exit(128 + signum)`. There is deliberately no draining of in-flight pool work
 and nothing else is awaited — per the explicit design goal, a user hitting Ctrl+C shouldn't have to think
 about "is it safe to interrupt this," only "did it warn me, and is the lock gone so I can retry." A
-half-finished operation (a stub materialized but not yet renamed into place, a mid-upload connection cut)
-is always left in a state the next `update_cache`/`sanity_check` can detect and reconcile — that's a
-property of the surrounding stub/materialize/sync design (see
+half-finished operation _in the working tree_ (a stub materialized but not yet renamed into place, a
+mid-upload connection cut) is always left in a state the next `update_cache`/`sanity_check` can detect
+and reconcile — that's a property of the surrounding stub/materialize/sync design (see
 [stub-files.md](stub-files.md)), not something the signal handler itself needs to guarantee.
+
+Two other kinds of leftovers from a killed `process.exit()` — no `finally` runs on the way out — are
+_not_ self-healing the same way, and needed their own fix:
+
+- **A `.sync1/`-internal temp DB.** `commit.ts`'s CAS commit (and the generic mutate-with-retry helper,
+  `gc`'s orphan staging, `update_cache`'s own staging pass) all write to a `tempSiblingPath` sibling —
+  `state.db.candidate-<hex>`, `state.db.remote-fresh-<hex>`, `cache.db.update-cache-staging-<hex>`, and
+  so on — deleted in a `finally` that Ctrl+C skips. Nothing else in the codebase ever revisits these
+  filenames, so they'd otherwise sit there permanently. `sweepStaleTempFiles` (`src/fs/temp-path.ts`) —
+  called from `src/cli.ts`'s `preAction` hook, right after `acquireLock()` succeeds and before any
+  command-specific code runs — removes every file in `.sync1/` matching the shape `tempSiblingPath`
+  produces (including a `-shm`/`-wal` sidecar, for one caught mid-WAL-checkpoint). Safe specifically
+  _because_ it only ever runs once the lock is confirmed held: that's what guarantees every such file is
+  trash from a past, no-longer-running attempt, never a live sibling some other process still owns.
+- **An in-tree download/stub-write temp.** `apply-remote-changes.ts`, `materialize.ts`, and `stub.ts` all
+  write to an `inTreeTempPath` sibling (`<file>.sync1-tmp-<hex>`) right next to the real destination,
+  renamed into place only on success. Unlike the `.sync1/`-internal case, this one _is_ self-healing on
+  its own (nothing ever references the half-written temp again, and the next run's own logic doesn't
+  depend on it) — the actual bug was that the walker never excluded it at all (only literal `.sync1` at
+  the root was ever excluded), so a leftover used to be picked up by the next `update_cache` as a
+  genuine new file and synced. `walk()` (`src/fs/walker.ts`) now excludes any name matching
+  `inTreeTempPath`'s own shape, at any depth — not swept or deleted, just never reported as a tracked
+  path, so it's harmless clutter rather than phantom content.
+
+This also fixed a real bug in the lock acquisition itself, found while wiring the sweep in: `preAction`
+used to check the _raw_ `--root` flag directly and silently skip locking altogether (no error) when it
+was omitted — exactly the common case `--root`'s ancestor-lookup default (`resolveRoot`, see
+`docs/cli/`) exists to support. It now resolves the same way every command's own action handler does,
+before acquiring the lock.
 
 The stderr write uses `fs.writeSync(2, ...)`, not `process.stderr.write(...)` — a stderr write to a
 pipe/socket is documented as _asynchronous_ on POSIX, so the `process.exit()` right after could otherwise

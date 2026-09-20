@@ -1,5 +1,6 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { isInTreeTempName } from "./temp-path.js";
 
 export type WalkEntryType = "file" | "dir";
 /** Which physical form currently backs this logical path; always "real" for directories. */
@@ -53,7 +54,9 @@ interface SortItem {
  * marker", sort key = name + "/"), sorted together with sibling file names,
  * with recursion happening exactly at the marker's position.
  *
- * Skips `.sync1` at the root (the tool's own bookkeeping directory).
+ * Skips `.sync1` at the root (the tool's own bookkeeping directory), and skips any file matching
+ * `inTreeTempPath`'s own shape at any depth (an in-tree download/stub-write temp, left behind
+ * next to its real destination by a run interrupted before it could rename/clean up).
  */
 export async function* walk(
   root: string,
@@ -72,6 +75,12 @@ async function* walkDir(
   const logical = new Map<string, LogicalFileInfo>();
   for (const dirent of dirents) {
     if (relativeDir === "" && excludeAtRoot.has(dirent.name)) continue;
+    // Not a root-only exclusion, unlike the one above: an in-tree download/
+    // stub-write temp (inTreeTempPath, src/fs/temp-path.ts) lands right
+    // next to its real destination, at whatever depth that is -- one left
+    // behind by an interrupted run used to be picked up here as a genuine
+    // new file and synced, since only ".sync1" itself was ever excluded.
+    if (!dirent.isDirectory() && isInTreeTempName(dirent.name)) continue;
 
     if (!dirent.isDirectory() && dirent.name.endsWith(STUB_SUFFIX)) {
       const logicalName = dirent.name.slice(0, -STUB_SUFFIX.length);

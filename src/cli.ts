@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import fs from "node:fs";
-import path from "node:path";
 import { Command } from "commander";
 import { registerInitRemoteCommand } from "./commands/init_remote.js";
 import { registerAttachRemoteCommand } from "./commands/attach_remote.js";
@@ -20,6 +19,9 @@ import { registerStatusCommand } from "./commands/status.js";
 import { registerConvergeCommand } from "./commands/converge.js";
 import { acquireLock, forceReleaseActiveLockSync, type LockHandle } from "./vault/lock.js";
 import { emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "./cli/output.js";
+import { resolveRoot } from "./cli/resolve-root.js";
+import { sync1Dir } from "./vault/local-dir.js";
+import { sweepStaleTempFiles } from "./fs/temp-path.js";
 
 const program = new Command();
 
@@ -33,8 +35,24 @@ let currentLock: LockHandle | undefined;
 program.hook("preAction", (_thisCommand, actionCommand) => {
   if (LOCK_EXEMPT_COMMANDS.has(actionCommand.name())) return;
   const opts = actionCommand.opts() as { root?: string };
-  if (!opts.root) return; // defensive: every command that needs the lock also requires --root
-  currentLock = acquireLock(path.resolve(opts.root));
+  // resolveRoot, not a bare path.resolve(opts.root): --root is optional
+  // (an omitted one walks up for the nearest ancestor .sync1/), and this
+  // used to check the *raw* flag directly -- silently skipping the lock
+  // entirely (no error, just `return`) for exactly the common case that
+  // convenience exists for. Every command still re-resolves its own root
+  // independently inside its own action handler (this doesn't remove
+  // that); the redundancy is a cheap fs.existsSync check, not a
+  // correctness concern, and is what keeps this hook decoupled from
+  // every individual command's own signature.
+  const root = resolveRoot(opts.root);
+  currentLock = acquireLock(root);
+  // Safe here specifically because acquireLock() above just succeeded:
+  // holding the lock guarantees every tempSiblingPath-shaped file already
+  // in .sync1/ is leftover from a past, no-longer-running attempt, never
+  // a live sibling another process still owns. Runs before any
+  // command-specific code -- which might create its own fresh temp files
+  // under the same naming scheme -- ever does.
+  sweepStaleTempFiles(sync1Dir(root));
 });
 
 program.hook("postAction", (_thisCommand, actionCommand) => {

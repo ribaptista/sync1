@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import { randomBytes } from "node:crypto";
 import {
   formatTaggedHash,
   parseTaggedHash,
@@ -7,6 +6,7 @@ import {
   HASH_ALGORITHM,
 } from "../crypto/hash.js";
 import { CorruptionError } from "../errors.js";
+import { inTreeTempPath } from "./temp-path.js";
 
 export function stubPathFor(realAbsolutePath: string): string {
   return `${realAbsolutePath}.stub`;
@@ -37,7 +37,7 @@ export function readStubHash(absoluteStubPath: string): string {
 
 /** Writes a stub file atomically (tmp + rename) so a crash never leaves a half-written stub. */
 export function writeStubAtomic(absoluteStubPath: string, hashHex: string): void {
-  const tmpPath = `${absoluteStubPath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+  const tmpPath = inTreeTempPath(absoluteStubPath);
   fs.writeFileSync(tmpPath, formatTaggedHash(hashHex));
   fs.renameSync(tmpPath, absoluteStubPath);
 }

@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
 import type PQueue from "p-queue";
 import type { S3Client } from "@aws-sdk/client-s3";
@@ -17,6 +16,7 @@ import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "../fs/decrypt-to-file.js";
+import { inTreeTempPath } from "../fs/temp-path.js";
 import {
   waitForRoom,
   createPoolErrorBox,
@@ -350,7 +350,7 @@ async function applyRemoteContentChange(
             }
 
             fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-            const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+            const tmpPath = inTreeTempPath(absolutePath);
             let computedHash: string;
             try {
               computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath, (n) =>

@@ -80,6 +80,32 @@ describe("walk", () => {
     expect(paths).toContain("keep.txt");
   });
 
+  it("excludes an in-tree temp file (inTreeTempPath's own shape) at any depth, not just the root", async () => {
+    const root = mkTempDir();
+    fs.writeFileSync(path.join(root, "photo.jpg"), "real content");
+    // Exactly what inTreeTempPath(absolutePath) itself produces -- a
+    // download or stub-write left behind by a run interrupted before its
+    // own rename/cleanup ran.
+    fs.writeFileSync(path.join(root, "photo.jpg.sync1-tmp-a1b2c3d4"), "half-written");
+    fs.mkdirSync(path.join(root, "nested"));
+    fs.writeFileSync(path.join(root, "nested", "video.mp4"), "real content");
+    fs.writeFileSync(path.join(root, "nested", "video.mp4.sync1-tmp-deadbeef"), "half-written");
+
+    const paths = await collectPaths(root);
+    expect(paths).toEqual(["nested", "nested/video.mp4", "photo.jpg"]);
+  });
+
+  it("does not exclude a real file that merely contains the temp-name shape as a substring, not a suffix", async () => {
+    // The regex is suffix-anchored -- a real filename that happens to
+    // contain something matching sync1-tmp-XXXXXXXX in the *middle* is
+    // not a temp file and must not be excluded.
+    const root = mkTempDir();
+    fs.writeFileSync(path.join(root, "photo.jpg.sync1-tmp-a1b2c3d4.jpg"), "real, just an odd name");
+
+    const paths = await collectPaths(root);
+    expect(paths).toEqual(["photo.jpg.sync1-tmp-a1b2c3d4.jpg"]);
+  });
+
   it("yields nothing for an empty directory", async () => {
     const root = mkTempDir();
     const paths = await collectPaths(root);
