@@ -1,9 +1,7 @@
-import fs from "node:fs";
-import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
-import { sync1Dir, localCacheDbPath, localStateDbPath } from "../vault/local-dir.js";
+import { localCacheDbPath, localStateDbPath } from "../vault/local-dir.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ThumbnailPoliciesRepository } from "../db/repositories/thumbnail-policies-repository.js";
 import { scanThumbnails, type ThumbnailRunMode, type ThumbnailScanStats } from "../fs/thumbnail.js";
@@ -15,10 +13,11 @@ import {
   type GlobalConcurrencyOptions,
 } from "../cli/concurrency-options.js";
 import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 import type { Logger } from "../logger.js";
 
 interface ThumbnailRunOptions extends OptionValues {
-  root: string;
+  root?: string;
   glob?: string;
   deleteStaleStubPreviews?: boolean;
 }
@@ -27,13 +26,6 @@ interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
   verbose?: boolean;
   progress?: boolean;
-}
-
-function assertAttached(root: string): void {
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
 }
 
 /**
@@ -49,8 +41,7 @@ async function runThumbnailMode(
   logger: Logger,
   showProgress: boolean,
 ): Promise<ThumbnailScanStats> {
-  const root = path.resolve(opts.root);
-  assertAttached(root);
+  const root = resolveRoot(opts.root);
 
   const cacheDb = new Database(localCacheDbPath(root), { readonly: true, fileMustExist: true });
   const cacheRepo = new CacheEntriesRepository(cacheDb);
@@ -152,7 +143,10 @@ function registerThumbnailSubcommand(
   const command = thumbnail
     .command(mode)
     .description(description)
-    .requiredOption("--root <path>", "local directory to scan")
+    .option(
+      "--root <path>",
+      "local directory to scan (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .option("--glob <pattern>", "glob pattern scoping which files to consider");
 
   // Only `cleanup` ever deletes anything, so this is the only subcommand

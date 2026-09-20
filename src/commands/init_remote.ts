@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import sodium from "sodium-native";
 import { createLogger } from "../logger.js";
@@ -28,11 +27,12 @@ import { openStateDb } from "../db/connection.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
 import { encryptBuffer } from "../crypto/chunked-codec.js";
 import { acquireLock } from "../vault/lock.js";
+import { resolveBootstrapRoot } from "../cli/resolve-root.js";
 
 interface InitRemoteOptions extends OptionValues {
   bucket: string;
   prefix: string;
-  root: string;
+  root?: string;
   endpoint?: string;
   region: string;
 }
@@ -48,7 +48,7 @@ export function registerInitRemoteCommand(program: Command): void {
     .description("Create a new backup vault in S3 for a local root directory")
     .requiredOption("--bucket <bucket>", "S3 bucket name")
     .option("--prefix <prefix>", "S3 key prefix", "")
-    .requiredOption("--root <path>", "local directory to back up")
+    .option("--root <path>", "local directory to back up (defaults to the current directory)")
     .option("--endpoint <url>", "S3-compatible endpoint (e.g. LocalStack); omit for real AWS S3")
     .option("--region <region>", "AWS region", "us-east-1")
     .action(async (opts: InitRemoteOptions, command: Command) => {
@@ -64,7 +64,7 @@ export function registerInitRemoteCommand(program: Command): void {
             version_stamp: versionStamp,
             bucket: opts.bucket,
             prefix: normalizePrefix(opts.prefix),
-            root: path.resolve(opts.root),
+            root: resolveBootstrapRoot(opts.root),
           });
         } else {
           process.stdout.write(
@@ -83,7 +83,7 @@ async function runInitRemote(
   opts: InitRemoteOptions,
   logger: ReturnType<typeof createLogger>,
 ): Promise<string> {
-  const root = path.resolve(opts.root);
+  const root = resolveBootstrapRoot(opts.root);
   const sync1DirPath = sync1Dir(root);
   // Checked via vault.json (not .sync1/'s own existence): vault.json is only
   // ever written at the very end of a successful run, below -- so a prior

@@ -1,18 +1,17 @@
-import fs from "node:fs";
-import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
-import { sync1Dir, localCacheDbPath, localStateDbPath } from "../vault/local-dir.js";
+import { localCacheDbPath, localStateDbPath } from "../vault/local-dir.js";
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 
 interface InspectOptions extends OptionValues {
-  root: string;
+  root?: string;
 }
 
 interface GlobalOptions extends OptionValues {
@@ -48,7 +47,10 @@ export function registerInspectCommand(program: Command): void {
       "Query cache.db/state.db for a path or glob pattern, as JSON -- meant for scripting and other tools built on top of this vault",
     )
     .argument("<path-or-glob>", "an exact tracked path, or a glob pattern")
-    .requiredOption("--root <path>", "local directory to inspect")
+    .option(
+      "--root <path>",
+      "local directory to inspect (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (pathOrGlob: string, opts: InspectOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -78,11 +80,7 @@ async function runInspect(
   opts: InspectOptions,
   logger: Logger,
 ): Promise<InspectResult[]> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
 
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
   const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });

@@ -12,17 +12,17 @@ matching fits in.
 ## Usage
 
 ```bash
-sync1 sanity_check --root <local-path> [--filter <glob>] [--json] [--hash-parallelism <n>] [--s3-metadata-parallelism <n>]
+sync1 sanity_check [--root <local-path>] [--filter <glob>] [--json] [--hash-parallelism <n>] [--s3-metadata-parallelism <n>]
 ```
 
 ## Options
 
-| Flag                            | Required | Description                                                                                  |
-| ------------------------------- | -------- | -------------------------------------------------------------------------------------------- |
-| `--root <path>`                 | yes      | Local directory to check. Must already be initialized or attached.                           |
-| `--filter <glob>`               | no       | [Glob pattern](../README.md#glob-syntax) scoping which tracked/untracked paths are reported. |
-| `--hash-parallelism <n>`        | no       | Max concurrent file-hashing worker threads. Default: CPU count.                              |
-| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` existence checks. Default 8.                                           |
+| Flag                            | Required | Description                                                                                                                                                                 |
+| ------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--root <path>`                 | no       | Local directory to check. Must already be initialized or attached. Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward. |
+| `--filter <glob>`               | no       | [Glob pattern](../README.md#glob-syntax) scoping which tracked/untracked paths are reported.                                                                                |
+| `--hash-parallelism <n>`        | no       | Max concurrent file-hashing worker threads. Default: CPU count.                                                                                                             |
+| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` existence checks. Default 8.                                                                                                                          |
 
 Rehashing and `HEAD` checks each dispatch to their own pool (see
 [concurrency-and-progress.md](../architecture/concurrency-and-progress.md)) — a file needing both runs

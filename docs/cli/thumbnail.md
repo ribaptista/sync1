@@ -22,16 +22,16 @@ act on, reported without acting.
 ## Usage
 
 ```bash
-sync1 thumbnail state --root <local-path> [--glob <pattern>] [--json] [--thumbnail-parallelism <n>]
-sync1 thumbnail ensure --root <local-path> [--glob <pattern>] [--json] [--thumbnail-parallelism <n>]
-sync1 thumbnail cleanup --root <local-path> [--glob <pattern>] [--delete-stale-stub-previews] [--json] [--thumbnail-parallelism <n>]
+sync1 thumbnail state [--root <local-path>] [--glob <pattern>] [--json] [--thumbnail-parallelism <n>]
+sync1 thumbnail ensure [--root <local-path>] [--glob <pattern>] [--json] [--thumbnail-parallelism <n>]
+sync1 thumbnail cleanup [--root <local-path>] [--glob <pattern>] [--delete-stale-stub-previews] [--json] [--thumbnail-parallelism <n>]
 ```
 
 ## Options
 
 | Flag                           | Required | Description                                                                                                                                                                                                                      |
 | ------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--root <path>`                | yes      | Local directory to scan. Must already be initialized/attached.                                                                                                                                                                   |
+| `--root <path>`                | no       | Local directory to scan. Must already be initialized/attached. Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward.                                                          |
 | `--glob <pattern>`             | no       | Glob (supports `**`) scoping which files to consider. Also prunes the filesystem walk when possible.                                                                                                                             |
 | `--thumbnail-parallelism <n>`  | no       | Max concurrent classification/generation jobs. Default 4.                                                                                                                                                                        |
 | `--delete-stale-stub-previews` | no       | `cleanup` only. Also deletes a stubbed original's existing thumbnail once its stub's own content hash no longer matches that thumbnail — see "Stale stub previews" below. Without this flag, `cleanup` leaves those files alone. |

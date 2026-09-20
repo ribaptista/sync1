@@ -8,16 +8,16 @@ implies for old, retained `/states/<version>` snapshots.
 ## Usage
 
 ```bash
-sync1 gc --root <local-path> [--apply] [--json] [--verbose] [--s3-metadata-parallelism <n>]
+sync1 gc [--root <local-path>] [--apply] [--json] [--verbose] [--s3-metadata-parallelism <n>]
 ```
 
 ## Options
 
-| Flag                            | Required | Description                                                                        |
-| ------------------------------- | -------- | ---------------------------------------------------------------------------------- |
-| `--root <path>`                 | yes      | Local directory whose vault to clean up.                                           |
-| `--apply`                       | no       | Actually delete orphaned objects. Without it, only counts what _would_ be removed. |
-| `--s3-metadata-parallelism <n>` | no       | With `--apply`, max concurrent `DeleteObject` calls. Default 8.                    |
+| Flag                            | Required | Description                                                                                                                                       |
+| ------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--root <path>`                 | no       | Local directory whose vault to clean up. Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward. |
+| `--apply`                       | no       | Actually delete orphaned objects. Without it, only counts what _would_ be removed.                                                                |
+| `--s3-metadata-parallelism <n>` | no       | With `--apply`, max concurrent `DeleteObject` calls. Default 8.                                                                                   |
 
 The vault password is required (gc reads and re-encrypts state.db).
 

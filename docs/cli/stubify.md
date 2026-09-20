@@ -6,16 +6,16 @@ for content you don't need materialized right now. The counterpart to `materiali
 ## Usage
 
 ```bash
-sync1 stubify <glob> --root <local-path> [--json] [--verbose] [--hash-parallelism <n>]
+sync1 stubify <glob> [--root <local-path>] [--json] [--verbose] [--hash-parallelism <n>]
 ```
 
 ## Arguments and options
 
-| Argument/Flag            | Required | Description                                                                                           |
-| ------------------------ | -------- | ----------------------------------------------------------------------------------------------------- |
-| `<glob>`                 | yes      | [Glob pattern](../README.md#glob-syntax) matched against tracked paths.                               |
-| `--root <path>`          | yes      | Local directory to operate on.                                                                        |
-| `--hash-parallelism <n>` | no       | Max concurrent rehashing worker threads, only used for paths whose mtime changed. Default: CPU count. |
+| Argument/Flag            | Required | Description                                                                                                                             |
+| ------------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `<glob>`                 | yes      | [Glob pattern](../README.md#glob-syntax) matched against tracked paths.                                                                 |
+| `--root <path>`          | no       | Local directory to operate on. Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward. |
+| `--hash-parallelism <n>` | no       | Max concurrent rehashing worker threads, only used for paths whose mtime changed. Default: CPU count.                                   |
 
 No password needed — this never touches encrypted content, it only replaces local bytes with a stub
 referencing an already-known hash.

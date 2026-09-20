@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
@@ -8,12 +7,12 @@ import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
 import {
-  sync1Dir,
   localCacheDbPath,
   localStateDbPath,
   localVaultJsonPath,
   localRemoteConfigPath,
 } from "../vault/local-dir.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
@@ -32,7 +31,7 @@ import {
 } from "../cli/progress.js";
 
 interface MaterializeOptions extends OptionValues {
-  root: string;
+  root?: string;
   requestRetrieval?: boolean;
 }
 
@@ -47,7 +46,10 @@ export function registerMaterializeCommand(program: Command): void {
     .command("materialize")
     .description("Download and materialize stub files matching a glob pattern")
     .argument("<glob>", "glob pattern matched against tracked paths")
-    .requiredOption("--root <path>", "local directory to operate on")
+    .option(
+      "--root <path>",
+      "local directory to operate on (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .option("--request-retrieval", "request temporary S3 restore for archived (cold) objects")
     .action(async (glob: string, opts: MaterializeOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -89,11 +91,7 @@ async function runMaterialize(
   logger: import("../logger.js").Logger,
   showProgress: boolean,
 ): Promise<MaterializeStats> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
 
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
   const password = await getPassword();

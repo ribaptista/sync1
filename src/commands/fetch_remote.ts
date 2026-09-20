@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
@@ -7,12 +6,8 @@ import { getPassword } from "../cli/password.js";
 import { createS3Client, getObject } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import {
-  sync1Dir,
-  localVaultJsonPath,
-  localRemoteConfigPath,
-  localStateDbPath,
-} from "../vault/local-dir.js";
+import { localVaultJsonPath, localRemoteConfigPath, localStateDbPath } from "../vault/local-dir.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 import {
   remoteKey,
   normalizePrefix,
@@ -25,7 +20,7 @@ import { CorruptionError } from "../errors.js";
 import { writeFileWithRetry } from "../fs/safe-fs.js";
 
 interface FetchRemoteOptions extends OptionValues {
-  root: string;
+  root?: string;
 }
 
 interface GlobalOptions extends OptionValues {
@@ -37,7 +32,10 @@ export function registerFetchRemoteCommand(program: Command): void {
   program
     .command("fetch_remote")
     .description("Fetch the latest state.db from the remote vault (no filesystem/cache.db changes)")
-    .requiredOption("--root <path>", "local directory whose vault to fetch")
+    .option(
+      "--root <path>",
+      "local directory whose vault to fetch (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (opts: FetchRemoteOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -59,11 +57,7 @@ export function registerFetchRemoteCommand(program: Command): void {
 }
 
 async function runFetchRemote(opts: FetchRemoteOptions, logger: Logger): Promise<string> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
 
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
   const password = await getPassword();

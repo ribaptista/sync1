@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
@@ -8,21 +7,17 @@ import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import {
-  sync1Dir,
-  localStateDbPath,
-  localVaultJsonPath,
-  localRemoteConfigPath,
-} from "../vault/local-dir.js";
+import { localStateDbPath, localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import {
   IgnorePoliciesRepository,
   type IgnorePolicyRow,
 } from "../db/repositories/ignore-policies-repository.js";
 import { mutateStateDb } from "../sync/mutate-state-db.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 
 interface RootOption extends OptionValues {
-  root: string;
+  root?: string;
 }
 
 interface GlobalOptions extends OptionValues {
@@ -36,13 +31,6 @@ interface MutationContext {
   s3: { client: ReturnType<typeof createS3Client>; bucket: string; location: RemoteLocation };
 }
 
-function assertAttached(root: string): void {
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
-}
-
 function parseId(idRaw: string): number {
   const id = Number(idRaw);
   if (!Number.isInteger(id)) {
@@ -52,8 +40,7 @@ function parseId(idRaw: string): number {
 }
 
 async function setupMutationContext(opts: RootOption): Promise<MutationContext> {
-  const root = path.resolve(opts.root);
-  assertAttached(root);
+  const root = resolveRoot(opts.root);
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
   const password = await getPassword();
   const manifest = parseManifest(fs.readFileSync(localVaultJsonPath(root)));
@@ -65,8 +52,7 @@ async function setupMutationContext(opts: RootOption): Promise<MutationContext> 
 }
 
 async function runList(opts: RootOption): Promise<IgnorePolicyRow[]> {
-  const root = path.resolve(opts.root);
-  assertAttached(root);
+  const root = resolveRoot(opts.root);
   const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
   try {
     return new IgnorePoliciesRepository(stateDb).list();
@@ -124,7 +110,10 @@ export function registerIgnoreCommand(program: Command): void {
   ignore
     .command("list")
     .description("List all ignore policies")
-    .requiredOption("--root <path>", "local directory whose vault to inspect")
+    .option(
+      "--root <path>",
+      "local directory whose vault to inspect (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (opts: RootOption, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -149,7 +138,10 @@ export function registerIgnoreCommand(program: Command): void {
     .command("create")
     .description("Create a new ignore policy")
     .argument("<glob>", "glob pattern to ignore")
-    .requiredOption("--root <path>", "local directory whose vault to modify")
+    .option(
+      "--root <path>",
+      "local directory whose vault to modify (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (glob: string, opts: RootOption, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -173,7 +165,10 @@ export function registerIgnoreCommand(program: Command): void {
     .description("Edit an existing ignore policy's glob")
     .argument("<id>", "policy id")
     .argument("<glob>", "new glob pattern")
-    .requiredOption("--root <path>", "local directory whose vault to modify")
+    .option(
+      "--root <path>",
+      "local directory whose vault to modify (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (idRaw: string, glob: string, opts: RootOption, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -197,7 +192,10 @@ export function registerIgnoreCommand(program: Command): void {
     .command("delete")
     .description("Delete an ignore policy")
     .argument("<id>", "policy id")
-    .requiredOption("--root <path>", "local directory whose vault to modify")
+    .option(
+      "--root <path>",
+      "local directory whose vault to modify (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (idRaw: string, opts: RootOption, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;

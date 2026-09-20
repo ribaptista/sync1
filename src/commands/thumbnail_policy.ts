@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
@@ -8,12 +7,7 @@ import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import {
-  sync1Dir,
-  localStateDbPath,
-  localVaultJsonPath,
-  localRemoteConfigPath,
-} from "../vault/local-dir.js";
+import { localStateDbPath, localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import {
   ThumbnailPoliciesRepository,
@@ -24,9 +18,10 @@ import {
   type ThumbnailPolicyUpdate,
 } from "../db/repositories/thumbnail-policies-repository.js";
 import { mutateStateDb } from "../sync/mutate-state-db.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 
 interface RootOption extends OptionValues {
-  root: string;
+  root?: string;
 }
 
 interface GenerateFieldOptions {
@@ -60,13 +55,6 @@ interface MutationContext {
   root: string;
   masterKey: Buffer;
   s3: { client: ReturnType<typeof createS3Client>; bucket: string; location: RemoteLocation };
-}
-
-function assertAttached(root: string): void {
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
 }
 
 function parseId(idRaw: string): number {
@@ -247,8 +235,7 @@ function assertNoMixedMediaTypeFlagsForEdit(opts: EditOptions): void {
 }
 
 async function setupMutationContext(opts: RootOption): Promise<MutationContext> {
-  const root = path.resolve(opts.root);
-  assertAttached(root);
+  const root = resolveRoot(opts.root);
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
   const password = await getPassword();
   const manifest = parseManifest(fs.readFileSync(localVaultJsonPath(root)));
@@ -260,8 +247,7 @@ async function setupMutationContext(opts: RootOption): Promise<MutationContext> 
 }
 
 async function runList(opts: RootOption): Promise<ThumbnailPolicyRow[]> {
-  const root = path.resolve(opts.root);
-  assertAttached(root);
+  const root = resolveRoot(opts.root);
   const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
   try {
     return new ThumbnailPoliciesRepository(stateDb).list();
@@ -390,7 +376,10 @@ export function registerThumbnailPolicyCommand(program: Command): void {
   thumbnailPolicy
     .command("list")
     .description("List all thumbnail policies")
-    .requiredOption("--root <path>", "local directory whose vault to inspect")
+    .option(
+      "--root <path>",
+      "local directory whose vault to inspect (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (opts: RootOption, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -420,7 +409,10 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     .description("Create a new thumbnail policy")
     .argument("<glob>", "glob pattern")
     .argument("<action>", "skip or generate")
-    .requiredOption("--root <path>", "local directory whose vault to modify")
+    .option(
+      "--root <path>",
+      "local directory whose vault to modify (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .requiredOption("--mime-types <csv>", 'comma-separated mime types, e.g. "image/jpeg,video/*"')
     .option(
       "--priority <n>",
@@ -472,7 +464,10 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     .command("edit")
     .description("Edit an existing thumbnail policy")
     .argument("<id>", "policy id")
-    .requiredOption("--root <path>", "local directory whose vault to modify")
+    .option(
+      "--root <path>",
+      "local directory whose vault to modify (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .option("--glob <glob>", "new glob pattern")
     .option("--action <action>", "new action: skip or generate")
     .option("--mime-types <csv>", "new comma-separated mime types")
@@ -512,7 +507,10 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     .command("delete")
     .description("Delete a thumbnail policy")
     .argument("<id>", "policy id")
-    .requiredOption("--root <path>", "local directory whose vault to modify")
+    .option(
+      "--root <path>",
+      "local directory whose vault to modify (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (idRaw: string, opts: RootOption, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;

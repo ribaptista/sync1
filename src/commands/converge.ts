@@ -1,10 +1,9 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { createS3Client } from "../s3/client.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import { sync1Dir, localRemoteConfigPath } from "../vault/local-dir.js";
+import { localRemoteConfigPath } from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { convergeStoragePolicies, type ConvergeResult } from "../sync/converge-storage-policies.js";
 import { createConcurrencyPools } from "../concurrency/pools.js";
@@ -13,9 +12,10 @@ import {
   type GlobalConcurrencyOptions,
 } from "../cli/concurrency-options.js";
 import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 
 interface ConvergeOptions extends OptionValues {
-  root: string;
+  root?: string;
   filter?: string;
 }
 
@@ -31,7 +31,10 @@ export function registerConvergeCommand(program: Command): void {
     .description(
       "Apply storage_policy: move each tracked object's actual S3 storage class to match what the policies imply",
     )
-    .requiredOption("--root <path>", "local directory whose vault to operate on")
+    .option(
+      "--root <path>",
+      "local directory whose vault to operate on (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .option("--filter <glob>", "glob pattern scoping which tracked paths to converge", "*")
     .action(async (opts: ConvergeOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -87,11 +90,7 @@ async function runConverge(
   logger: import("../logger.js").Logger,
   showProgress: boolean,
 ): Promise<ConvergeResult> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
   const filter = opts.filter ?? "*";
 
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));

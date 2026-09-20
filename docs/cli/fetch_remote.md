@@ -13,14 +13,14 @@ touching the local filesystem or committing anything.
 ## Usage
 
 ```bash
-sync1 fetch_remote --root <local-path> [--json] [--verbose]
+sync1 fetch_remote [--root <local-path>] [--json] [--verbose]
 ```
 
 ## Options
 
-| Flag            | Required | Description                                                                    |
-| --------------- | -------- | ------------------------------------------------------------------------------ |
-| `--root <path>` | yes      | Local directory whose vault to fetch. Must already be initialized or attached. |
+| Flag            | Required | Description                                                                                                                                                                             |
+| --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--root <path>` | no       | Local directory whose vault to fetch. Must already be initialized or attached. Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward. |
 
 ## Output
 
@@ -39,4 +39,6 @@ sync1 fetch_remote --root <local-path> [--json] [--verbose]
 
 ```bash
 SYNC1_PASSWORD='correct horse battery staple' sync1 fetch_remote --root ~/Pictures --json
+# or, run from anywhere inside ~/Pictures:
+SYNC1_PASSWORD='correct horse battery staple' sync1 fetch_remote --json
 ```

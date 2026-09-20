@@ -34,11 +34,14 @@ non-default policies. Only its `target_class` can ever be changed (`storage_poli
 ## Usage
 
 ```bash
-sync1 storage_policy list --root <local-path> [--json]
-sync1 storage_policy create <glob> <class> [--priority <n>] --root <local-path> [--json]
-sync1 storage_policy edit <id> [--glob <glob>] [--class <class>] [--priority <n>] --root <local-path> [--json]
-sync1 storage_policy delete <id> --root <local-path> [--json]
+sync1 storage_policy list [--root <local-path>] [--json]
+sync1 storage_policy create <glob> <class> [--priority <n>] [--root <local-path>] [--json]
+sync1 storage_policy edit <id> [--glob <glob>] [--class <class>] [--priority <n>] [--root <local-path>] [--json]
+sync1 storage_policy delete <id> [--root <local-path>] [--json]
 ```
+
+`--root` is optional on every subcommand — omitted, it defaults to the nearest ancestor directory
+containing a `.sync1/`, searched from the current directory upward.
 
 `<class>`/`--class` accepts `STANDARD`, `GLACIER`, or `DEEP_ARCHIVE`. `--priority`, when omitted on
 `create`, is auto-assigned to run after every existing non-default policy (still ahead of the default) —

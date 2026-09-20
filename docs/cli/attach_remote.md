@@ -8,13 +8,14 @@ so nothing downloads until you ask for it via `materialize`).
 ## Usage
 
 ```bash
-sync1 attach_remote --bucket <bucket> --root <local-path> [options]
+sync1 attach_remote --bucket <bucket> [--root <local-path>] [options]
 ```
 
 ## Options
 
-Same shape as `init_remote`: `--bucket` (required), `--root` (required), `--prefix`, `--endpoint`,
-`--region`. See [`init_remote`](init_remote.md) for details on each.
+Same shape as `init_remote`: `--bucket` (required), `--root` (optional, defaults to the current
+directory — see [`init_remote`](init_remote.md#options)), `--prefix`, `--endpoint`, `--region`. See
+[`init_remote`](init_remote.md) for details on each.
 
 ## Password
 

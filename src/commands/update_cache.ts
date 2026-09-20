@@ -1,14 +1,9 @@
 import fs from "node:fs";
-import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
-import {
-  sync1Dir,
-  localCacheDbPath,
-  localStateDbPath,
-  lastSyncedVersionPath,
-} from "../vault/local-dir.js";
+import { localCacheDbPath, localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
@@ -27,7 +22,7 @@ import {
 } from "../cli/progress.js";
 
 interface UpdateCacheOptions extends OptionValues {
-  root: string;
+  root?: string;
 }
 
 interface GlobalOptions extends GlobalConcurrencyOptions {
@@ -40,7 +35,10 @@ export function registerUpdateCacheCommand(program: Command): void {
   program
     .command("update_cache")
     .description("Scan the local root directory and refresh cache.db to match the filesystem")
-    .requiredOption("--root <path>", "local directory to scan")
+    .option(
+      "--root <path>",
+      "local directory to scan (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (opts: UpdateCacheOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -91,11 +89,7 @@ async function runUpdateCache(
   logger: import("../logger.js").Logger,
   showProgress: boolean,
 ): Promise<UpdateCacheStats> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
 
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const db = openCacheDb(localCacheDbPath(root), logger);

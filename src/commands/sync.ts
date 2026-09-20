@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import type { Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError, EXIT_CONFLICT } from "../cli/output.js";
@@ -7,12 +6,8 @@ import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import {
-  sync1Dir,
-  localVaultJsonPath,
-  localRemoteConfigPath,
-  localCacheDbPath,
-} from "../vault/local-dir.js";
+import { localVaultJsonPath, localRemoteConfigPath, localCacheDbPath } from "../vault/local-dir.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
@@ -30,7 +25,7 @@ import {
 } from "../cli/progress.js";
 
 interface SyncOptions extends OptionValues {
-  root: string;
+  root?: string;
 }
 
 interface GlobalOptions extends GlobalConcurrencyOptions {
@@ -43,7 +38,10 @@ export function registerSyncCommand(program: Command): void {
   program
     .command("sync")
     .description("Sync local changes with the remote vault")
-    .requiredOption("--root <path>", "local directory to sync")
+    .option(
+      "--root <path>",
+      "local directory to sync (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (opts: SyncOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -124,11 +122,7 @@ async function runSync(
   logger: Logger,
   showProgress: boolean,
 ): Promise<SyncResult> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
 
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
   const password = await getPassword();

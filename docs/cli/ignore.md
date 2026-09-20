@@ -21,11 +21,15 @@ uploaded, CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactiv
 ## Usage
 
 ```bash
-sync1 ignore list --root <local-path> [--json]
-sync1 ignore create <glob> --root <local-path> [--json]
-sync1 ignore edit <id> <glob> --root <local-path> [--json]
-sync1 ignore delete <id> --root <local-path> [--json]
+sync1 ignore list [--root <local-path>] [--json]
+sync1 ignore create <glob> [--root <local-path>] [--json]
+sync1 ignore edit <id> <glob> [--root <local-path>] [--json]
+sync1 ignore delete <id> [--root <local-path>] [--json]
 ```
+
+`--root` is optional on every subcommand — omitted, it defaults to the nearest ancestor directory
+containing a `.sync1/` (the same "find the marker directory" lookup git uses for `.git/`), searched from
+the current directory upward.
 
 ## What matching a policy actually does
 

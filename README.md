@@ -56,6 +56,13 @@ Every example below uses the same running scenario: `~/backups/photos` on **mach
 vault. In practice these can be two directories on the same computer or two entirely different
 machines; sync1 doesn't care which.
 
+Every example also passes `--root` explicitly, since these walkthroughs juggle two different vault
+directories side by side — but day to day it's optional: every command except `init_remote`/
+`attach_remote` defaults to the nearest ancestor directory containing a `.sync1/` when `--root` is
+omitted (the same "find the marker directory" lookup git uses for `.git/`), so running `sync1 sync`
+from inside `~/backups/photos` (or any of its subdirectories) works without repeating `--root` every
+time.
+
 ### Initialize a vault
 
 Create a brand-new vault, once, on the first machine:

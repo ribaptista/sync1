@@ -11,8 +11,11 @@ machines). No password is needed — it never decrypts content, only reads alrea
 ## Usage
 
 ```bash
-sync1 inspect <path-or-glob> --root <local-path> [--json]
+sync1 inspect <path-or-glob> [--root <local-path>] [--json]
 ```
+
+`--root` defaults to the nearest ancestor directory containing a `.sync1/` (searched from the current
+directory upward) when omitted.
 
 ## Arguments
 

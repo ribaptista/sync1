@@ -23,9 +23,9 @@ CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactive prompt).
 ## Usage
 
 ```bash
-sync1 thumbnail_policy list --root <local-path> [--json]
+sync1 thumbnail_policy list [--root <local-path>] [--json]
 
-sync1 thumbnail_policy create <glob> <skip|generate> --root <local-path> \
+sync1 thumbnail_policy create <glob> <skip|generate> [--root <local-path>] \
   --mime-types <csv> \
   [--priority <n>] \
   --media-type <image|video> \
@@ -34,7 +34,7 @@ sync1 thumbnail_policy create <glob> <skip|generate> --root <local-path> \
   [--jpeg-quality <1-100>] \
   [--json]
 
-sync1 thumbnail_policy edit <id> --root <local-path> \
+sync1 thumbnail_policy edit <id> [--root <local-path>] \
   [--glob <glob>] [--action <skip|generate>] [--mime-types <csv>] [--priority <n>] \
   [--media-type <image|video>] \
   [--image-width <n>] [--image-height <n>] \
@@ -42,8 +42,11 @@ sync1 thumbnail_policy edit <id> --root <local-path> \
   [--jpeg-quality <1-100>] \
   [--json]
 
-sync1 thumbnail_policy delete <id> --root <local-path> [--json]
+sync1 thumbnail_policy delete <id> [--root <local-path>] [--json]
 ```
+
+`--root` is optional on every subcommand — omitted, it defaults to the nearest ancestor directory
+containing a `.sync1/`, searched from the current directory upward.
 
 `--mime-types` is a comma-separated list, e.g. `"image/jpeg,video/*"` — the subtype half of any entry may
 be a literal `*` wildcard, nothing else is a wildcard here. Required on `create` (even for a `skip`

@@ -1,11 +1,11 @@
 import fs from "node:fs";
-import path from "node:path";
 import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
 import { createS3Client, headObject } from "../s3/client.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import { sync1Dir, localStateDbPath, localRemoteConfigPath } from "../vault/local-dir.js";
+import { localStateDbPath, localRemoteConfigPath } from "../vault/local-dir.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 import { remoteKey, normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
@@ -24,7 +24,7 @@ import {
 } from "../cli/progress.js";
 
 interface SanityCheckOptions extends OptionValues {
-  root: string;
+  root?: string;
   filter?: string;
 }
 
@@ -51,7 +51,10 @@ export function registerSanityCheckCommand(program: Command): void {
     .description(
       "Read-only diagnostic: cross-checks state.db against S3 and the local filesystem for bugs (never repairs anything)",
     )
-    .requiredOption("--root <path>", "local directory to check")
+    .option(
+      "--root <path>",
+      "local directory to check (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .option("--filter <glob>", "glob pattern scoping which tracked paths to check")
     .action(async (opts: SanityCheckOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -135,11 +138,7 @@ async function runSanityCheck(
   logger: import("../logger.js").Logger,
   showProgress: boolean,
 ): Promise<SanityCheckResult> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
 
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
   const client = createS3Client({ endpoint: remoteConfig.endpoint, region: remoteConfig.region });

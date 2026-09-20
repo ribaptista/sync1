@@ -1,8 +1,6 @@
-import fs from "node:fs";
-import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
-import { sync1Dir, localCacheDbPath } from "../vault/local-dir.js";
+import { localCacheDbPath } from "../vault/local-dir.js";
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { stubifyGlob, type StubifyStats } from "../fs/stubify.js";
@@ -17,9 +15,10 @@ import {
   createLoggerForRun,
   reporterFor,
 } from "../cli/progress.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 
 interface StubifyOptions extends OptionValues {
-  root: string;
+  root?: string;
 }
 
 interface GlobalOptions extends GlobalConcurrencyOptions {
@@ -33,7 +32,10 @@ export function registerStubifyCommand(program: Command): void {
     .command("stubify")
     .description("Replace fully-committed real files matching a glob pattern with stubs")
     .argument("<glob>", "glob pattern matched against tracked paths")
-    .requiredOption("--root <path>", "local directory to operate on")
+    .option(
+      "--root <path>",
+      "local directory to operate on (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .action(async (glob: string, opts: StubifyOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -75,11 +77,7 @@ async function runStubify(
   logger: import("../logger.js").Logger,
   showProgress: boolean,
 ): Promise<StubifyStats> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
 
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));

@@ -6,16 +6,16 @@ Internally runs `update_cache` first, so you never need to run that separately b
 ## Usage
 
 ```bash
-sync1 sync --root <local-path> [--json] [--verbose] [--hash-parallelism <n>] [--file-stream-parallelism <n>] [--no-progress]
+sync1 sync [--root <local-path>] [--json] [--verbose] [--hash-parallelism <n>] [--file-stream-parallelism <n>] [--no-progress]
 ```
 
 ## Options
 
-| Flag                            | Required | Description                                                                                                        |
-| ------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------ |
-| `--root <path>`                 | yes      | Local directory to sync. Must already be initialized (`init_remote`) or attached (`attach_remote`).                |
-| `--hash-parallelism <n>`        | no       | Max concurrent file-hashing worker threads, used by `sync`'s internal `update_cache` scan. Default: CPU count.     |
-| `--file-stream-parallelism <n>` | no       | Max concurrent encrypt+upload / download+decrypt pipelines, used by the upload and remote-apply passes. Default 4. |
+| Flag                            | Required | Description                                                                                                                                                                                                  |
+| ------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--root <path>`                 | no       | Local directory to sync. Must already be initialized (`init_remote`) or attached (`attach_remote`). Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward. |
+| `--hash-parallelism <n>`        | no       | Max concurrent file-hashing worker threads, used by `sync`'s internal `update_cache` scan. Default: CPU count.                                                                                               |
+| `--file-stream-parallelism <n>` | no       | Max concurrent encrypt+upload / download+decrypt pipelines, used by the upload and remote-apply passes. Default 4.                                                                                           |
 
 Bucket/prefix/endpoint/region are read from `.sync1/remote.json`, written by `init_remote`/`attach_remote` — not repeated here. See
 [concurrency-and-progress.md](../architecture/concurrency-and-progress.md) for how `sync`'s three phases (scan, upload, remote-apply) each dispatch their own concurrent work.

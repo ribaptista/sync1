@@ -7,18 +7,18 @@ instead (not yet implemented) — `init_remote` refuses to run against a non-emp
 ## Usage
 
 ```bash
-sync1 init_remote --bucket <bucket> --root <local-path> [options]
+sync1 init_remote --bucket <bucket> [--root <local-path>] [options]
 ```
 
 ## Options
 
-| Flag                | Required | Description                                                                           |
-| ------------------- | -------- | ------------------------------------------------------------------------------------- |
-| `--bucket <bucket>` | yes      | S3 bucket name.                                                                       |
-| `--root <path>`     | yes      | Local directory to back up. Must not already contain a `.sync1/` directory.           |
-| `--prefix <prefix>` | no       | S3 key prefix within the bucket (default: none — the vault lives at the bucket root). |
-| `--endpoint <url>`  | no       | S3-compatible endpoint, e.g. a LocalStack URL. Omit to use real AWS S3.               |
-| `--region <region>` | no       | AWS region (default: `us-east-1`).                                                    |
+| Flag                | Required | Description                                                                                                                                                                                                                                                                                                                                   |
+| ------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--bucket <bucket>` | yes      | S3 bucket name.                                                                                                                                                                                                                                                                                                                               |
+| `--root <path>`     | no       | Local directory to back up. Must not already contain a `.sync1/` directory. Defaults to the current directory -- never an ancestor search (unlike every other command's `--root`): there's no existing vault to find yet, and searching upward could silently target an unrelated ancestor vault instead of the directory you actually meant. |
+| `--prefix <prefix>` | no       | S3 key prefix within the bucket (default: none — the vault lives at the bucket root).                                                                                                                                                                                                                                                         |
+| `--endpoint <url>`  | no       | S3-compatible endpoint, e.g. a LocalStack URL. Omit to use real AWS S3.                                                                                                                                                                                                                                                                       |
+| `--region <region>` | no       | AWS region (default: `us-east-1`).                                                                                                                                                                                                                                                                                                            |
 
 Global flags `--json` and `--verbose` also apply (see the top-level `sync1 --help`).
 

@@ -1,12 +1,11 @@
 import fs from "node:fs";
-import path from "node:path";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import { sync1Dir, localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
+import { localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { performGc, type GcResult } from "../sync/gc.js";
 import { createConcurrencyPools } from "../concurrency/pools.js";
@@ -15,9 +14,10 @@ import {
   type GlobalConcurrencyOptions,
 } from "../cli/concurrency-options.js";
 import { shouldShowProgress, startProgressSession, createLoggerForRun } from "../cli/progress.js";
+import { resolveRoot } from "../cli/resolve-root.js";
 
 interface GcOptions extends OptionValues {
-  root: string;
+  root?: string;
   apply?: boolean;
 }
 
@@ -31,7 +31,10 @@ export function registerGcCommand(program: Command): void {
   program
     .command("gc")
     .description("Remove S3 objects no longer referenced by any current entry")
-    .requiredOption("--root <path>", "local directory whose vault to clean up")
+    .option(
+      "--root <path>",
+      "local directory whose vault to clean up (defaults to the nearest ancestor directory with a .sync1/)",
+    )
     .option("--apply", "actually delete orphaned objects (default: count only)")
     .action(async (opts: GcOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -70,11 +73,7 @@ async function runGc(
   globalOpts: GlobalOptions,
   logger: import("../logger.js").Logger,
 ): Promise<GcResult> {
-  const root = path.resolve(opts.root);
-  const sync1DirPath = sync1Dir(root);
-  if (!fs.existsSync(sync1DirPath)) {
-    throw new Error(`"${sync1DirPath}" does not exist — run init_remote or attach_remote first`);
-  }
+  const root = resolveRoot(opts.root);
 
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
   const password = await getPassword();

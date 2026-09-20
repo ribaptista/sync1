@@ -6,7 +6,7 @@ you get real content back after a stub-only restore (`attach_remote` + `sync`).
 ## Usage
 
 ```bash
-sync1 materialize <glob> --root <local-path> [--request-retrieval] [--json] [--verbose] [--s3-metadata-parallelism <n>] [--file-stream-parallelism <n>]
+sync1 materialize <glob> [--root <local-path>] [--request-retrieval] [--json] [--verbose] [--s3-metadata-parallelism <n>] [--file-stream-parallelism <n>]
 ```
 
 ## Arguments and options
@@ -14,7 +14,7 @@ sync1 materialize <glob> --root <local-path> [--request-retrieval] [--json] [--v
 | Argument/Flag                   | Required | Description                                                                                                                                                           |
 | ------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `<glob>`                        | yes      | [Glob pattern](../README.md#glob-syntax) matched against tracked paths (e.g. `photos/2024/*`).                                                                        |
-| `--root <path>`                 | yes      | Local directory to operate on.                                                                                                                                        |
+| `--root <path>`                 | no       | Local directory to operate on. Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward.                               |
 | `--request-retrieval`           | no       | Request a temporary S3 restore for matched content that's currently archived (`GLACIER`/`DEEP_ARCHIVE`). Without it, archived content is just counted, not requested. |
 | `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` archive-status checks. Default 8.                                                                                                               |
 | `--file-stream-parallelism <n>` | no       | Max concurrent download+decrypt+verify+rename pipelines. Default 4.                                                                                                   |
