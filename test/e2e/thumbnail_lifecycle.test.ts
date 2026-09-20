@@ -236,7 +236,7 @@ describe("thumbnail lifecycle (end to end)", () => {
     expect(inspectParsed.state?.hash).toEqual(expect.any(String));
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 60000);
+  });
 
   it("generates a .jpg thumbnail from a Canon CR2 raw original through the real CLI, never a .CR2 destination", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
@@ -290,7 +290,7 @@ describe("thumbnail lifecycle (end to end)", () => {
     expect(thumbs[0]).toMatch(/^photo\.CR2\.p1-iw16-ih16-q80\.[0-9a-f]+\.jpg$/);
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 60000);
+  });
 
   it("preserves a stubbed original's up-to-date thumbnail across stubify, reporting it as stubbed_preserved", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
@@ -367,7 +367,7 @@ describe("thumbnail lifecycle (end to end)", () => {
     expect(fs.existsSync(thumbPath)).toBe(true);
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 60000);
+  });
 
   it("flags a stubbed original's thumbnail as a stale stub preview once the stub's content changes, and only deletes it via cleanup --delete-stale-stub-previews", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
@@ -455,5 +455,5 @@ describe("thumbnail lifecycle (end to end)", () => {
     expect(fs.existsSync(thumbPath)).toBe(false); // actually removed with the flag
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 60000);
+  });
 });

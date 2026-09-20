@@ -157,7 +157,7 @@ describe("materialize: progress totals", () => {
     expect(finalUpdate.totalsFinal).toBe(true);
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 60000);
+  });
 
   it("an archived object resolves its bytes without transferring them, still finishing at 100%", async () => {
     const { root } = await setUpVault();
@@ -198,5 +198,5 @@ describe("materialize: progress totals", () => {
     expect(updates.some((u) => u.activity !== undefined)).toBe(false);
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 60000);
+  });
 });

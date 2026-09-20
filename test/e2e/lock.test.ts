@@ -158,7 +158,7 @@ describe("per-vault lock", () => {
     expect(fs.existsSync(lockPath(root))).toBe(false);
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 30000);
+  });
 
   it("SIGINT to a running invocation prints a warning, exits 130, and removes the lock", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
@@ -205,5 +205,5 @@ describe("per-vault lock", () => {
     expect(fs.existsSync(lockPath(root))).toBe(false);
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 30000);
+  });
 });

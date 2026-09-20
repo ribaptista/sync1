@@ -95,5 +95,5 @@ describe("multipart upload for an object over the size threshold", () => {
     expect(roundTripped.equals(content)).toBe(true);
 
     fs.rmSync(root, { recursive: true, force: true });
-  }, 60000);
+  });
 });
