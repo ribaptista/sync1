@@ -103,7 +103,10 @@ async function runUpdateCache(
 
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
   const progress = startBytesProgressSession({ show: showProgress, overallLabel: "scanning" });
-  progress.setOverallTotals({ files: Math.max(cacheRepo.count(), 1) });
+  // No `cacheRepo.count()` pre-seed any more: it was last run's row count
+  // standing in for this one's, and it said nothing at all about bytes --
+  // which is what actually drives the bar and the ETA. performUpdateCache
+  // enumerates both for real now, concurrently with the scan itself.
 
   try {
     const stats = await performUpdateCache(

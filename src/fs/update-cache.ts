@@ -17,6 +17,7 @@ import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policie
 import { BoundedTaskTracker } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
 import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
+import { enumerateUpdateCacheWork, type EnumerationControl } from "./update-cache-enumerate.js";
 
 export interface CaseCollision {
   path: string;
@@ -116,6 +117,21 @@ export async function performUpdateCache(
   // completion for a row that needed a real hash.
   const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
 
+  // Started before the real pass and deliberately not awaited here: it
+  // counts the same work without dispatching any of it, so it runs at the
+  // filesystem's pace rather than the hash pool's and has the totals long
+  // before the loop below could discover them. Never rejects; `control`
+  // is how the `finally` cuts it short if this run ends first (or fails).
+  const enumerationControl: EnumerationControl = { stop: false };
+  const enumeration = enumerateUpdateCacheWork(
+    root,
+    cacheRepo,
+    ignoreGlobs,
+    progress,
+    logger,
+    enumerationControl,
+  );
+
   try {
     const fsIter = walk(root);
     const cacheIter = cacheRepo.iterateAllSortedByPath();
@@ -191,6 +207,14 @@ export async function performUpdateCache(
       cacheRepo.upsert(row);
     }
   } finally {
+    // Joined before settling, not after: an enumeration still publishing
+    // estimates after settle() would push the denominator back up off a
+    // just-completed bar. Setting `stop` first means a failed run isn't
+    // held open for the remainder of a full second walk.
+    enumerationControl.stop = true;
+    await enumeration;
+    progress.settle();
+
     staging.close();
     for (const suffix of ["", "-wal", "-shm"]) {
       const p = `${stagingPath}${suffix}`;

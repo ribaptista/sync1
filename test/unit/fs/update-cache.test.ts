@@ -736,6 +736,56 @@ describe("performUpdateCache: byte progress", () => {
     });
   });
 
+  it("knows the whole byte total while the hash pool is still blocking the producer", async () => {
+    // The regression this enumeration pass exists to prevent. Three files,
+    // a hash pool of one, and a runner that never resolves: the producer
+    // loop dispatches the first file, then blocks on the pool for the rest
+    // of the test. Discovery-driven totals can therefore only ever have
+    // seen ONE file's bytes at this point -- which is precisely why the
+    // denominator used to keep climbing until a run was nearly over.
+    touch("a.txt", "a".repeat(100));
+    touch("b.txt", "b".repeat(200));
+    touch("c.txt", "c".repeat(400));
+    const repo = makeRepo();
+
+    // One shared gate every hash blocks on, so the pool stays occupied by
+    // the first file until the assertions below have run -- then they all
+    // proceed and hash for real, letting the run finish normally.
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => (openGate = resolve));
+    const hashRunner: HashRunner = {
+      run: async (absolutePath) => {
+        await gate;
+        return hashFile(absolutePath);
+      },
+    };
+
+    const updates: { bytesDone: number; bytesTotal: number; filesTotal: number }[] = [];
+    const statsPromise = run(repo, {
+      hashRunner,
+      maxInFlightHashes: 1,
+      onProgress: (u) => updates.push({ ...u }),
+    });
+
+    await vi.waitFor(() => {
+      expect(updates.some((u) => u.bytesTotal === 700)).toBe(true);
+    });
+    // Nothing has finished hashing -- the total came from the enumeration
+    // pass running ahead of the blocked producer, not from dispatch, which
+    // by now has only ever seen a.txt's 100 bytes.
+    expect(updates.every((u) => u.bytesDone === 0)).toBe(true);
+    expect(updates.some((u) => u.filesTotal === 3)).toBe(true);
+
+    openGate();
+    const stats = await statsPromise;
+    expect(stats.created).toBe(3);
+
+    // And the run still lands exactly on its own denominator.
+    const last = updates.at(-1)!;
+    expect(last.bytesDone).toBe(700);
+    expect(last.bytesTotal).toBe(700);
+  });
+
   it("a directory contributes 0 bytes", async () => {
     fs.mkdirSync(path.join(root, "a-dir"));
     const repo = makeRepo();
