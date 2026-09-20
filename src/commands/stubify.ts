@@ -85,7 +85,11 @@ async function runStubify(
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
-    progress.setOverallTotals({ files: Math.max(cacheRepo.count(), 1) });
+    // No `cacheRepo.count()` pre-seed any more: it counted every row in
+    // the vault, not the glob-matched ones this run will touch, and said
+    // nothing at all about bytes -- which is what actually drives the bar
+    // and the ETA. stubifyGlob enumerates both for real now, concurrently
+    // with the scan itself.
     return await stubifyGlob(
       root,
       glob,

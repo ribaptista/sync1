@@ -7,6 +7,8 @@ import {
 } from "../db/repositories/cache-entries-repository.js";
 import { writeStubAtomic, stubPathFor } from "./stub.js";
 import { isUnderThumbnailDir } from "./thumbnail.js";
+import { enumerateStubifyWork } from "./stubify-enumerate.js";
+import type { EnumerationControl } from "./update-cache-enumerate.js";
 import { BoundedTaskTracker } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
 import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
@@ -84,19 +86,43 @@ export async function stubifyGlob(
   // is processRow's responsibility -- see its own doc comment for why.
   const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
 
-  // A single connection/repo covers both the glob scan and cacheRepo.upsert()
-  // below: iterateByGlobSortedByPath() is keyset-paginated (src/db/keyset-
-  // pagination.ts), not a live `.iterate()` cursor, so the write can safely
-  // interleave with it -- a write only ever conflicts with a *paused*
-  // cursor, and pagination never leaves one paused between pages.
-  for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
-    progress.rowDiscovered();
-    await processRow(row, root, cacheRepo, logger, hashRunner, hashJobs, stats, progress);
+  // Started, deliberately not awaited: it counts the same rows this loop
+  // is about to process, concurrently, so the denominator is known within
+  // a scan rather than only once the last rehash lands. See
+  // stubify-enumerate.ts.
+  const enumerationControl: EnumerationControl = { stop: false };
+  const enumeration = enumerateStubifyWork(
+    root,
+    glob,
+    cacheRepo,
+    progress,
+    logger,
+    enumerationControl,
+  );
+
+  try {
+    // A single connection/repo covers both the glob scan and cacheRepo.upsert()
+    // below: iterateByGlobSortedByPath() is keyset-paginated (src/db/keyset-
+    // pagination.ts), not a live `.iterate()` cursor, so the write can safely
+    // interleave with it -- a write only ever conflicts with a *paused*
+    // cursor, and pagination never leaves one paused between pages.
+    for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
+      progress.rowDiscovered();
+      await processRow(row, root, cacheRepo, logger, hashRunner, hashJobs, stats, progress);
+    }
+
+    await hashJobs.onIdle();
+
+    return stats;
+  } finally {
+    // The real pass is done (or has thrown), so whatever the counting pass
+    // still has left to count is now worthless -- cut it short, join it so
+    // it can't publish into a settled tracker, then settle on what
+    // actually happened.
+    enumerationControl.stop = true;
+    await enumeration;
+    progress.settle();
   }
-
-  await hashJobs.onIdle();
-
-  return stats;
 }
 
 /**
