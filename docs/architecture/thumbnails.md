@@ -228,10 +228,15 @@ this doesn't depend on probing either.
 `state`/`ensure`/`cleanup` (`sync1 thumbnail <mode>`) all share a single classification algorithm
 (`scanThumbnails` in `src/fs/thumbnail.ts`) rather than three separate walks: one filesystem walk both
 collects every existing `_thumbnail/` file (reverse-parsed back to the original it belongs to, including
-its params segment) and classifies every other candidate path into one of two kinds. A real (or "both",
-real-with-dangling-stub) entry is dispatched for mime-probing + policy resolution — only for a path that
-already matches at least one policy's glob, a cheap in-memory check with zero I/O, so a path matching no
-policy at all is never probed. A stub entry is classified synchronously instead, with no probing or
+its params segment) and classifies every other candidate path into one of two kinds. Before either
+classification path, a candidate matching any `ignore_policies` glob (`IgnorePoliciesRepository.listGlobs()`,
+same cheap in-memory pre-filter, same precedent as `update_cache`/`apply-remote-changes.ts` — see
+[ignore-and-storage-policies.md](ignore-and-storage-policies.md#what-matching-actually-gates)) is skipped
+outright, exactly as if it matched no `thumbnail_policy` glob at all — a path explicitly excluded from the
+vault has no business getting a preview generated for it either. A real (or "both",
+real-with-dangling-stub) entry is then dispatched for mime-probing + policy resolution — only for a path
+that already matches at least one policy's glob, a cheap in-memory check with zero I/O, so a path matching
+no policy at all is never probed. A stub entry is classified synchronously instead, with no probing or
 policy resolution at all (see "Stubbed originals" above) — `ProvisionalDecision` is a `"probed"`/`"stub"`
 discriminated union at the type level, so a stub decision is structurally impossible to hand to the
 generation code path.

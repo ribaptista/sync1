@@ -566,4 +566,76 @@ describe("thumbnail lifecycle (end to end)", () => {
 
     fs.rmSync(root, { recursive: true, force: true });
   });
+
+  it("skips a candidate matching an ignore policy, even though it also matches a thumbnail policy", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    fs.copyFileSync(path.join(FIXTURES_DIR, "tiny.jpg"), path.join(root, "photo.jpg"));
+    fs.copyFileSync(path.join(FIXTURES_DIR, "tiny.jpg"), path.join(root, "private.jpg"));
+
+    const policy = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "*.jpg",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "img",
+        "--mime-types",
+        "image/jpeg",
+        ...IMAGE_GENERATE_FLAGS,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(policy.exitCode).toBe(0);
+
+    const ignore = await runCli(["ignore", "create", "private.jpg", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    expect(ignore.exitCode).toBe(0);
+
+    await runCli(["update_cache", "--root", root, "--json"]);
+    const state = await runCli(["thumbnail", "state", "--root", root, "--json"]);
+    // Only photo.jpg -- private.jpg matches the ignore policy too, so it's
+    // never probed or classified as a candidate at all. Without the fix,
+    // private.jpg would still match the thumbnail policy's glob and get
+    // dispatched for probing; since update_cache's own ignore check never
+    // staged it into cache.db at all, it would then show up as a *false*
+    // missing_cache_entry rather than being silently skipped -- asserting
+    // that count is 0 is what actually distinguishes "correctly skipped"
+    // from "skipped for the wrong reason".
+    expect(JSON.parse(state.stdout) as ThumbnailStatsJson).toMatchObject({
+      to_generate: 1,
+      to_delete: 0,
+      missing_cache_entry: 0,
+    });
+
+    const ensure = await runCli(["thumbnail", "ensure", "--root", root, "--json"]);
+    expect(JSON.parse(ensure.stdout) as ThumbnailStatsJson).toMatchObject({ to_generate: 1 });
+
+    const thumbs = fs.readdirSync(path.join(root, "_thumbnail"));
+    expect(thumbs).toHaveLength(1);
+    expect(thumbs[0]).toMatch(/^photo\.jpg\./);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
 });

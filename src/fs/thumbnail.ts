@@ -494,6 +494,20 @@ async function generateForDecision(
  * cumulative count, since "files scanned" and "thumbnails generated" are
  * different units caller-side progress reporting needs to track
  * independently (see `runThumbnailMode` in `src/commands/thumbnail.ts`).
+ *
+ * `ignoreGlobs` (`IgnorePoliciesRepository.listGlobs()`, same precedent as
+ * `update_cache`/`sanity_check`/`apply-remote-changes`'s own ignore-policy
+ * consultation) is checked as a cheap, in-memory pre-filter right beside
+ * the thumbnail-policy one -- a matching path is skipped entirely, never
+ * probed or policy-resolved, exactly as if it matched no thumbnail policy
+ * glob at all. Deliberately unconditional, unlike `update_cache`'s own
+ * "only an uncommitted `created` row" carve-out: a thumbnail is a
+ * local-only artifact with no cross-machine propagation concern, so
+ * there's no analogous reason to spare an already-thumbnailed path once
+ * its glob is ignored. An existing thumbnail for a newly-ignored path is
+ * therefore never explicitly deleted here -- it's simply never claimed,
+ * so it falls through the ordinary unclaimed-orphan sweep below and is
+ * counted under `toDelete` like any other orphan.
  */
 export async function scanThumbnails(
   root: string,
@@ -501,6 +515,7 @@ export async function scanThumbnails(
   glob: string | undefined,
   cacheRepo: CacheEntriesRepository,
   policies: readonly ThumbnailPolicyRow[],
+  ignoreGlobs: readonly string[],
   prober: MediaProber,
   generator: ThumbnailGenerator,
   logger: Logger,
@@ -584,6 +599,7 @@ export async function scanThumbnails(
       }
 
       if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
+      if (matchesAnyGlob(relativePath, ignoreGlobs).matched) continue;
       if (!anyGlobMatches(relativePath, policies)) continue;
 
       if (fsEntry.representation === "stub") {

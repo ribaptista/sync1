@@ -4,6 +4,7 @@ import { localCacheDbPath, localStateDbPath } from "../vault/local-dir.js";
 import { openCacheDbReadOnly, openStateDbReadOnly } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ThumbnailPoliciesRepository } from "../db/repositories/thumbnail-policies-repository.js";
+import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import { scanThumbnails, type ThumbnailRunMode, type ThumbnailScanStats } from "../fs/thumbnail.js";
 import { realMediaProber } from "../media/probe.js";
 import { realThumbnailGenerator } from "../media/thumbnail-generate.js";
@@ -47,6 +48,7 @@ async function runThumbnailMode(
   const cacheRepo = new CacheEntriesRepository(cacheDb);
   const stateDb = openStateDbReadOnly(localStateDbPath(root));
   const policiesRepo = new ThumbnailPoliciesRepository(stateDb);
+  const ignorePoliciesRepo = new IgnorePoliciesRepository(stateDb);
 
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
   const progress = startProgressSession({
@@ -71,6 +73,7 @@ async function runThumbnailMode(
       opts.glob,
       cacheRepo,
       policiesRepo.list(),
+      ignorePoliciesRepo.listGlobs(),
       realMediaProber,
       realThumbnailGenerator,
       logger,

@@ -9,6 +9,7 @@ import {
   ThumbnailPoliciesRepository,
   type ThumbnailPolicyCreateInput,
 } from "../../../src/db/repositories/thumbnail-policies-repository.js";
+import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
 import {
   scanThumbnails,
   isUnderThumbnailDir,
@@ -30,6 +31,7 @@ let stateDb: ReturnType<typeof openStateDb>;
 let cacheDb: ReturnType<typeof openCacheDb>;
 let cacheRepo: CacheEntriesRepository;
 let policiesRepo: ThumbnailPoliciesRepository;
+let ignorePoliciesRepo: IgnorePoliciesRepository;
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-thumbnail-test-"));
@@ -37,6 +39,7 @@ beforeEach(() => {
   cacheDb = openCacheDb(":memory:");
   cacheRepo = new CacheEntriesRepository(cacheDb);
   policiesRepo = new ThumbnailPoliciesRepository(stateDb);
+  ignorePoliciesRepo = new IgnorePoliciesRepository(stateDb);
 });
 
 afterEach(() => {
@@ -162,6 +165,7 @@ function run(
     glob,
     cacheRepo,
     policiesRepo.list(),
+    ignorePoliciesRepo.listGlobs(),
     prober,
     generator,
     silentLogger,
@@ -583,6 +587,7 @@ describe("scanThumbnails", () => {
       undefined,
       cacheRepo,
       policiesRepo.list(),
+      ignorePoliciesRepo.listGlobs(),
       prober,
       generator,
       silentLogger,
@@ -635,6 +640,7 @@ describe("scanThumbnails", () => {
       undefined,
       cacheRepo,
       policiesRepo.list(),
+      ignorePoliciesRepo.listGlobs(),
       prober,
       generator,
       silentLogger,
@@ -670,6 +676,7 @@ describe("scanThumbnails", () => {
       undefined,
       cacheRepo,
       policiesRepo.list(),
+      ignorePoliciesRepo.listGlobs(),
       prober,
       fakeGenerator(),
       silentLogger,
@@ -703,6 +710,7 @@ describe("scanThumbnails", () => {
       undefined,
       cacheRepo,
       policiesRepo.list(),
+      ignorePoliciesRepo.listGlobs(),
       prober,
       fakeGenerator(),
       silentLogger,
@@ -900,5 +908,42 @@ describe("scanThumbnails", () => {
     await run("state", undefined, prober, fakeGenerator());
 
     expect(prober.detectMedia).not.toHaveBeenCalled();
+  });
+
+  it("never probes a path matching an ignore policy, even though it also matches a thumbnail policy", async () => {
+    createGeneratePolicy("*.jpg");
+    ignorePoliciesRepo.create("private.jpg");
+    writeFile("private.jpg");
+
+    const prober = fakeProber({ "private.jpg": JPEG_IMAGE });
+    const stats = await run("state", undefined, prober, fakeGenerator());
+
+    expect(prober.detectMedia).not.toHaveBeenCalled();
+    expect(stats).toMatchObject({ toGenerate: 0, upToDate: 0, toDelete: 0 });
+  });
+
+  it("an ignore-matched path's existing thumbnail is swept as an ordinary orphan, not explicitly deleted", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile("private.jpg");
+    seedCache("private.jpg", "abc");
+    writeFile(`_thumbnail/private.jpg.${IMAGE_PARAMS}.abc.jpg`);
+
+    // Thumbnailed once before the ignore policy existed -- now-ignored, so
+    // the next scan must never re-claim it, and its stale thumbnail must
+    // fall through to the same unclaimed-orphan sweep any other orphan
+    // does (no ignore-specific deletion path).
+    ignorePoliciesRepo.create("private.jpg");
+
+    const stats = await run("state", undefined, fakeProber({}), fakeGenerator());
+    expect(stats).toMatchObject({ toDelete: 1, upToDate: 0 });
+    expect(fs.existsSync(path.join(root, `_thumbnail/private.jpg.${IMAGE_PARAMS}.abc.jpg`))).toBe(
+      true,
+    ); // state never deletes
+
+    const cleanupStats = await run("cleanup", undefined, fakeProber({}), fakeGenerator());
+    expect(cleanupStats).toMatchObject({ toDelete: 1 });
+    expect(fs.existsSync(path.join(root, `_thumbnail/private.jpg.${IMAGE_PARAMS}.abc.jpg`))).toBe(
+      false,
+    );
   });
 });

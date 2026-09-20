@@ -27,11 +27,14 @@ priority to decide between overlapping globs implying _different_ target classes
 
 No call site anywhere in this codebase uses SQL `GLOB` — every glob match, for every command and every
 policy type, happens in memory via `matchesAnyGlob` (`src/fs/glob-match.ts`, wrapping `minimatch`; see
-[the README's "Glob syntax" section](../README.md#glob-syntax) for the full dialect). Two call
-sites check a path against every ignore policy: `update_cache`'s merge-join (local creations) and
-`apply-remote-changes.ts`'s merge-join (remote arrivals) — both preload the (expected-small) policy list
-once via `IgnorePoliciesRepository.listGlobs()` before the loop starts, rather than re-querying it per
-path, since one side of each merge-join (a filesystem walk) was never SQL rows to begin with.
+[the README's "Glob syntax" section](../README.md#glob-syntax) for the full dialect). Three call
+sites check a path against every ignore policy: `update_cache`'s merge-join (local creations),
+`apply-remote-changes.ts`'s merge-join (remote arrivals), and `scanThumbnails`'s own walk
+(`src/fs/thumbnail.ts` — see below) — all three preload the (expected-small) policy list once via
+`IgnorePoliciesRepository.listGlobs()` before the loop starts, rather than re-querying it per path, since
+one side of each walk/merge-join (a filesystem walk) was never SQL rows to begin with. `sanity_check`
+reuses the same `matchesAnyGlob` utility too, for its own read-only diagnostic purpose — see its own
+section below.
 
 ## What matching actually gates
 
@@ -61,6 +64,15 @@ path, since one side of each merge-join (a filesystem walk) was never SQL rows t
   quirk (the content was committed before the policy existed, or before this machine had synced the
   policy), so it's surfaced as a warning (`ignoredButSynced` / `sync`'s `ignored_but_synced` output field)
   rather than a failure — it never changes `sync`'s exit code.
+
+- **Thumbnail candidate** (`scanThumbnails`, `sync1 thumbnail state/ensure/cleanup`): a match means the
+  path is skipped entirely — never probed, never policy-resolved, exactly as if it matched no
+  `thumbnail_policy` glob at all. Deliberately unconditional, unlike `update_cache`'s own
+  "only an uncommitted row" carve-out above: a thumbnail is a local-only artifact with no cross-machine
+  propagation concern, so there's no reason to spare an already-thumbnailed path once its glob becomes
+  ignored. Nothing deletes its existing thumbnail directly either — it's simply never claimed by this
+  scan, so it falls through the ordinary unclaimed-orphan sweep (`toDelete`) like any other orphaned
+  thumbnail. See [thumbnails.md](thumbnails.md#thumbnail_policy-deciding-what-gets-a-thumbnail).
 
 Since `sync` runs `performUpdateCache` internally as its own first phase, both local-creation cases
 above take effect identically whether the scan runs via the standalone `update_cache` command or as part
