@@ -64,6 +64,14 @@ export async function performGc(
   s3QueueLimit: number,
   onBeforeCas?: () => Promise<void>,
   onProgress?: (deleted: number) => void,
+  /**
+   * The orphan count, reported once, before the first delete is dispatched
+   * -- gc is the one command that has always known its exact total up
+   * front (`countStagedOrphans` below runs before the loop) and simply
+   * never told anyone, leaving its bar to infer a denominator from its own
+   * running dispatch count.
+   */
+  onTotalKnown?: (total: number) => void,
 ): Promise<GcResult> {
   const currentKey = remoteKey(s3.location, CURRENT_POINTER_KEY);
 
@@ -169,7 +177,15 @@ export async function performGc(
         // delete to s3Pool with backpressure rather than awaiting inline --
         // an unbounded producer feeding a pool is just as unbounded as
         // materializing the whole orphan set into an array up front.
-        let dispatched = 0;
+        onTotalKnown?.(orphanCount);
+        // Counted on *completion*, not dispatch -- which is what this
+        // callback's own parameter name always claimed. Dispatch runs
+        // ahead of the pool by design (that's what the backpressure above
+        // bounds), so advancing there would race the bar to 100% while
+        // deletes were still in flight. Harmless while the denominator was
+        // itself derived from the dispatch count; wrong the moment the
+        // denominator became the real total.
+        let deleted = 0;
         for (const o of objectsRepo.iterateStagedOrphans()) {
           await waitForRoom(s3Pool, s3QueueLimit);
           void s3Pool.add(async () => {
@@ -178,10 +194,10 @@ export async function performGc(
               { pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size },
               "completed",
             );
+            deleted++;
+            onProgress?.(deleted);
           });
           logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "dispatched");
-          dispatched++;
-          onProgress?.(dispatched);
         }
         await s3Pool.onIdle();
 

@@ -105,10 +105,11 @@ async function runGc(
       pools.s3,
       pools.s3.concurrency * 2,
       undefined,
-      (n) => {
-        progress.setOverallTotal(n);
-        progress.advanceOverall(1);
-      },
+      // Absolute count of completed deletes, not a delta -- the pool
+      // resolves out of order, so only the callback's own running tally is
+      // meaningful.
+      (deleted) => progress.setOverallProgress(deleted),
+      (total) => progress.setOverallTotal(total, { final: true }),
     );
   } finally {
     progress.stop();
