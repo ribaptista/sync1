@@ -42,6 +42,8 @@ function readCacheEntry(root: string, relativePath: string): { hash: string | nu
 const IMAGE_GENERATE_FLAGS = [
   "--media-type",
   "image",
+  "--resizing-strategy",
+  "fit_to_box",
   "--image-width",
   "16",
   "--image-height",
@@ -53,6 +55,8 @@ const IMAGE_GENERATE_FLAGS = [
 const VIDEO_GENERATE_FLAGS = [
   "--media-type",
   "video",
+  "--output-type",
+  "mosaic",
   "--tile-rows",
   "2",
   "--tile-columns",
@@ -465,6 +469,100 @@ describe("thumbnail lifecycle (end to end)", () => {
     const cleanupWithFlagParsed = JSON.parse(cleanupWithFlag.stdout) as ThumbnailStatsJson;
     expect(cleanupWithFlagParsed.stale_stub_previews).toHaveLength(1);
     expect(fs.existsSync(thumbPath)).toBe(false); // actually removed with the flag
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("a mosaic policy and a gif policy matching the same video each generate their own real file through the CLI", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    fs.copyFileSync(path.join(FIXTURES_DIR, "tiny.mp4"), path.join(root, "clip.mp4"));
+
+    const mosaicPolicy = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "*.mp4",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "mosaic",
+        "--mime-types",
+        "video/*",
+        ...VIDEO_GENERATE_FLAGS,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(mosaicPolicy.exitCode).toBe(0);
+
+    const gifPolicy = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "*.mp4",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "gif",
+        "--mime-types",
+        "video/*",
+        "--media-type",
+        "video",
+        "--output-type",
+        "gif",
+        "--tile-size",
+        "16",
+        "--frame-count",
+        "4",
+        "--frame-delay-ms",
+        "100",
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(gifPolicy.exitCode).toBe(0);
+
+    await runCli(["update_cache", "--root", root, "--json"]);
+    const ensure = await runCli(["thumbnail", "ensure", "--root", root, "--json"]);
+    expect(JSON.parse(ensure.stdout) as ThumbnailStatsJson).toMatchObject({
+      to_generate: 2,
+      errors: 0,
+    });
+
+    const thumbs = fs.readdirSync(path.join(root, "_thumbnail"));
+    expect(thumbs).toHaveLength(2);
+    expect(
+      thumbs.some((f) => /^clip\.mp4\.p1-mosaic-tr2-tc2-ts16-q80\.[0-9a-f]+\.jpg$/.test(f)),
+    ).toBe(true);
+    expect(thumbs.some((f) => /^clip\.mp4\.p1-gif-ts16-fc4-fd100\.[0-9a-f]+\.gif$/.test(f))).toBe(
+      true,
+    );
+
+    const second = await runCli(["thumbnail", "state", "--root", root, "--json"]);
+    expect(JSON.parse(second.stdout) as ThumbnailStatsJson).toMatchObject({
+      up_to_date: 2,
+      to_generate: 0,
+      to_delete: 0,
+    });
 
     fs.rmSync(root, { recursive: true, force: true });
   });

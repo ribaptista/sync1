@@ -2,6 +2,8 @@ import type Database from "better-sqlite3";
 
 export type ThumbnailPolicyAction = "skip" | "generate";
 export type ThumbnailPolicyMediaType = "image" | "video";
+export type ThumbnailResizingStrategy = "fit_to_box" | "resize_shorter_side";
+export type ThumbnailOutputType = "mosaic" | "gif";
 
 const MIME_TYPE_PATTERN = /^[a-zA-Z0-9.+-]+\/(\*|[a-zA-Z0-9.+-]+)$/;
 /** Matches the table's own CHECK constraint: non-empty, alphanumeric plus underscore only -- see 0007's migration comment and src/fs/thumbnail.ts's filename-grammar use of it. */
@@ -19,29 +21,49 @@ interface Base {
  * Flat, not nested: every existing consumer reads a field like
  * `policy.imageWidth` or `policy.tileSize` directly, and nesting a
  * `generate: {...}` sub-object would force an `if (policy.action ===
- * "generate")` unwrap everywhere for no safety gain over the discriminant
- * already living on `action`/`mediaType`. A 'skip' row carries no
- * `mediaType` at all (never applicable); a 'generate' row is *either* an
- * image policy or a video policy, never both -- no more nonsense tile
- * fields on an image-only policy, no more `!` non-null assertions
- * scattered through consuming code.
+ * "generate")` unwrap everywhere for no safety gain over the discriminants
+ * already living on `action`/`mediaType`/`resizingStrategy`/`outputType`.
+ * A 'skip' row carries none of them. A 'generate' row is exactly one of
+ * four branches -- an image policy picks a `resizingStrategy` (which
+ * fields apply), a video policy picks an `outputType` (which fields
+ * apply) -- never fields from a branch it isn't. `tileSize` is the one
+ * field 'mosaic' and 'gif' share (frame/tile shorter-side target);
+ * `jpegQuality` is the one field every branch *except* 'gif' has (a GIF
+ * is never JPEG-encoded).
  */
 export type ThumbnailPolicyRow =
   | (Base & { action: "skip" })
   | (Base & {
       action: "generate";
       mediaType: "image";
+      resizingStrategy: "fit_to_box";
       imageWidth: number;
       imageHeight: number;
       jpegQuality: number;
     })
   | (Base & {
       action: "generate";
+      mediaType: "image";
+      resizingStrategy: "resize_shorter_side";
+      shorterSide: number;
+      jpegQuality: number;
+    })
+  | (Base & {
+      action: "generate";
       mediaType: "video";
+      outputType: "mosaic";
       tileRowCount: number;
       tileColumnCount: number;
       tileSize: number;
       jpegQuality: number;
+    })
+  | (Base & {
+      action: "generate";
+      mediaType: "video";
+      outputType: "gif";
+      tileSize: number;
+      frameCount: number;
+      frameDelayMs: number;
     });
 
 /** What a policy match actually is -- a 'skip' row is never useful past the fact that it matched. */
@@ -54,6 +76,7 @@ export type ThumbnailPolicyCreateInput =
       glob: string;
       action: "generate";
       mediaType: "image";
+      resizingStrategy: "fit_to_box";
       mimeTypes: string[];
       imageWidth: number;
       imageHeight: number;
@@ -63,12 +86,34 @@ export type ThumbnailPolicyCreateInput =
       name: string;
       glob: string;
       action: "generate";
+      mediaType: "image";
+      resizingStrategy: "resize_shorter_side";
+      mimeTypes: string[];
+      shorterSide: number;
+      jpegQuality: number;
+    }
+  | {
+      name: string;
+      glob: string;
+      action: "generate";
       mediaType: "video";
+      outputType: "mosaic";
       mimeTypes: string[];
       tileRowCount: number;
       tileColumnCount: number;
       tileSize: number;
       jpegQuality: number;
+    }
+  | {
+      name: string;
+      glob: string;
+      action: "generate";
+      mediaType: "video";
+      outputType: "gif";
+      mimeTypes: string[];
+      tileSize: number;
+      frameCount: number;
+      frameDelayMs: number;
     };
 
 /**
@@ -85,34 +130,92 @@ export interface ThumbnailPolicyUpdate {
   action?: ThumbnailPolicyAction;
   mimeTypes?: string[];
   mediaType?: ThumbnailPolicyMediaType;
+  resizingStrategy?: ThumbnailResizingStrategy;
   imageWidth?: number;
   imageHeight?: number;
+  shorterSide?: number;
+  outputType?: ThumbnailOutputType;
   tileRowCount?: number;
   tileColumnCount?: number;
   tileSize?: number;
+  frameCount?: number;
+  frameDelayMs?: number;
   jpegQuality?: number;
 }
 
-/** The all-nullable shape both the SQL layer and `update()`'s merge work in -- every field a row could possibly have, regardless of which branch is actually live. */
+/** Every field a row could possibly have, regardless of which branch is actually live -- the all-nullable shape both the SQL layer and `update()`'s merge work in. */
 interface FlatPolicyFields {
   name: string;
   glob: string;
   action: ThumbnailPolicyAction;
   mimeTypes: string[];
   mediaType: ThumbnailPolicyMediaType | null;
+  resizingStrategy: ThumbnailResizingStrategy | null;
   imageWidth: number | null;
   imageHeight: number | null;
+  shorterSide: number | null;
+  outputType: ThumbnailOutputType | null;
   tileRowCount: number | null;
   tileColumnCount: number | null;
   tileSize: number | null;
+  frameCount: number | null;
+  frameDelayMs: number | null;
   jpegQuality: number | null;
 }
 
-type TypeSpecificFieldName =
-  "imageWidth" | "imageHeight" | "tileRowCount" | "tileColumnCount" | "tileSize";
+export type GenerateFieldName =
+  | "imageWidth"
+  | "imageHeight"
+  | "shorterSide"
+  | "tileRowCount"
+  | "tileColumnCount"
+  | "tileSize"
+  | "frameCount"
+  | "frameDelayMs"
+  | "jpegQuality";
 
-const IMAGE_FIELD_NAMES = ["imageWidth", "imageHeight"] as const;
-const VIDEO_FIELD_NAMES = ["tileRowCount", "tileColumnCount", "tileSize"] as const;
+const ALL_GENERATE_FIELD_NAMES: readonly GenerateFieldName[] = [
+  "imageWidth",
+  "imageHeight",
+  "shorterSide",
+  "tileRowCount",
+  "tileColumnCount",
+  "tileSize",
+  "frameCount",
+  "frameDelayMs",
+  "jpegQuality",
+];
+
+/**
+ * A 'generate' row is exactly one of these four branches -- keyed by
+ * `mediaType:resizingStrategy` for image, `mediaType:outputType` for
+ * video. Each branch's field list is exactly what that branch requires;
+ * everything else in `ALL_GENERATE_FIELD_NAMES` is forbidden for it. Two
+ * fields are deliberately shared across branches -- `tileSize` (mosaic
+ * and gif: one tile's / one frame's shorter side) and `jpegQuality`
+ * (every branch except gif) -- which is also what lets `update()`'s
+ * generic per-field carry logic (below) carry them across a branch switch
+ * without a field-specific special case.
+ */
+export const GENERATE_BRANCH_FIELDS = {
+  "image:fit_to_box": ["imageWidth", "imageHeight", "jpegQuality"],
+  "image:resize_shorter_side": ["shorterSide", "jpegQuality"],
+  "video:mosaic": ["tileRowCount", "tileColumnCount", "tileSize", "jpegQuality"],
+  "video:gif": ["tileSize", "frameCount", "frameDelayMs"],
+} as const satisfies Record<string, readonly GenerateFieldName[]>;
+
+export type GenerateBranchKey = keyof typeof GENERATE_BRANCH_FIELDS;
+
+/** `undefined` for a 'skip' row, or a row missing the second discriminant it needs (caught as a validation error before this is ever consulted for real). */
+function branchKeyFor(
+  mediaType: ThumbnailPolicyMediaType | null,
+  resizingStrategy: ThumbnailResizingStrategy | null,
+  outputType: ThumbnailOutputType | null,
+): GenerateBranchKey | undefined {
+  if (mediaType === "image" && resizingStrategy) return `image:${resizingStrategy}`;
+  if (mediaType === "video" && outputType) return `video:${outputType}`;
+  return undefined;
+}
 
 function validateName(name: string): void {
   if (!NAME_PATTERN.test(name)) {
@@ -160,23 +263,21 @@ function validateMediaTypeMimeConsistency(
 }
 
 /**
- * Checks the action/media-type/generate-fields consistency invariant the
- * `thumbnail_policies` table's own three-way CHECK constraint also
- * enforces, but ahead of time with a friendly, field-naming error message.
- * A 'skip' row must have no media type, and none of the six generate
- * fields at all. A 'generate' row must have a media type; given that media
- * type, it must have every field belonging to its own type (image fields ∪
- * jpegQuality, or video fields ∪ jpegQuality) and none of the other type's
- * fields.
+ * Checks the action/media-type/resizing-strategy/output-type/generate-
+ * fields consistency invariant the `thumbnail_policies` table's own
+ * five-way CHECK constraint also enforces, but ahead of time with a
+ * friendly, field-naming error message. A 'skip' row must have no media
+ * type and none of the nine generate-only fields. A 'generate' row must
+ * pick a media type, then (for 'image') a `resizingStrategy` or (for
+ * 'video') an `outputType`, and carry exactly that branch's own fields
+ * (`GENERATE_BRANCH_FIELDS`) and no others.
  */
 function validateActionConsistency(flat: FlatPolicyFields): void {
   if (flat.action === "skip") {
     if (flat.mediaType != null) {
       throw new Error("a 'skip' policy can't have a media type");
     }
-    const present = [...IMAGE_FIELD_NAMES, ...VIDEO_FIELD_NAMES, "jpegQuality" as const].filter(
-      (name) => flat[name] != null,
-    );
+    const present = ALL_GENERATE_FIELD_NAMES.filter((name) => flat[name] != null);
     if (present.length > 0) {
       throw new Error(`a 'skip' policy can't set ${present.join(", ")}`);
     }
@@ -186,26 +287,37 @@ function validateActionConsistency(flat: FlatPolicyFields): void {
   if (flat.mediaType == null) {
     throw new Error("a 'generate' policy needs a media type");
   }
-
-  const [ownFieldNames, otherFieldNames] =
-    flat.mediaType === "image"
-      ? [IMAGE_FIELD_NAMES, VIDEO_FIELD_NAMES]
-      : [VIDEO_FIELD_NAMES, IMAGE_FIELD_NAMES];
-
-  const missing = [...ownFieldNames, "jpegQuality" as const].filter((name) => flat[name] == null);
-  if (missing.length > 0) {
-    throw new Error(`a 'generate' '${flat.mediaType}' policy needs ${missing.join(", ")}`);
+  if (flat.mediaType === "image" && flat.resizingStrategy == null) {
+    throw new Error("a 'generate' 'image' policy needs a resizing strategy");
+  }
+  if (flat.mediaType === "video" && flat.outputType == null) {
+    throw new Error("a 'generate' 'video' policy needs an output type");
   }
 
-  const present = otherFieldNames.filter((name) => flat[name] != null);
+  const branchKey = branchKeyFor(flat.mediaType, flat.resizingStrategy, flat.outputType)!;
+  const ownFieldNames = GENERATE_BRANCH_FIELDS[branchKey];
+  const branchLabel =
+    flat.mediaType === "image"
+      ? `'image'/'${flat.resizingStrategy}'`
+      : `'video'/'${flat.outputType}'`;
+
+  const missing = ownFieldNames.filter((name) => flat[name] == null);
+  if (missing.length > 0) {
+    throw new Error(`a 'generate' ${branchLabel} policy needs ${missing.join(", ")}`);
+  }
+
+  const present = ALL_GENERATE_FIELD_NAMES.filter(
+    (name) => flat[name] != null && !(ownFieldNames as readonly string[]).includes(name),
+  );
   if (present.length > 0) {
-    throw new Error(`a 'generate' '${flat.mediaType}' policy can't set ${present.join(", ")}`);
+    throw new Error(`a 'generate' ${branchLabel} policy can't set ${present.join(", ")}`);
   }
 }
 
 const ROW_COLUMNS =
-  "id, name, glob, action, mime_types, media_type, image_width, image_height, " +
-  "tile_row_count, tile_column_count, tile_size, jpeg_quality, created_at";
+  "id, name, glob, action, mime_types, media_type, resizing_strategy, image_width, image_height, " +
+  "shorter_side, output_type, tile_row_count, tile_column_count, tile_size, frame_count, " +
+  "frame_delay_ms, jpeg_quality, created_at";
 
 interface RawRow {
   id: number;
@@ -214,11 +326,16 @@ interface RawRow {
   action: ThumbnailPolicyAction;
   mime_types: string;
   media_type: ThumbnailPolicyMediaType | null;
+  resizing_strategy: ThumbnailResizingStrategy | null;
   image_width: number | null;
   image_height: number | null;
+  shorter_side: number | null;
+  output_type: ThumbnailOutputType | null;
   tile_row_count: number | null;
   tile_column_count: number | null;
   tile_size: number | null;
+  frame_count: number | null;
+  frame_delay_ms: number | null;
   jpeg_quality: number | null;
   created_at: string;
 }
@@ -236,71 +353,124 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
     return { ...base, action: "skip" };
   }
 
-  // Non-null assertions below rely on the table's own three-way CHECK
-  // constraint: a 'generate' row's media-type-appropriate fields (plus
-  // jpegQuality) are always NOT NULL, never on trust alone.
+  // Non-null assertions below rely on the table's own five-way CHECK
+  // constraint: a 'generate' row's branch-appropriate fields are always
+  // NOT NULL, never on trust alone.
   if (row.media_type === "image") {
+    if (row.resizing_strategy === "fit_to_box") {
+      return {
+        ...base,
+        action: "generate",
+        mediaType: "image",
+        resizingStrategy: "fit_to_box",
+        imageWidth: row.image_width!,
+        imageHeight: row.image_height!,
+        jpegQuality: row.jpeg_quality!,
+      };
+    }
+    // resizing_strategy === "resize_shorter_side" -- the CHECK constraint
+    // leaves no other possibility for a 'generate'+'image' row.
     return {
       ...base,
       action: "generate",
       mediaType: "image",
-      imageWidth: row.image_width!,
-      imageHeight: row.image_height!,
+      resizingStrategy: "resize_shorter_side",
+      shorterSide: row.shorter_side!,
       jpegQuality: row.jpeg_quality!,
     };
   }
-  // media_type === "video" -- the CHECK constraint leaves no other
-  // possibility for a 'generate' row.
+  // media_type === "video"
+  if (row.output_type === "mosaic") {
+    return {
+      ...base,
+      action: "generate",
+      mediaType: "video",
+      outputType: "mosaic",
+      tileRowCount: row.tile_row_count!,
+      tileColumnCount: row.tile_column_count!,
+      tileSize: row.tile_size!,
+      jpegQuality: row.jpeg_quality!,
+    };
+  }
+  // output_type === "gif" -- the CHECK constraint leaves no other
+  // possibility for a 'generate'+'video' row.
   return {
     ...base,
     action: "generate",
     mediaType: "video",
-    tileRowCount: row.tile_row_count!,
-    tileColumnCount: row.tile_column_count!,
+    outputType: "gif",
     tileSize: row.tile_size!,
-    jpegQuality: row.jpeg_quality!,
+    frameCount: row.frame_count!,
+    frameDelayMs: row.frame_delay_ms!,
   };
 }
 
 /** The inverse of `fromRawRow`'s narrowing -- flattens a validated row back to the all-nullable shape `update()`'s merge and the SQL layer both need. */
 function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
   const base = { name: row.name, glob: row.glob, mimeTypes: row.mimeTypes };
+  const empty: Omit<FlatPolicyFields, keyof typeof base | "action"> = {
+    mediaType: null,
+    resizingStrategy: null,
+    imageWidth: null,
+    imageHeight: null,
+    shorterSide: null,
+    outputType: null,
+    tileRowCount: null,
+    tileColumnCount: null,
+    tileSize: null,
+    frameCount: null,
+    frameDelayMs: null,
+    jpegQuality: null,
+  };
+
   if (row.action === "skip") {
+    return { ...base, ...empty, action: "skip" };
+  }
+  if (row.mediaType === "image" && row.resizingStrategy === "fit_to_box") {
     return {
       ...base,
-      action: "skip",
-      mediaType: null,
-      imageWidth: null,
-      imageHeight: null,
-      tileRowCount: null,
-      tileColumnCount: null,
-      tileSize: null,
-      jpegQuality: null,
+      ...empty,
+      action: "generate",
+      mediaType: "image",
+      resizingStrategy: "fit_to_box",
+      imageWidth: row.imageWidth,
+      imageHeight: row.imageHeight,
+      jpegQuality: row.jpegQuality,
     };
   }
   if (row.mediaType === "image") {
     return {
       ...base,
+      ...empty,
       action: "generate",
       mediaType: "image",
-      imageWidth: row.imageWidth,
-      imageHeight: row.imageHeight,
-      tileRowCount: null,
-      tileColumnCount: null,
-      tileSize: null,
+      resizingStrategy: "resize_shorter_side",
+      shorterSide: row.shorterSide,
+      jpegQuality: row.jpegQuality,
+    };
+  }
+  if (row.outputType === "mosaic") {
+    return {
+      ...base,
+      ...empty,
+      action: "generate",
+      mediaType: "video",
+      outputType: "mosaic",
+      tileRowCount: row.tileRowCount,
+      tileColumnCount: row.tileColumnCount,
+      tileSize: row.tileSize,
       jpegQuality: row.jpegQuality,
     };
   }
   return {
     ...base,
+    ...empty,
     action: "generate",
     mediaType: "video",
-    imageWidth: null,
-    imageHeight: null,
-    tileRowCount: row.tileRowCount,
-    tileColumnCount: row.tileColumnCount,
+    outputType: "gif",
     tileSize: row.tileSize,
-    jpegQuality: row.jpegQuality,
+    frameCount: row.frameCount,
+    frameDelayMs: row.frameDelayMs,
   };
 }
 
@@ -322,11 +492,16 @@ function flatFromCreateInput(input: ThumbnailPolicyCreateInput): FlatPolicyField
     action: input.action,
     mimeTypes: input.mimeTypes,
     mediaType: loose.mediaType ?? null,
+    resizingStrategy: loose.resizingStrategy ?? null,
     imageWidth: loose.imageWidth ?? null,
     imageHeight: loose.imageHeight ?? null,
+    shorterSide: loose.shorterSide ?? null,
+    outputType: loose.outputType ?? null,
     tileRowCount: loose.tileRowCount ?? null,
     tileColumnCount: loose.tileColumnCount ?? null,
     tileSize: loose.tileSize ?? null,
+    frameCount: loose.frameCount ?? null,
+    frameDelayMs: loose.frameDelayMs ?? null,
     jpegQuality: loose.jpegQuality ?? null,
   };
 }
@@ -389,6 +564,11 @@ export class ThumbnailPoliciesRepository {
           ThumbnailPolicyAction,
           string,
           ThumbnailPolicyMediaType | null,
+          ThumbnailResizingStrategy | null,
+          number | null,
+          number | null,
+          number | null,
+          ThumbnailOutputType | null,
           number | null,
           number | null,
           number | null,
@@ -399,9 +579,10 @@ export class ThumbnailPoliciesRepository {
         ]
       >(
         `INSERT INTO thumbnail_policies (
-          name, glob, action, mime_types, media_type, image_width, image_height,
-          tile_row_count, tile_column_count, tile_size, jpeg_quality, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          name, glob, action, mime_types, media_type, resizing_strategy, image_width, image_height,
+          shorter_side, output_type, tile_row_count, tile_column_count, tile_size, frame_count,
+          frame_delay_ms, jpeg_quality, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         flat.name,
@@ -409,11 +590,16 @@ export class ThumbnailPoliciesRepository {
         flat.action,
         JSON.stringify(flat.mimeTypes),
         flat.mediaType,
+        flat.resizingStrategy,
         flat.imageWidth,
         flat.imageHeight,
+        flat.shorterSide,
+        flat.outputType,
         flat.tileRowCount,
         flat.tileColumnCount,
         flat.tileSize,
+        flat.frameCount,
+        flat.frameDelayMs,
         flat.jpegQuality,
         new Date().toISOString(),
       );
@@ -425,16 +611,19 @@ export class ThumbnailPoliciesRepository {
    * re-validating the resulting whole. Returns `false` for a nonexistent
    * id.
    *
-   * Switching to a different branch -- 'skip'->'generate',
-   * 'generate'->'skip', or (staying 'generate' but) 'image'<->'video' --
-   * drops every field of the branch being left: each must come fresh from
-   * `changes`, exactly like the already-tested skip<->generate behavior.
-   * The one exception is `jpegQuality`, the single field both 'generate'
-   * branches share: it survives an 'image'<->'video' switch, since that
-   * switch never actually leaves the 'generate' action at all. Branch-
-   * switching a policy this way also requires resupplying `--mime-types`
-   * to match the new media type, or `validateMediaTypeMimeConsistency`
-   * rejects it below.
+   * A field carries over from the existing row only if the *new* branch
+   * (after applying `action`/`mediaType`/`resizingStrategy`/`outputType`
+   * from `changes`) also has that field in its own set
+   * (`GENERATE_BRANCH_FIELDS`) -- otherwise it's forced to `null`,
+   * regardless of what the old row had. This one rule handles every case
+   * uniformly, including the two fields shared across branches:
+   * `jpegQuality` (every branch but 'gif') and `tileSize` ('mosaic' and
+   * 'gif') both carry across a switch between their shared branches
+   * without needing a field-specific special case, because `old[name]`
+   * is already `null` for a field the *old* branch didn't have -- so
+   * "carry `old[name]` forward when the new branch wants this field"
+   * degrades correctly to "nothing to carry" when the old branch never
+   * had it either.
    */
   update(id: number, changes: ThumbnailPolicyUpdate): boolean {
     const row = this.get(id);
@@ -449,24 +638,25 @@ export class ThumbnailPoliciesRepository {
       action === "generate"
         ? (changes.mediaType ?? (old.action === "generate" ? old.mediaType : null))
         : null;
+    const resizingStrategy =
+      action === "generate" && mediaType === "image"
+        ? (changes.resizingStrategy ?? (old.mediaType === "image" ? old.resizingStrategy : null))
+        : null;
+    const outputType =
+      action === "generate" && mediaType === "video"
+        ? (changes.outputType ?? (old.mediaType === "video" ? old.outputType : null))
+        : null;
 
-    const actionSwitched = action !== old.action;
-    const branchChanged = actionSwitched || (action === "generate" && mediaType !== old.mediaType);
+    const newBranchKey = branchKeyFor(mediaType, resizingStrategy, outputType);
+    const newBranchFields: readonly GenerateFieldName[] = newBranchKey
+      ? GENERATE_BRANCH_FIELDS[newBranchKey]
+      : [];
 
-    const typeField = (name: TypeSpecificFieldName): number | null => {
-      if (changes[name] !== undefined) return changes[name];
-      return branchChanged ? null : old[name];
+    const field = (fieldName: GenerateFieldName): number | null => {
+      if (changes[fieldName] !== undefined) return changes[fieldName];
+      if (!newBranchFields.includes(fieldName)) return null;
+      return old[fieldName];
     };
-
-    // jpegQuality drops only when the *action* itself switches (skip<->
-    // generate); an image<->video switch leaves it alone, per the doc
-    // comment above.
-    const jpegQuality =
-      changes.jpegQuality !== undefined
-        ? changes.jpegQuality
-        : actionSwitched
-          ? null
-          : old.jpegQuality;
 
     const flat: FlatPolicyFields = {
       name,
@@ -474,12 +664,17 @@ export class ThumbnailPoliciesRepository {
       action,
       mimeTypes,
       mediaType,
-      imageWidth: typeField("imageWidth"),
-      imageHeight: typeField("imageHeight"),
-      tileRowCount: typeField("tileRowCount"),
-      tileColumnCount: typeField("tileColumnCount"),
-      tileSize: typeField("tileSize"),
-      jpegQuality,
+      resizingStrategy,
+      outputType,
+      imageWidth: field("imageWidth"),
+      imageHeight: field("imageHeight"),
+      shorterSide: field("shorterSide"),
+      tileRowCount: field("tileRowCount"),
+      tileColumnCount: field("tileColumnCount"),
+      tileSize: field("tileSize"),
+      frameCount: field("frameCount"),
+      frameDelayMs: field("frameDelayMs"),
+      jpegQuality: field("jpegQuality"),
     };
 
     validateName(flat.name);
@@ -495,6 +690,11 @@ export class ThumbnailPoliciesRepository {
           ThumbnailPolicyAction,
           string,
           ThumbnailPolicyMediaType | null,
+          ThumbnailResizingStrategy | null,
+          number | null,
+          number | null,
+          number | null,
+          ThumbnailOutputType | null,
           number | null,
           number | null,
           number | null,
@@ -505,8 +705,9 @@ export class ThumbnailPoliciesRepository {
         ]
       >(
         `UPDATE thumbnail_policies SET
-          name = ?, glob = ?, action = ?, mime_types = ?, media_type = ?, image_width = ?, image_height = ?,
-          tile_row_count = ?, tile_column_count = ?, tile_size = ?, jpeg_quality = ?
+          name = ?, glob = ?, action = ?, mime_types = ?, media_type = ?, resizing_strategy = ?,
+          image_width = ?, image_height = ?, shorter_side = ?, output_type = ?, tile_row_count = ?,
+          tile_column_count = ?, tile_size = ?, frame_count = ?, frame_delay_ms = ?, jpeg_quality = ?
         WHERE id = ?`,
       )
       .run(
@@ -515,11 +716,16 @@ export class ThumbnailPoliciesRepository {
         flat.action,
         JSON.stringify(flat.mimeTypes),
         flat.mediaType,
+        flat.resizingStrategy,
         flat.imageWidth,
         flat.imageHeight,
+        flat.shorterSide,
+        flat.outputType,
         flat.tileRowCount,
         flat.tileColumnCount,
         flat.tileSize,
+        flat.frameCount,
+        flat.frameDelayMs,
         flat.jpegQuality,
         id,
       );

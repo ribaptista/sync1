@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   computeContainFitSize,
-  computeMosaicFrameSize,
+  computeShorterSideFitSize,
 } from "../../../src/media/thumbnail-generate.js";
 
 describe("computeContainFitSize", () => {
@@ -65,12 +65,12 @@ describe("computeContainFitSize", () => {
   });
 });
 
-describe("computeMosaicFrameSize", () => {
+describe("computeShorterSideFitSize", () => {
   it("scales a matching-orientation (landscape) source so its short side hits shortSide exactly", () => {
     // 400x300, ratio 4:3 -- min dimension is height (300). scale = 150/300 =
     // 0.5, applied uniformly: 400*0.5=200, 300*0.5=150. Both axes land
     // exactly on an integer, nothing to round.
-    expect(computeMosaicFrameSize({ width: 400, height: 300 }, 150)).toEqual({
+    expect(computeShorterSideFitSize({ width: 400, height: 300 }, 150)).toEqual({
       width: 200,
       height: 150,
     });
@@ -78,7 +78,7 @@ describe("computeMosaicFrameSize", () => {
 
   it("has no orientation concept at all -- a transposed source with the same shortSide produces the exact transpose", () => {
     // 700x500 (landscape): min=500, scale=100/500=0.2 -> {140,100}.
-    expect(computeMosaicFrameSize({ width: 700, height: 500 }, 100)).toEqual({
+    expect(computeShorterSideFitSize({ width: 700, height: 500 }, 100)).toEqual({
       width: 140,
       height: 100,
     });
@@ -88,7 +88,7 @@ describe("computeMosaicFrameSize", () => {
     // internal box-orientation swap to get right or wrong -- the formula
     // has no pairing between the source's shape and anything else, so
     // transposing the input just transposes the output.
-    expect(computeMosaicFrameSize({ width: 500, height: 700 }, 100)).toEqual({
+    expect(computeShorterSideFitSize({ width: 500, height: 700 }, 100)).toEqual({
       width: 100,
       height: 140,
     });
@@ -100,14 +100,14 @@ describe("computeMosaicFrameSize", () => {
     // (shortSide/min) == shortSide, modulo float noise that doesn't land
     // here). height = 82*scale = 90.864864... -- Math.round takes it to
     // 91, independent of the (exact) width computation.
-    expect(computeMosaicFrameSize({ width: 37, height: 82 }, 41)).toEqual({
+    expect(computeShorterSideFitSize({ width: 37, height: 82 }, 41)).toEqual({
       width: 41,
       height: 91,
     });
   });
 
   it("scales a square source uniformly on both axes", () => {
-    expect(computeMosaicFrameSize({ width: 500, height: 500 }, 125)).toEqual({
+    expect(computeShorterSideFitSize({ width: 500, height: 500 }, 125)).toEqual({
       width: 125,
       height: 125,
     });

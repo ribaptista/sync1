@@ -73,11 +73,15 @@ const GENERATE_JPEG = {
   name: "img",
   action: "generate",
   mediaType: "image",
+  resizingStrategy: "fit_to_box",
   mimeTypes: ["image/jpeg"],
   imageWidth: 320,
   imageHeight: 240,
   jpegQuality: 80,
-} satisfies Omit<Extract<ThumbnailPolicyCreateInput, { mediaType: "image" }>, "glob">;
+} satisfies Omit<
+  Extract<ThumbnailPolicyCreateInput, { mediaType: "image"; resizingStrategy: "fit_to_box" }>,
+  "glob"
+>;
 
 function createGeneratePolicy(glob: string, overrides: Partial<typeof GENERATE_JPEG> = {}): number {
   return policiesRepo.create({ ...GENERATE_JPEG, glob, ...overrides });
@@ -108,12 +112,15 @@ function fakeProber(entries: Record<string, ProbedMedia>): MediaProber {
 function fakeGenerator(failFor: Set<string> = new Set()): ThumbnailGenerator & {
   imageCalls: { sourcePath: string; destPath: string; width: number; height: number }[];
   videoCalls: { sourcePath: string; destPath: string }[];
+  gifCalls: { sourcePath: string; destPath: string }[];
 } {
   const imageCalls: { sourcePath: string; destPath: string; width: number; height: number }[] = [];
   const videoCalls: { sourcePath: string; destPath: string }[] = [];
+  const gifCalls: { sourcePath: string; destPath: string }[] = [];
   return {
     imageCalls,
     videoCalls,
+    gifCalls,
     async generateImageThumbnail(input) {
       if (failFor.has(input.sourcePath)) {
         throw new ThumbnailGenerationError(`simulated failure for ${input.sourcePath}`);
@@ -129,6 +136,14 @@ function fakeGenerator(failFor: Set<string> = new Set()): ThumbnailGenerator & {
       videoCalls.push(input);
       fs.mkdirSync(path.dirname(input.destPath), { recursive: true });
       fs.writeFileSync(input.destPath, "mosaic");
+    },
+    async generateVideoGif(input) {
+      if (failFor.has(input.sourcePath)) {
+        throw new ThumbnailGenerationError(`simulated failure for ${input.sourcePath}`);
+      }
+      gifCalls.push(input);
+      fs.mkdirSync(path.dirname(input.destPath), { recursive: true });
+      fs.writeFileSync(input.destPath, "gif");
     },
   };
 }
@@ -557,6 +572,7 @@ describe("scanThumbnails", () => {
           else resolveB = finish;
         }),
       generateVideoMosaic: async () => {},
+      generateVideoGif: async () => {},
     };
 
     const updates: { total: number; generated: number }[] = [];
@@ -706,6 +722,7 @@ describe("scanThumbnails", () => {
       glob: "*.mp4",
       action: "generate",
       mediaType: "video",
+      outputType: "mosaic",
       mimeTypes: ["video/*"],
       tileRowCount: 3,
       tileColumnCount: 3,
@@ -731,6 +748,132 @@ describe("scanThumbnails", () => {
     expect(generator.videoCalls).toHaveLength(1);
     expect(generator.videoCalls[0]).toMatchObject({
       destPath: path.join(root, `_thumbnail/clip.mp4.${VIDEO_PARAMS}.vid1.jpg`),
+    });
+  });
+
+  it("generates via generateVideoGif for an 'output_type=gif' policy -- .gif extension, no jpegQuality in the params segment", async () => {
+    policiesRepo.create({
+      name: "gifpolicy",
+      glob: "*.mp4",
+      action: "generate",
+      mediaType: "video",
+      outputType: "gif",
+      mimeTypes: ["video/*"],
+      tileSize: 32,
+      frameCount: 6,
+      frameDelayMs: 100,
+    });
+    writeFile("clip.mp4");
+    seedCache("clip.mp4", "vid1");
+
+    const media: ProbedMedia = {
+      kind: "video",
+      mimeType: "video/mp4",
+      width: 1920,
+      height: 1080,
+      durationSeconds: 10,
+    };
+    const generator = fakeGenerator();
+    const stats = await run("ensure", undefined, fakeProber({ "clip.mp4": media }), generator);
+
+    expect(stats).toMatchObject({ toGenerate: 1 });
+    expect(generator.videoCalls).toHaveLength(0); // mosaic generator untouched
+    expect(generator.gifCalls).toHaveLength(1);
+    expect(generator.gifCalls[0]).toMatchObject({
+      destPath: path.join(root, "_thumbnail/clip.mp4.p1-gifpolicy-ts32-fc6-fd100.vid1.gif"),
+    });
+
+    // Up to date on the next run -- the .gif extension round-trips through
+    // parseThumbnailEntry/expectedThumbExtension correctly.
+    const second = await run(
+      "state",
+      undefined,
+      fakeProber({ "clip.mp4": media }),
+      fakeGenerator(),
+    );
+    expect(second).toMatchObject({ upToDate: 1, toGenerate: 0 });
+  });
+
+  it("a mosaic policy and a gif policy both matching the same video each produce their own thumbnail", async () => {
+    policiesRepo.create({
+      name: "mosaicpolicy",
+      glob: "*.mp4",
+      action: "generate",
+      mediaType: "video",
+      outputType: "mosaic",
+      mimeTypes: ["video/*"],
+      tileRowCount: 2,
+      tileColumnCount: 2,
+      tileSize: 32,
+      jpegQuality: 80,
+    });
+    policiesRepo.create({
+      name: "gifpolicy",
+      glob: "*.mp4",
+      action: "generate",
+      mediaType: "video",
+      outputType: "gif",
+      mimeTypes: ["video/*"],
+      tileSize: 32,
+      frameCount: 4,
+      frameDelayMs: 100,
+    });
+    writeFile("clip.mp4");
+    seedCache("clip.mp4", "vid1");
+
+    const media = {
+      kind: "video" as const,
+      mimeType: "video/mp4",
+      width: 1920,
+      height: 1080,
+      durationSeconds: 10,
+    };
+    const generator = fakeGenerator();
+    const stats = await run("ensure", undefined, fakeProber({ "clip.mp4": media }), generator);
+
+    expect(stats).toMatchObject({ toGenerate: 2, toDelete: 0 });
+    expect(generator.videoCalls).toHaveLength(1);
+    expect(generator.gifCalls).toHaveLength(1);
+    expect(
+      fs.existsSync(
+        path.join(root, "_thumbnail/clip.mp4.p1-mosaicpolicy-tr2-tc2-ts32-q80.vid1.jpg"),
+      ),
+    ).toBe(true);
+    expect(
+      fs.existsSync(path.join(root, "_thumbnail/clip.mp4.p1-gifpolicy-ts32-fc4-fd100.vid1.gif")),
+    ).toBe(true);
+  });
+
+  it("generates via resize_shorter_side, scaling the source's shorter side to the configured target", async () => {
+    policiesRepo.create({
+      name: "short",
+      glob: "*.jpg",
+      action: "generate",
+      mediaType: "image",
+      resizingStrategy: "resize_shorter_side",
+      mimeTypes: ["image/jpeg"],
+      shorterSide: 100,
+      jpegQuality: 80,
+    });
+    writeFile("photo.jpg");
+    seedCache("photo.jpg", "abc");
+
+    // JPEG_IMAGE is 800x600 -- shorter side (600) scaled to 100 gives
+    // scale 1/6, so width also scales to 800/6 = 133.33... -> 133.
+    const generator = fakeGenerator();
+    const stats = await run(
+      "ensure",
+      undefined,
+      fakeProber({ "photo.jpg": JPEG_IMAGE }),
+      generator,
+    );
+
+    expect(stats).toMatchObject({ toGenerate: 1 });
+    expect(generator.imageCalls).toHaveLength(1);
+    expect(generator.imageCalls[0]).toMatchObject({
+      width: 133,
+      height: 100,
+      destPath: path.join(root, "_thumbnail/photo.jpg.p1-short-ss100-q80.abc.jpg"),
     });
   });
 

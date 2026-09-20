@@ -15,6 +15,7 @@ import type {
 import type { MediaProber, ProbedMedia } from "../media/probe.js";
 import {
   computeContainFitSize,
+  computeShorterSideFitSize,
   ThumbnailGenerationError,
   type ThumbnailGenerator,
 } from "../media/thumbnail-generate.js";
@@ -95,10 +96,25 @@ const PARAMS_VERSION = "p1";
  */
 const PARAMS_SEGMENT_RE = /^p1-[A-Za-z0-9_]+(?:-[a-z]+\d+)+$/;
 
+/**
+ * Four branches, one per `ThumbnailPolicyGenerateRow` arm -- see that
+ * type's own doc comment (thumbnail-policies-repository.ts) for why each
+ * carries exactly these fields and no others. `ss`/`fc`/`fd` are new for
+ * 'resize_shorter_side'/'gif'; `iw`/`ih`/`tr`/`tc`/`ts`/`q` are unchanged
+ * from before this policy gained a second discriminant per media type. A
+ * 'gif' row has no `q` segment at all -- a GIF is never JPEG-encoded, so
+ * there's no quality setting to encode (see the repository's own
+ * `GENERATE_BRANCH_FIELDS`).
+ */
 function expectedParamsSegment(policy: ThumbnailPolicyGenerateRow): string {
-  return policy.mediaType === "image"
-    ? `${PARAMS_VERSION}-${policy.name}-iw${policy.imageWidth}-ih${policy.imageHeight}-q${policy.jpegQuality}`
-    : `${PARAMS_VERSION}-${policy.name}-tr${policy.tileRowCount}-tc${policy.tileColumnCount}-ts${policy.tileSize}-q${policy.jpegQuality}`;
+  if (policy.mediaType === "image") {
+    return policy.resizingStrategy === "fit_to_box"
+      ? `${PARAMS_VERSION}-${policy.name}-iw${policy.imageWidth}-ih${policy.imageHeight}-q${policy.jpegQuality}`
+      : `${PARAMS_VERSION}-${policy.name}-ss${policy.shorterSide}-q${policy.jpegQuality}`;
+  }
+  return policy.outputType === "mosaic"
+    ? `${PARAMS_VERSION}-${policy.name}-tr${policy.tileRowCount}-tc${policy.tileColumnCount}-ts${policy.tileSize}-q${policy.jpegQuality}`
+    : `${PARAMS_VERSION}-${policy.name}-ts${policy.tileSize}-fc${policy.frameCount}-fd${policy.frameDelayMs}`;
 }
 
 interface ExistingThumbnailFile {
@@ -281,8 +297,19 @@ interface GenerationJob {
  */
 const RAW_IMAGE_MIME_TYPES = new Set<string>(["image/x-canon-cr2"]);
 
-function expectedThumbExtension(decision: ProvisionalDecisionProbed): string {
-  if (decision.probed.kind === "video") return "jpg";
+/**
+ * For a video, the extension is the *policy's* own `outputType`, not a
+ * property of the source at all -- 'mosaic' is always a JPEG regardless of
+ * container, 'gif' is always a GIF. For an image, unchanged: the policy's
+ * `resizingStrategy` plays no role, since both image branches produce the
+ * same output format (the original's own extension, or `.jpg` for a
+ * write-incapable source format).
+ */
+function expectedThumbExtension(
+  decision: ProvisionalDecisionProbed,
+  policy: ThumbnailPolicyGenerateRow,
+): string {
+  if (policy.mediaType === "video") return policy.outputType === "gif" ? "gif" : "jpg";
   if (RAW_IMAGE_MIME_TYPES.has(decision.probed.mimeType)) return "jpg";
   return fileExtension(decision.relativePath);
 }
@@ -361,7 +388,7 @@ async function generateForDecision(
 ): Promise<void> {
   if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
 
-  const thumbExt = expectedThumbExtension(decision);
+  const thumbExt = expectedThumbExtension(decision, policy);
   const paramsSegment = expectedParamsSegment(policy);
   const destRelativePath = thumbnailRelativePath(
     decision.relativePath,
@@ -379,10 +406,11 @@ async function generateForDecision(
         `internal error: matched policy media type "${policy.mediaType}" doesn't agree with probed kind "image" for "${decision.relativePath}"`,
       );
     }
-    const size = computeContainFitSize(
-      { width: decision.probed.width, height: decision.probed.height },
-      { width: policy.imageWidth, height: policy.imageHeight },
-    );
+    const source = { width: decision.probed.width, height: decision.probed.height };
+    const size =
+      policy.resizingStrategy === "fit_to_box"
+        ? computeContainFitSize(source, { width: policy.imageWidth, height: policy.imageHeight })
+        : computeShorterSideFitSize(source, policy.shorterSide);
     await generator.generateImageThumbnail(
       {
         sourcePath: sourceAbsolutePath,
@@ -399,20 +427,36 @@ async function generateForDecision(
         `internal error: matched policy media type "${policy.mediaType}" doesn't agree with probed kind "video" for "${decision.relativePath}"`,
       );
     }
-    await generator.generateVideoMosaic(
-      {
-        sourcePath: sourceAbsolutePath,
-        destPath: destAbsolutePath,
-        sourceWidth: decision.probed.width,
-        sourceHeight: decision.probed.height,
-        durationSeconds: decision.probed.durationSeconds,
-        tileRowCount: policy.tileRowCount,
-        tileColumnCount: policy.tileColumnCount,
-        tileSize: policy.tileSize,
-        jpegQuality: policy.jpegQuality,
-      },
-      logger,
-    );
+    if (policy.outputType === "mosaic") {
+      await generator.generateVideoMosaic(
+        {
+          sourcePath: sourceAbsolutePath,
+          destPath: destAbsolutePath,
+          sourceWidth: decision.probed.width,
+          sourceHeight: decision.probed.height,
+          durationSeconds: decision.probed.durationSeconds,
+          tileRowCount: policy.tileRowCount,
+          tileColumnCount: policy.tileColumnCount,
+          tileSize: policy.tileSize,
+          jpegQuality: policy.jpegQuality,
+        },
+        logger,
+      );
+    } else {
+      await generator.generateVideoGif(
+        {
+          sourcePath: sourceAbsolutePath,
+          destPath: destAbsolutePath,
+          sourceWidth: decision.probed.width,
+          sourceHeight: decision.probed.height,
+          durationSeconds: decision.probed.durationSeconds,
+          frameCount: policy.frameCount,
+          frameDelayMs: policy.frameDelayMs,
+          tileSize: policy.tileSize,
+        },
+        logger,
+      );
+    }
   }
 }
 
@@ -636,10 +680,10 @@ export async function scanThumbnails(
     // files any policy accounted for; whatever's left over at the end --
     // an orphan from a deleted/renamed policy, or a leftover duplicate --
     // is swept the same way a single-policy setup always has been.
-    const expectedExt = expectedThumbExtension(decision);
     const claimedThumbs = new Set<ExistingThumbnailFile>();
 
     for (const policy of decision.resolution.policies) {
+      const expectedExt = expectedThumbExtension(decision, policy);
       const expectedParams = expectedParamsSegment(policy);
       const upToDateMatch = existing.find(
         (t) =>

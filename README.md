@@ -160,6 +160,7 @@ cp ~/Pictures/sunset.jpg ~/backups/photos/sunset.jpg
 SYNC1_PASSWORD='correct horse battery staple' \
   sync1 thumbnail_policy create "*.jpg" generate --root ~/backups/photos \
   --name jpg_thumb --mime-types image/jpeg --media-type image \
+  --resizing-strategy fit_to_box \
   --image-width 320 --image-height 240 --jpeg-quality 80
 ```
 

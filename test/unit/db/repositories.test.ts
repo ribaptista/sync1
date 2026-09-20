@@ -715,9 +715,21 @@ const IMAGE_GENERATE_INPUT = {
   glob: "**/*.jpg",
   action: "generate" as const,
   mediaType: "image" as const,
+  resizingStrategy: "fit_to_box" as const,
   mimeTypes: ["image/jpeg"],
   imageWidth: 320,
   imageHeight: 240,
+  jpegQuality: 80,
+};
+
+const IMAGE_SHORTER_SIDE_INPUT = {
+  name: "img_short",
+  glob: "**/*.jpg",
+  action: "generate" as const,
+  mediaType: "image" as const,
+  resizingStrategy: "resize_shorter_side" as const,
+  mimeTypes: ["image/jpeg"],
+  shorterSide: 150,
   jpegQuality: 80,
 };
 
@@ -726,11 +738,24 @@ const VIDEO_GENERATE_INPUT = {
   glob: "**/*.mp4",
   action: "generate" as const,
   mediaType: "video" as const,
+  outputType: "mosaic" as const,
   mimeTypes: ["video/mp4"],
   tileRowCount: 4,
   tileColumnCount: 4,
   tileSize: 90,
   jpegQuality: 80,
+};
+
+const VIDEO_GIF_INPUT = {
+  name: "vid_gif",
+  glob: "**/*.mp4",
+  action: "generate" as const,
+  mediaType: "video" as const,
+  outputType: "gif" as const,
+  mimeTypes: ["video/mp4"],
+  tileSize: 64,
+  frameCount: 8,
+  frameDelayMs: 100,
 };
 
 const SKIP_INPUT = {
@@ -766,6 +791,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       glob: "**/*.jpg",
       action: "generate",
       mediaType: "image",
+      resizingStrategy: "fit_to_box",
       mimeTypes: ["image/jpeg"],
       imageWidth: 320,
       imageHeight: 240,
@@ -802,11 +828,51 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       glob: "**/*.mp4",
       action: "generate",
       mediaType: "video",
+      outputType: "mosaic",
       mimeTypes: ["video/mp4"],
       tileRowCount: 4,
       tileColumnCount: 4,
       tileSize: 90,
       jpegQuality: 80,
+      createdAt: expect.any(String) as string,
+    });
+  });
+
+  it("creates, lists, and gets an image/resize_shorter_side row", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+
+    const id = repo.create(IMAGE_SHORTER_SIDE_INPUT);
+    expect(repo.get(id)).toEqual({
+      id,
+      name: "img_short",
+      glob: "**/*.jpg",
+      action: "generate",
+      mediaType: "image",
+      resizingStrategy: "resize_shorter_side",
+      mimeTypes: ["image/jpeg"],
+      shorterSide: 150,
+      jpegQuality: 80,
+      createdAt: expect.any(String) as string,
+    });
+  });
+
+  it("creates, lists, and gets a video/gif row -- no jpegQuality, since a GIF is never JPEG", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+
+    const id = repo.create(VIDEO_GIF_INPUT);
+    expect(repo.get(id)).toEqual({
+      id,
+      name: "vid_gif",
+      glob: "**/*.mp4",
+      action: "generate",
+      mediaType: "video",
+      outputType: "gif",
+      mimeTypes: ["video/mp4"],
+      tileSize: 64,
+      frameCount: 8,
+      frameDelayMs: 100,
       createdAt: expect.any(String) as string,
     });
   });
@@ -948,14 +1014,24 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     const skipId = repo.create(SKIP_INPUT);
     // Switching skip -> generate without supplying the newly-required fields
     // in the same call fails -- nothing carries over from the skip row's
-    // (all-null) generate fields.
+    // (all-null) generate fields. mediaType alone isn't enough for an
+    // 'image' row either -- resizingStrategy is checked before the fields
+    // that strategy itself would require.
     expect(() => repo.update(skipId, { action: "generate", mediaType: "image" })).toThrow(
-      /imageWidth/,
+      /resizing strategy/,
     );
+    expect(() =>
+      repo.update(skipId, {
+        action: "generate",
+        mediaType: "image",
+        resizingStrategy: "fit_to_box",
+      }),
+    ).toThrow(/imageWidth/);
     expect(
       repo.update(skipId, {
         action: "generate",
         mediaType: "image",
+        resizingStrategy: "fit_to_box",
         mimeTypes: ["image/jpeg"], // must be resupplied -- the skip row's own mix of image/video types no longer matches 'image'
         imageWidth: 100,
         imageHeight: 100,
@@ -965,6 +1041,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(repo.get(skipId)).toMatchObject({
       action: "generate",
       mediaType: "image",
+      resizingStrategy: "fit_to_box",
       imageWidth: 100,
     });
   });
@@ -977,6 +1054,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       glob: "**/*.jpg",
       action: "generate",
       mediaType: "image",
+      resizingStrategy: "fit_to_box",
       mimeTypes: ["image/jpeg"],
       imageWidth: 320,
       imageHeight: 240,
@@ -985,16 +1063,17 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
 
     // Switching without supplying the new type's own fields fails --
     // nothing about the video shape carries over from an image row.
-    expect(() => repo.update(id, { mediaType: "video", mimeTypes: ["video/mp4"] })).toThrow(
-      /tileRowCount/,
-    );
+    expect(() =>
+      repo.update(id, { mediaType: "video", outputType: "mosaic", mimeTypes: ["video/mp4"] }),
+    ).toThrow(/tileRowCount/);
 
-    // image -> video: imageWidth/imageHeight are dropped (not part of the
-    // video shape at all); jpegQuality (85) carries over untouched, since
-    // it's never overridden here.
+    // image -> video: imageWidth/imageHeight/resizingStrategy are dropped
+    // (not part of the video shape at all); jpegQuality (85) carries over
+    // untouched, since it's never overridden here and 'mosaic' shares it.
     expect(
       repo.update(id, {
         mediaType: "video",
+        outputType: "mosaic",
         mimeTypes: ["video/mp4"],
         tileRowCount: 3,
         tileColumnCount: 5,
@@ -1007,6 +1086,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       glob: "**/*.jpg",
       action: "generate",
       mediaType: "video",
+      outputType: "mosaic",
       mimeTypes: ["video/mp4"],
       tileRowCount: 3,
       tileColumnCount: 5,
@@ -1020,6 +1100,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(
       repo.update(id, {
         mediaType: "image",
+        resizingStrategy: "fit_to_box",
         mimeTypes: ["image/png"],
         imageWidth: 50,
         imageHeight: 60,
@@ -1032,10 +1113,55 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       glob: "**/*.jpg",
       action: "generate",
       mediaType: "image",
+      resizingStrategy: "fit_to_box",
       mimeTypes: ["image/png"],
       imageWidth: 50,
       imageHeight: 60,
       jpegQuality: 42,
+      createdAt: expect.any(String) as string,
+    });
+  });
+
+  it("update() switching resizingStrategy within 'image' drops the losing strategy's fields, carries jpegQuality", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const id = repo.create(IMAGE_GENERATE_INPUT); // fit_to_box, jpegQuality 80
+
+    expect(repo.update(id, { resizingStrategy: "resize_shorter_side", shorterSide: 100 })).toBe(
+      true,
+    );
+    expect(repo.get(id)).toEqual({
+      id,
+      name: "img_thumb",
+      glob: "**/*.jpg",
+      action: "generate",
+      mediaType: "image",
+      resizingStrategy: "resize_shorter_side",
+      mimeTypes: ["image/jpeg"],
+      shorterSide: 100,
+      jpegQuality: 80, // carried -- both strategies share it
+      createdAt: expect.any(String) as string,
+    });
+  });
+
+  it("update() switching outputType within 'video' carries tileSize but drops jpegQuality when switching to 'gif'", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const id = repo.create(VIDEO_GENERATE_INPUT); // mosaic, tileSize 90, jpegQuality 80
+
+    expect(() => repo.update(id, { outputType: "gif" })).toThrow(/frameCount/);
+    expect(repo.update(id, { outputType: "gif", frameCount: 6, frameDelayMs: 80 })).toBe(true);
+    expect(repo.get(id)).toEqual({
+      id,
+      name: "vid_thumb",
+      glob: "**/*.mp4",
+      action: "generate",
+      mediaType: "video",
+      outputType: "gif",
+      mimeTypes: ["video/mp4"],
+      tileSize: 90, // carried -- 'mosaic' and 'gif' share it
+      frameCount: 6,
+      frameDelayMs: 80,
       createdAt: expect.any(String) as string,
     });
   });

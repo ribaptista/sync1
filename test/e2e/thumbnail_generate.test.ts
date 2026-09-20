@@ -5,7 +5,7 @@ import path from "node:path";
 import { realMediaProber } from "../../src/media/probe.js";
 import {
   computeContainFitSize,
-  computeMosaicFrameSize,
+  computeShorterSideFitSize,
   realThumbnailGenerator,
 } from "../../src/media/thumbnail-generate.js";
 
@@ -208,7 +208,7 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
   it("produces a portrait mosaic (not stretched/squished) from a landscape-encoded, -90-rotated source -- the exact bug this plan started from", async () => {
     // Full-stack proof that the rotation fix (probeVideo swapping
     // width/height for a display-rotated stream) and the tile-sizing
-    // redesign (computeMosaicFrameSize, no fixed box to disagree with a
+    // redesign (computeShorterSideFitSize, no fixed box to disagree with a
     // source's real orientation) work together correctly, composed the
     // same way generateForDecision composes them in production: probe
     // first, feed the *probed* (rotation-corrected) dimensions into
@@ -221,7 +221,7 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
       width: number;
       height: number;
     };
-    const frame = computeMosaicFrameSize({ width: sourceWidth, height: sourceHeight }, 10);
+    const frame = computeShorterSideFitSize({ width: sourceWidth, height: sourceHeight }, 10);
     expect(frame.height).toBeGreaterThan(frame.width); // portrait, matching the display-rotated source
 
     // xstack requires at least 2 inputs, so a 1x1 "mosaic" isn't a valid
@@ -253,6 +253,106 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
       mimeType: "image/jpeg",
       width: frame.width,
       height: frame.height * 2,
+    });
+  });
+});
+
+describe("generateVideoGif (real ffmpeg)", () => {
+  it("generates an animated GIF sized by computeShorterSideFitSize, same frame-extraction shape as a mosaic", async () => {
+    const destPath = path.join(mkTempDir(), "clip.gif");
+    // tiny.mp4 is 32x24 (landscape, min dimension 24). tileSize 16 (reused
+    // as the GIF's own per-frame shorter-side target, same knob a mosaic
+    // policy's tileSize is) gives scale 16/24, frame = {width:
+    // round(32*16/24)=21, height: round(24*16/24)=16} -- computed the same
+    // way generateVideoMosaic's own frame size is.
+    const frame = computeShorterSideFitSize({ width: 32, height: 24 }, 16);
+    await realThumbnailGenerator.generateVideoGif(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        frameCount: 4,
+        frameDelayMs: 100,
+        tileSize: 16,
+      },
+      silentLogger,
+    );
+
+    // identify's "[0]" frame index (src/media/probe.ts's probeImage) reads
+    // exactly the first frame, which -- since every extracted frame is
+    // scaled identically -- reports the same dimensions any frame would.
+    const probed = await realMediaProber.detectMedia(destPath);
+    expect(probed).toEqual({
+      kind: "image",
+      mimeType: "image/gif",
+      width: frame.width,
+      height: frame.height,
+    });
+  });
+
+  it("cleans up its temp frame directory even after generating successfully", async () => {
+    const destPath = path.join(mkTempDir(), "clip.gif");
+    const tmpEntriesBefore = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith("sync1-gif-"));
+
+    await realThumbnailGenerator.generateVideoGif(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        frameCount: 3,
+        frameDelayMs: 200,
+        tileSize: 10,
+      },
+      silentLogger,
+    );
+
+    const tmpEntriesAfter = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith("sync1-gif-"));
+    expect(tmpEntriesAfter.length).toBe(tmpEntriesBefore.length);
+
+    const probed = await realMediaProber.detectMedia(destPath);
+    expect(probed).toMatchObject({ kind: "image", mimeType: "image/gif" });
+  });
+
+  it("produces a portrait GIF (not stretched/squished) from a landscape-encoded, -90-rotated source", async () => {
+    // Same rotation-correctness proof as generateVideoMosaic's own
+    // equivalent test above, for the other output type: the probed
+    // (rotation-corrected) dimensions must drive frame sizing, not the
+    // raw encoded ones.
+    const probed = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "rotated-90.mp4"));
+    expect(probed).toMatchObject({ kind: "video", width: 24, height: 32 });
+
+    const destPath = path.join(mkTempDir(), "clip.gif");
+    const { width: sourceWidth, height: sourceHeight } = probed as {
+      width: number;
+      height: number;
+    };
+    const frame = computeShorterSideFitSize({ width: sourceWidth, height: sourceHeight }, 10);
+    expect(frame.height).toBeGreaterThan(frame.width); // portrait, matching the display-rotated source
+
+    await realThumbnailGenerator.generateVideoGif(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "rotated-90.mp4"),
+        destPath,
+        sourceWidth,
+        sourceHeight,
+        durationSeconds: 2,
+        frameCount: 3,
+        frameDelayMs: 100,
+        tileSize: 10,
+      },
+      silentLogger,
+    );
+
+    const gifProbed = await realMediaProber.detectMedia(destPath);
+    expect(gifProbed).toEqual({
+      kind: "image",
+      mimeType: "image/gif",
+      width: frame.width,
+      height: frame.height,
     });
   });
 });

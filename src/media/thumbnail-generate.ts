@@ -59,18 +59,24 @@ export function computeContainFitSize(source: Dimensions, box: Dimensions): Dime
 }
 
 /**
- * Computes the frame size for one mosaic tile: `shortSide` is a policy's
- * configured `tileSize`, the pixel length of a tile's *shorter* side --
+ * Scales `source` so its own *shorter* side lands exactly on `shortSide` --
  * scale is derived from whichever of `source`'s own dimensions is smaller,
  * and both axes are scaled by that same factor, so the long side falls out
  * of `source`'s own aspect ratio rather than being configured directly.
- * Deliberately has no orientation concept at all (no portrait/landscape
- * branch, unlike `computeContainFitSize` above) -- every frame sampled from
- * one video shares that video's aspect ratio, so there's no "declared box
- * vs. source orientation" pairing left to get wrong, structurally, not by
- * convention.
+ * Shared by two call sites with different names for the same knob: a video
+ * mosaic tile's `tileSize` (this file's `generateVideoMosaic`/
+ * `generateVideoGif`) and an image policy's `resize_shorter_side`
+ * `shorterSide` (`src/fs/thumbnail.ts`'s `generateForDecision`) -- both are
+ * "fit the shorter side to a target, let the rest fall out of the source's
+ * own aspect ratio," the same operation regardless of what produced the
+ * source pixels. Deliberately has no orientation concept at all (no
+ * portrait/landscape branch, unlike `computeContainFitSize` above) -- every
+ * frame sampled from one video shares that video's aspect ratio, and an
+ * image has only the one aspect ratio to begin with, so there's no
+ * "declared box vs. source orientation" pairing left to get wrong,
+ * structurally, not by convention.
  */
-export function computeMosaicFrameSize(source: Dimensions, shortSide: number): Dimensions {
+export function computeShorterSideFitSize(source: Dimensions, shortSide: number): Dimensions {
   const scale = shortSide / Math.min(source.width, source.height);
   return {
     width: Math.max(1, Math.round(source.width * scale)),
@@ -154,6 +160,7 @@ async function runTool(
 export interface ThumbnailGenerator {
   generateImageThumbnail(input: GenerateImageThumbnailInput, logger: Logger): Promise<void>;
   generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logger): Promise<void>;
+  generateVideoGif(input: GenerateVideoGifInput, logger: Logger): Promise<void>;
 }
 
 export interface GenerateImageThumbnailInput {
@@ -203,7 +210,7 @@ export interface GenerateVideoMosaicInput {
   durationSeconds: number;
   tileRowCount: number;
   tileColumnCount: number;
-  /** One tile's shorter-side target in pixels -- see `computeMosaicFrameSize`; the longer side is derived, never configured independently. */
+  /** One tile's shorter-side target in pixels -- see `computeShorterSideFitSize`; the longer side is derived, never configured independently. */
   tileSize: number;
   jpegQuality: number;
 }
@@ -217,7 +224,7 @@ function mapJpegQualityToFfmpegQScale(jpegQuality: number): number {
  * Samples `tileRowCount * tileColumnCount` frames at evenly-spaced,
  * center-of-bucket timestamps (deliberately avoiding literal first/last
  * frames, often black/blank/credits), scales each to `frame` (via
- * `computeMosaicFrameSize`, computed once -- every frame sampled from this
+ * `computeShorterSideFitSize`, computed once -- every frame sampled from this
  * one source shares its aspect ratio, so `frame` is constant across the
  * whole run, not recomputed per frame), then composites the grid via
  * ffmpeg's `xstack` filter into one JPEG. No `pad`: since every sampled
@@ -232,7 +239,7 @@ function mapJpegQualityToFfmpegQScale(jpegQuality: number): number {
  */
 async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logger): Promise<void> {
   const tileCount = input.tileRowCount * input.tileColumnCount;
-  const frame = computeMosaicFrameSize(
+  const frame = computeShorterSideFitSize(
     { width: input.sourceWidth, height: input.sourceHeight },
     input.tileSize,
   );
@@ -303,7 +310,122 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logg
   }
 }
 
+export interface GenerateVideoGifInput {
+  sourcePath: string;
+  /** Always a .gif destination -- video GIFs are always GIF regardless of the source container. */
+  destPath: string;
+  sourceWidth: number;
+  sourceHeight: number;
+  durationSeconds: number;
+  frameCount: number;
+  /** Per-frame display duration. Converted to an input framerate (`1000 / frameDelayMs`) -- ffmpeg's gif muxer derives each frame's stored delay from the stream's own framerate, there's no separate per-frame-delay flag to set directly. */
+  frameDelayMs: number;
+  /** Each frame's shorter-side target in pixels -- see `computeShorterSideFitSize`. Reuses a mosaic policy's own `tileSize` field/flag name deliberately, rather than a GIF-specific one -- see docs/architecture/thumbnails.md. */
+  tileSize: number;
+}
+
+/**
+ * Samples `frameCount` frames at evenly-spaced, center-of-bucket
+ * timestamps -- identical extraction shape to `generateVideoMosaic` above
+ * (same timestamp formula, same per-frame `ffmpeg` invocation, same
+ * `computeShorterSideFitSize` frame sizing), since stage 1 (getting N
+ * correctly-scaled PNG frames onto disk) doesn't care what stage 2 does
+ * with them. Stage 2 replaces `xstack`'s single-JPEG grid composite with
+ * the standard two-pass high-quality animated-GIF pipeline: `palettegen`
+ * builds one shared palette across every frame (a naive per-frame or
+ * fixed palette produces visibly banded/dithered output), then
+ * `paletteuse` re-encodes the frame sequence against that palette into
+ * the final looping GIF (`-loop 0`). Both passes read the same on-disk
+ * frame sequence via ffmpeg's image2 demuxer (`frame-%d.png`,
+ * `-start_number 0` explicit rather than relying on its default) at the
+ * same input framerate, derived from `frameDelayMs` -- there's no
+ * separate "set this frame's delay" flag; the gif muxer stores each
+ * frame's delay as however long the filtered stream says it should be on
+ * screen. Temporary per-frame PNGs (and the intermediate palette) live
+ * under a fresh temp directory, always removed in a `finally`.
+ */
+async function generateVideoGif(input: GenerateVideoGifInput, logger: Logger): Promise<void> {
+  const frame = computeShorterSideFitSize(
+    { width: input.sourceWidth, height: input.sourceHeight },
+    input.tileSize,
+  );
+  const fps = 1000 / input.frameDelayMs;
+
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "sync1-gif-"));
+  try {
+    for (let i = 0; i < input.frameCount; i++) {
+      const timestampSeconds = (input.durationSeconds * (i + 0.5)) / input.frameCount;
+      const framePath = path.join(tempDir, `frame-${i}.png`);
+      await runTool(
+        "ffmpeg",
+        [
+          "-y",
+          "-autorotate",
+          "-ss",
+          timestampSeconds.toFixed(3),
+          "-i",
+          input.sourcePath,
+          "-frames:v",
+          "1",
+          "-update",
+          "1",
+          "-vf",
+          `scale=${frame.width}:${frame.height}`,
+          framePath,
+        ],
+        "ffmpeg (frame extraction)",
+        logger,
+      );
+    }
+
+    const framePattern = path.join(tempDir, "frame-%d.png");
+    const palettePath = path.join(tempDir, "palette.png");
+    await runTool(
+      "ffmpeg",
+      [
+        "-y",
+        "-start_number",
+        "0",
+        "-framerate",
+        fps.toFixed(6),
+        "-i",
+        framePattern,
+        "-vf",
+        "palettegen",
+        palettePath,
+      ],
+      "ffmpeg (gif palette)",
+      logger,
+    );
+
+    await runTool(
+      "ffmpeg",
+      [
+        "-y",
+        "-start_number",
+        "0",
+        "-framerate",
+        fps.toFixed(6),
+        "-i",
+        framePattern,
+        "-i",
+        palettePath,
+        "-lavfi",
+        "paletteuse",
+        "-loop",
+        "0",
+        input.destPath,
+      ],
+      "ffmpeg (gif composite)",
+      logger,
+    );
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 export const realThumbnailGenerator: ThumbnailGenerator = {
   generateImageThumbnail,
   generateVideoMosaic,
+  generateVideoGif,
 };

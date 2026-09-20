@@ -24,11 +24,16 @@ interface RawThumbnailPolicyRow {
   action: string;
   mime_types: string;
   media_type: string | null;
+  resizing_strategy: string | null;
   image_width: number | null;
   image_height: number | null;
+  shorter_side: number | null;
+  output_type: string | null;
   tile_row_count: number | null;
   tile_column_count: number | null;
   tile_size: number | null;
+  frame_count: number | null;
+  frame_delay_ms: number | null;
   jpeg_quality: number | null;
 }
 
@@ -36,8 +41,9 @@ function readThumbnailPolicies(root: string): RawThumbnailPolicyRow[] {
   const db = new Database(path.join(root, ".sync1", "state.db"), { readonly: true });
   const rows = db
     .prepare(
-      `SELECT id, name, glob, action, mime_types, media_type, image_width, image_height,
-       tile_row_count, tile_column_count, tile_size, jpeg_quality
+      `SELECT id, name, glob, action, mime_types, media_type, resizing_strategy, image_width,
+       image_height, shorter_side, output_type, tile_row_count, tile_column_count, tile_size,
+       frame_count, frame_delay_ms, jpeg_quality
        FROM thumbnail_policies ORDER BY id`,
     )
     .all() as RawThumbnailPolicyRow[];
@@ -48,6 +54,8 @@ function readThumbnailPolicies(root: string): RawThumbnailPolicyRow[] {
 const IMAGE_GENERATE_FLAGS = [
   "--media-type",
   "image",
+  "--resizing-strategy",
+  "fit_to_box",
   "--image-width",
   "320",
   "--image-height",
@@ -56,9 +64,22 @@ const IMAGE_GENERATE_FLAGS = [
   "80",
 ];
 
+const IMAGE_SHORTER_SIDE_FLAGS = [
+  "--media-type",
+  "image",
+  "--resizing-strategy",
+  "resize_shorter_side",
+  "--shorter-side",
+  "150",
+  "--jpeg-quality",
+  "80",
+];
+
 const VIDEO_GENERATE_FLAGS = [
   "--media-type",
   "video",
+  "--output-type",
+  "mosaic",
   "--tile-rows",
   "4",
   "--tile-columns",
@@ -67,6 +88,19 @@ const VIDEO_GENERATE_FLAGS = [
   "90",
   "--jpeg-quality",
   "80",
+];
+
+const VIDEO_GIF_FLAGS = [
+  "--media-type",
+  "video",
+  "--output-type",
+  "gif",
+  "--tile-size",
+  "64",
+  "--frame-count",
+  "8",
+  "--frame-delay-ms",
+  "100",
 ];
 
 async function initVault(localstack: LocalStackHandle): Promise<string> {
@@ -144,11 +178,16 @@ describe("thumbnail_policy command", () => {
         action: "generate",
         mime_types: JSON.stringify(["image/jpeg"]),
         media_type: "image",
+        resizing_strategy: "fit_to_box",
         image_width: 320,
         image_height: 240,
+        shorter_side: null,
+        output_type: null,
         tile_row_count: null,
         tile_column_count: null,
         tile_size: null,
+        frame_count: null,
+        frame_delay_ms: null,
         jpeg_quality: 80,
       },
     ]);
@@ -205,11 +244,16 @@ describe("thumbnail_policy command", () => {
         action: "generate",
         mime_types: JSON.stringify(["video/*"]),
         media_type: "video",
+        resizing_strategy: null,
         image_width: null,
         image_height: null,
+        shorter_side: null,
+        output_type: "mosaic",
         tile_row_count: 4,
         tile_column_count: 4,
         tile_size: 90,
+        frame_count: null,
+        frame_delay_ms: null,
         jpeg_quality: 80,
       },
     ]);
@@ -246,14 +290,181 @@ describe("thumbnail_policy command", () => {
         action: "skip",
         mime_types: JSON.stringify(["image/*", "video/*"]),
         media_type: null,
+        resizing_strategy: null,
         image_width: null,
         image_height: null,
+        shorter_side: null,
+        output_type: null,
         tile_row_count: null,
         tile_column_count: null,
         tile_size: null,
+        frame_count: null,
+        frame_delay_ms: null,
         jpeg_quality: null,
       },
     ]);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("creates an image/resize_shorter_side generate policy", async () => {
+    const root = await initVault(localstack);
+
+    const create = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "**/*.jpg",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "jpg_short",
+        "--mime-types",
+        "image/jpeg",
+        ...IMAGE_SHORTER_SIDE_FLAGS,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(create.exitCode).toBe(0);
+
+    expect(readThumbnailPolicies(root)).toEqual([
+      {
+        id: expect.any(Number) as number,
+        name: "jpg_short",
+        glob: "**/*.jpg",
+        action: "generate",
+        mime_types: JSON.stringify(["image/jpeg"]),
+        media_type: "image",
+        resizing_strategy: "resize_shorter_side",
+        image_width: null,
+        image_height: null,
+        shorter_side: 150,
+        output_type: null,
+        tile_row_count: null,
+        tile_column_count: null,
+        tile_size: null,
+        frame_count: null,
+        frame_delay_ms: null,
+        jpeg_quality: 80,
+      },
+    ]);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("creates a video/gif generate policy -- no jpeg_quality, since a GIF is never JPEG", async () => {
+    const root = await initVault(localstack);
+
+    const create = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "**/*.mp4",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "mp4_gif",
+        "--mime-types",
+        "video/*",
+        ...VIDEO_GIF_FLAGS,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(create.exitCode).toBe(0);
+
+    expect(readThumbnailPolicies(root)).toEqual([
+      {
+        id: expect.any(Number) as number,
+        name: "mp4_gif",
+        glob: "**/*.mp4",
+        action: "generate",
+        mime_types: JSON.stringify(["video/*"]),
+        media_type: "video",
+        resizing_strategy: null,
+        image_width: null,
+        image_height: null,
+        shorter_side: null,
+        output_type: "gif",
+        tile_row_count: null,
+        tile_column_count: null,
+        tile_size: 64,
+        frame_count: 8,
+        frame_delay_ms: 100,
+        jpeg_quality: null,
+      },
+    ]);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("rejects --resizing-strategy on a video policy, and --output-type on an image policy", async () => {
+    const root = await initVault(localstack);
+
+    const imageWithOutputType = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "a/*",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "bad1",
+        "--mime-types",
+        "image/jpeg",
+        "--media-type",
+        "image",
+        "--output-type",
+        "mosaic",
+        "--image-width",
+        "10",
+        "--image-height",
+        "10",
+        "--jpeg-quality",
+        "80",
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(imageWithOutputType.exitCode).not.toBe(0);
+
+    const videoWithResizingStrategy = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "a/*",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "bad2",
+        "--mime-types",
+        "video/mp4",
+        "--media-type",
+        "video",
+        "--resizing-strategy",
+        "fit_to_box",
+        "--output-type",
+        "mosaic",
+        "--tile-rows",
+        "4",
+        "--tile-columns",
+        "4",
+        "--tile-size",
+        "90",
+        "--jpeg-quality",
+        "80",
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(videoWithResizingStrategy.exitCode).not.toBe(0);
+
+    expect(readThumbnailPolicies(root)).toEqual([]);
 
     fs.rmSync(root, { recursive: true, force: true });
   });
@@ -535,6 +746,8 @@ describe("thumbnail_policy command", () => {
         String(id),
         "--media-type",
         "video",
+        "--output-type",
+        "mosaic",
         "--tile-rows",
         "2",
         "--tile-columns",
@@ -556,6 +769,8 @@ describe("thumbnail_policy command", () => {
         String(id),
         "--media-type",
         "video",
+        "--output-type",
+        "mosaic",
         "--mime-types",
         "video/mp4",
         "--tile-rows",
@@ -574,6 +789,7 @@ describe("thumbnail_policy command", () => {
 
     expect(readThumbnailPolicies(root)[0]).toMatchObject({
       media_type: "video",
+      output_type: "mosaic",
       mime_types: JSON.stringify(["video/mp4"]),
       image_width: null,
       image_height: null,
@@ -581,6 +797,61 @@ describe("thumbnail_policy command", () => {
       tile_column_count: 2,
       tile_size: 50,
       jpeg_quality: 77, // carried across the image<->video switch, untouched
+    });
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("edit switching outputType mosaic->gif carries tileSize but drops jpegQuality", async () => {
+    const root = await initVault(localstack);
+
+    const create = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "**/*.mp4",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "mp4_thumb",
+        "--mime-types",
+        "video/*",
+        ...VIDEO_GENERATE_FLAGS,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    const id = (JSON.parse(create.stdout) as { id: number }).id;
+
+    const edit = await runCli(
+      [
+        "thumbnail_policy",
+        "edit",
+        String(id),
+        "--output-type",
+        "gif",
+        "--frame-count",
+        "6",
+        "--frame-delay-ms",
+        "80",
+        "--root",
+        root,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(edit.exitCode).toBe(0);
+
+    expect(readThumbnailPolicies(root)[0]).toMatchObject({
+      media_type: "video",
+      output_type: "gif",
+      tile_row_count: null,
+      tile_column_count: null,
+      tile_size: 90, // carried -- 'mosaic' and 'gif' share this field
+      frame_count: 6,
+      frame_delay_ms: 80,
+      jpeg_quality: null, // dropped -- a GIF is never JPEG
     });
 
     fs.rmSync(root, { recursive: true, force: true });

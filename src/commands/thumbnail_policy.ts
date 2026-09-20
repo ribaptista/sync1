@@ -10,11 +10,16 @@ import { localStateDbPath, localVaultJsonPath, localRemoteConfigPath } from "../
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import {
   ThumbnailPoliciesRepository,
+  GENERATE_BRANCH_FIELDS,
   type ThumbnailPolicyRow,
   type ThumbnailPolicyAction,
   type ThumbnailPolicyMediaType,
+  type ThumbnailResizingStrategy,
+  type ThumbnailOutputType,
   type ThumbnailPolicyCreateInput,
   type ThumbnailPolicyUpdate,
+  type GenerateFieldName,
+  type GenerateBranchKey,
 } from "../db/repositories/thumbnail-policies-repository.js";
 import { mutateStateDb } from "../sync/mutate-state-db.js";
 import { resolveRoot } from "../cli/resolve-root.js";
@@ -26,11 +31,16 @@ interface RootOption extends OptionValues {
 
 interface GenerateFieldOptions {
   mediaType?: string;
+  resizingStrategy?: string;
+  outputType?: string;
   imageWidth?: string;
   imageHeight?: string;
+  shorterSide?: string;
   tileRows?: string;
   tileColumns?: string;
   tileSize?: string;
+  frameCount?: string;
+  frameDelayMs?: string;
   jpegQuality?: string;
 }
 
@@ -79,6 +89,22 @@ function parseMediaType(raw: string): ThumbnailPolicyMediaType {
   return raw;
 }
 
+function parseResizingStrategy(raw: string): ThumbnailResizingStrategy {
+  if (raw !== "fit_to_box" && raw !== "resize_shorter_side") {
+    throw new Error(
+      `invalid resizing strategy "${raw}" — expected "fit_to_box" or "resize_shorter_side"`,
+    );
+  }
+  return raw;
+}
+
+function parseOutputType(raw: string): ThumbnailOutputType {
+  if (raw !== "mosaic" && raw !== "gif") {
+    throw new Error(`invalid output type "${raw}" — expected "mosaic" or "gif"`);
+  }
+  return raw;
+}
+
 function parsePositiveInt(raw: string, flagName: string): number {
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0) {
@@ -102,31 +128,54 @@ function parseMimeTypes(raw: string): string[] {
     .filter((s) => s.length > 0);
 }
 
-/** Image-only fields -- required together for a "generate" "image" policy, forbidden on a "generate" "video" one. */
-const IMAGE_FLAG_NAMES: Array<[flag: string, key: "imageWidth" | "imageHeight"]> = [
-  ["--image-width", "imageWidth"],
-  ["--image-height", "imageHeight"],
-];
-
-/** Video-only fields -- required together for a "generate" "video" policy, forbidden on a "generate" "image" one. `tileSize` replaces the old fixed tileWidth/tileHeight box: one shorter-side target, longer side derived per source. */
-const VIDEO_FLAG_NAMES: Array<[flag: string, key: "tileRows" | "tileColumns" | "tileSize"]> = [
-  ["--tile-rows", "tileRows"],
-  ["--tile-columns", "tileColumns"],
-  ["--tile-size", "tileSize"],
-];
-
-/** The one field both "generate" branches share, regardless of media type. */
-const SHARED_GENERATE_FLAG_NAMES: Array<[flag: string, key: "jpegQuality"]> = [
-  ["--jpeg-quality", "jpegQuality"],
-];
-
 interface ParsedGenerateFields {
   imageWidth?: number;
   imageHeight?: number;
+  shorterSide?: number;
   tileRowCount?: number;
   tileColumnCount?: number;
   tileSize?: number;
+  frameCount?: number;
+  frameDelayMs?: number;
   jpegQuality?: number;
+}
+
+/**
+ * The CLI's own flag name and raw-option-key for every field the
+ * repository's `GENERATE_BRANCH_FIELDS` knows about -- the two field
+ * names that differ from their repository name (`tileRows`/`tileColumns`
+ * vs `tileRowCount`/`tileColumnCount`) are historical, kept for CLI
+ * flag-naming ergonomics (`--tile-rows`, not `--tile-row-count`); every
+ * other field's CLI option key already matches its repository name
+ * one-for-one.
+ */
+const FIELD_INFO: Record<
+  GenerateFieldName,
+  { flag: string; optionKey: keyof GenerateFieldOptions }
+> = {
+  imageWidth: { flag: "--image-width", optionKey: "imageWidth" },
+  imageHeight: { flag: "--image-height", optionKey: "imageHeight" },
+  shorterSide: { flag: "--shorter-side", optionKey: "shorterSide" },
+  tileRowCount: { flag: "--tile-rows", optionKey: "tileRows" },
+  tileColumnCount: { flag: "--tile-columns", optionKey: "tileColumns" },
+  tileSize: { flag: "--tile-size", optionKey: "tileSize" },
+  frameCount: { flag: "--frame-count", optionKey: "frameCount" },
+  frameDelayMs: { flag: "--frame-delay-ms", optionKey: "frameDelayMs" },
+  jpegQuality: { flag: "--jpeg-quality", optionKey: "jpegQuality" },
+};
+
+const ALL_GENERATE_FIELD_NAMES = Object.keys(FIELD_INFO) as GenerateFieldName[];
+
+/** Fields that, by themselves, name exactly one branch -- used for the edit-only "don't mix branches" pre-check below. Deliberately excludes `tileSize`/`jpegQuality`, which are shared across more than one branch and so don't uniquely indicate one. */
+const BRANCH_ONLY_FIELDS: Record<GenerateBranchKey, GenerateFieldName[]> = {
+  "image:fit_to_box": ["imageWidth", "imageHeight"],
+  "image:resize_shorter_side": ["shorterSide"],
+  "video:mosaic": ["tileRowCount", "tileColumnCount"],
+  "video:gif": ["frameCount", "frameDelayMs"],
+};
+
+function isPresent(opts: GenerateFieldOptions, name: GenerateFieldName): boolean {
+  return opts[FIELD_INFO[name].optionKey] !== undefined;
 }
 
 /** Parses whichever of the generate-only flags were actually provided (each independently optional -- callers decide what "all" or "none" means for their command). */
@@ -136,40 +185,47 @@ function parseGenerateFields(opts: GenerateFieldOptions): ParsedGenerateFields {
     fields.imageWidth = parsePositiveInt(opts.imageWidth, "--image-width");
   if (opts.imageHeight !== undefined)
     fields.imageHeight = parsePositiveInt(opts.imageHeight, "--image-height");
+  if (opts.shorterSide !== undefined)
+    fields.shorterSide = parsePositiveInt(opts.shorterSide, "--shorter-side");
   if (opts.tileRows !== undefined)
     fields.tileRowCount = parsePositiveInt(opts.tileRows, "--tile-rows");
   if (opts.tileColumns !== undefined)
     fields.tileColumnCount = parsePositiveInt(opts.tileColumns, "--tile-columns");
   if (opts.tileSize !== undefined) fields.tileSize = parsePositiveInt(opts.tileSize, "--tile-size");
+  if (opts.frameCount !== undefined)
+    fields.frameCount = parsePositiveInt(opts.frameCount, "--frame-count");
+  if (opts.frameDelayMs !== undefined)
+    fields.frameDelayMs = parsePositiveInt(opts.frameDelayMs, "--frame-delay-ms");
   if (opts.jpegQuality !== undefined) fields.jpegQuality = parseJpegQuality(opts.jpegQuality);
   return fields;
 }
 
 /**
  * Fast, friendly, pre-network-round-trip check for `create`: a "skip"
- * policy must supply none of --media-type or any generate flag; a
- * "generate" policy must supply --media-type, then exactly that media
- * type's own fields (plus --jpeg-quality) and none of the other type's.
- * The repository re-validates the same invariant regardless (its own
- * CHECK constraint enforces it at the SQL level too) -- this only exists
- * to fail before `setupMutationContext`'s password/KDF/network work for
- * an obviously-wrong combination of flags.
+ * policy must supply none of --media-type/--resizing-strategy/--output-
+ * type or any generate flag; a "generate" policy must supply
+ * --media-type, then (for "image") --resizing-strategy or (for "video")
+ * --output-type, then exactly that branch's own fields
+ * (`GENERATE_BRANCH_FIELDS`) and none of the other branches'. The
+ * repository re-validates the same invariant regardless (its own CHECK
+ * constraint enforces it at the SQL level too) -- this only exists to
+ * fail before `setupMutationContext`'s password/KDF/network work for an
+ * obviously-wrong combination of flags.
  */
 function assertGenerateFlagsConsistentForCreate(
   action: ThumbnailPolicyAction,
   opts: CreateOptions,
 ): void {
-  const allGenerateFlagNames = [
-    ...IMAGE_FLAG_NAMES,
-    ...VIDEO_FLAG_NAMES,
-    ...SHARED_GENERATE_FLAG_NAMES,
-  ];
-
   if (action === "skip") {
-    const present = allGenerateFlagNames
-      .filter(([, key]) => opts[key] !== undefined)
-      .map(([flag]) => flag);
-    const allPresent = [...(opts.mediaType !== undefined ? ["--media-type"] : []), ...present];
+    const present = ALL_GENERATE_FIELD_NAMES.filter((name) => isPresent(opts, name)).map(
+      (name) => FIELD_INFO[name].flag,
+    );
+    const allPresent = [
+      ...(opts.mediaType !== undefined ? ["--media-type"] : []),
+      ...(opts.resizingStrategy !== undefined ? ["--resizing-strategy"] : []),
+      ...(opts.outputType !== undefined ? ["--output-type"] : []),
+      ...present,
+    ];
     if (allPresent.length > 0) {
       throw new Error(`a "skip" policy can't set ${allPresent.join(", ")}`);
     }
@@ -180,42 +236,70 @@ function assertGenerateFlagsConsistentForCreate(
     throw new Error('a "generate" policy needs --media-type');
   }
   const mediaType = parseMediaType(opts.mediaType);
-  const [ownFlagNames, otherFlagNames] =
-    mediaType === "image"
-      ? [IMAGE_FLAG_NAMES, VIDEO_FLAG_NAMES]
-      : [VIDEO_FLAG_NAMES, IMAGE_FLAG_NAMES];
 
-  const missing = [...ownFlagNames, ...SHARED_GENERATE_FLAG_NAMES]
-    .filter(([, key]) => opts[key] === undefined)
-    .map(([flag]) => flag);
+  let branchKey: GenerateBranchKey;
+  if (mediaType === "image") {
+    if (opts.outputType !== undefined) {
+      throw new Error('a "generate" "image" policy can\'t set --output-type');
+    }
+    if (opts.resizingStrategy === undefined) {
+      throw new Error('a "generate" "image" policy needs --resizing-strategy');
+    }
+    branchKey = `image:${parseResizingStrategy(opts.resizingStrategy)}`;
+  } else {
+    if (opts.resizingStrategy !== undefined) {
+      throw new Error('a "generate" "video" policy can\'t set --resizing-strategy');
+    }
+    if (opts.outputType === undefined) {
+      throw new Error('a "generate" "video" policy needs --output-type');
+    }
+    branchKey = `video:${parseOutputType(opts.outputType)}`;
+  }
+  const branchLabel = branchKey.replace(":", "/");
+
+  const ownFieldNames = GENERATE_BRANCH_FIELDS[branchKey];
+  const missing = ownFieldNames
+    .filter((name) => !isPresent(opts, name))
+    .map((name) => FIELD_INFO[name].flag);
   if (missing.length > 0) {
-    throw new Error(`a "generate" "${mediaType}" policy needs ${missing.join(", ")}`);
+    throw new Error(`a "generate" "${branchLabel}" policy needs ${missing.join(", ")}`);
   }
 
-  const present = otherFlagNames.filter(([, key]) => opts[key] !== undefined).map(([flag]) => flag);
+  const present = ALL_GENERATE_FIELD_NAMES.filter(
+    (name) => !(ownFieldNames as readonly string[]).includes(name) && isPresent(opts, name),
+  ).map((name) => FIELD_INFO[name].flag);
   if (present.length > 0) {
-    throw new Error(`a "generate" "${mediaType}" policy can't set ${present.join(", ")}`);
+    throw new Error(`a "generate" "${branchLabel}" policy can't set ${present.join(", ")}`);
   }
 }
 
 /**
- * Cheap, edit-only pre-check: a single `edit` call can't set fields from
- * both media types at once, regardless of what the existing row's branch
- * is or is becoming. Full branch-aware validation -- what's *required*
- * depends on the *existing* row, which isn't available here without a
- * network round trip -- stays in the repository's own `update()`, same as
- * today.
+ * Cheap, edit-only pre-check: a single `edit` call can't name more than
+ * one branch's own exclusive fields at once (e.g. both --image-width and
+ * --frame-count), and can't set both --resizing-strategy and
+ * --output-type (one is image-only, the other video-only). Full branch-
+ * aware validation -- what's *required* depends on the *existing* row,
+ * which isn't available here without a network round trip -- stays in
+ * the repository's own `update()`, same as today.
  */
-function assertNoMixedMediaTypeFlagsForEdit(opts: EditOptions): void {
-  const imagePresent = IMAGE_FLAG_NAMES.filter(([, key]) => opts[key] !== undefined).map(
-    ([flag]) => flag,
-  );
-  const videoPresent = VIDEO_FLAG_NAMES.filter(([, key]) => opts[key] !== undefined).map(
-    ([flag]) => flag,
-  );
-  if (imagePresent.length > 0 && videoPresent.length > 0) {
+function assertNoMixedBranchFlagsForEdit(opts: EditOptions): void {
+  if (opts.resizingStrategy !== undefined && opts.outputType !== undefined) {
+    throw new Error("can't set both --resizing-strategy and --output-type in the same edit");
+  }
+
+  const touchedBranches = (
+    Object.entries(BRANCH_ONLY_FIELDS) as [GenerateBranchKey, GenerateFieldName[]][]
+  )
+    .map(([branchKey, names]) => ({
+      branchKey,
+      present: names.filter((name) => isPresent(opts, name)).map((name) => FIELD_INFO[name].flag),
+    }))
+    .filter((g) => g.present.length > 0);
+
+  if (touchedBranches.length > 1) {
+    const allFlags = touchedBranches.flatMap((g) => g.present);
     throw new Error(
-      `can't set both image and video fields in the same edit: ${[...imagePresent, ...videoPresent].join(", ")}`,
+      `can't set fields from more than one resizing strategy/output type at once: ${allFlags.join(", ")}`,
     );
   }
 }
@@ -242,6 +326,19 @@ async function runList(opts: RootOption): Promise<ThumbnailPolicyRow[]> {
   }
 }
 
+/** One-line summary of a row's media type, branch, and generation parameters -- "-" for a 'skip' row, which has none. Used by `list`'s plain-text (non-`--json`) output only; `--json` already returns every field structured. */
+function generateSummary(row: ThumbnailPolicyRow): string {
+  if (row.action === "skip") return "-";
+  if (row.mediaType === "image") {
+    return row.resizingStrategy === "fit_to_box"
+      ? `image/fit_to_box(${row.imageWidth}x${row.imageHeight},q${row.jpegQuality})`
+      : `image/resize_shorter_side(${row.shorterSide},q${row.jpegQuality})`;
+  }
+  return row.outputType === "mosaic"
+    ? `video/mosaic(${row.tileRowCount}x${row.tileColumnCount},ts${row.tileSize},q${row.jpegQuality})`
+    : `video/gif(ts${row.tileSize},frames${row.frameCount},delay${row.frameDelayMs}ms)`;
+}
+
 /**
  * Builds the real `ThumbnailPolicyCreateInput` union value from
  * independently-parsed pieces. The `!` assertions on `generateFields`'
@@ -264,14 +361,44 @@ function buildCreateInput(
   const mediaType = parseMediaType(opts.mediaType!);
 
   if (mediaType === "image") {
+    const resizingStrategy = parseResizingStrategy(opts.resizingStrategy!);
+    if (resizingStrategy === "fit_to_box") {
+      return {
+        name,
+        glob,
+        action: "generate",
+        mediaType: "image",
+        resizingStrategy: "fit_to_box",
+        mimeTypes,
+        imageWidth: generateFields.imageWidth!,
+        imageHeight: generateFields.imageHeight!,
+        jpegQuality: generateFields.jpegQuality!,
+      };
+    }
     return {
       name,
       glob,
       action: "generate",
       mediaType: "image",
+      resizingStrategy: "resize_shorter_side",
       mimeTypes,
-      imageWidth: generateFields.imageWidth!,
-      imageHeight: generateFields.imageHeight!,
+      shorterSide: generateFields.shorterSide!,
+      jpegQuality: generateFields.jpegQuality!,
+    };
+  }
+
+  const outputType = parseOutputType(opts.outputType!);
+  if (outputType === "mosaic") {
+    return {
+      name,
+      glob,
+      action: "generate",
+      mediaType: "video",
+      outputType: "mosaic",
+      mimeTypes,
+      tileRowCount: generateFields.tileRowCount!,
+      tileColumnCount: generateFields.tileColumnCount!,
+      tileSize: generateFields.tileSize!,
       jpegQuality: generateFields.jpegQuality!,
     };
   }
@@ -280,11 +407,11 @@ function buildCreateInput(
     glob,
     action: "generate",
     mediaType: "video",
+    outputType: "gif",
     mimeTypes,
-    tileRowCount: generateFields.tileRowCount!,
-    tileColumnCount: generateFields.tileColumnCount!,
     tileSize: generateFields.tileSize!,
-    jpegQuality: generateFields.jpegQuality!,
+    frameCount: generateFields.frameCount!,
+    frameDelayMs: generateFields.frameDelayMs!,
   };
 }
 
@@ -313,7 +440,7 @@ async function runEdit(
   opts: EditOptions,
   logger: Logger,
 ): Promise<{ versionStamp: string }> {
-  assertNoMixedMediaTypeFlagsForEdit(opts);
+  assertNoMixedBranchFlagsForEdit(opts);
   const { root, masterKey, s3 } = await setupMutationContext(opts);
   const { versionStamp } = await mutateStateDb(root, masterKey, s3, logger, (db) => {
     const changes: ThumbnailPolicyUpdate = {};
@@ -322,6 +449,9 @@ async function runEdit(
     if (opts.action !== undefined) changes.action = parseAction(opts.action);
     if (opts.mimeTypes !== undefined) changes.mimeTypes = parseMimeTypes(opts.mimeTypes);
     if (opts.mediaType !== undefined) changes.mediaType = parseMediaType(opts.mediaType);
+    if (opts.resizingStrategy !== undefined)
+      changes.resizingStrategy = parseResizingStrategy(opts.resizingStrategy);
+    if (opts.outputType !== undefined) changes.outputType = parseOutputType(opts.outputType);
     Object.assign(changes, parseGenerateFields(opts));
     if (!new ThumbnailPoliciesRepository(db).update(id, changes)) {
       throw new Error(`no thumbnail policy with id ${id}`);
@@ -371,7 +501,7 @@ export function registerThumbnailPolicyCommand(program: Command): void {
         } else {
           for (const r of rows) {
             process.stdout.write(
-              `${r.id}\t${r.name}\t${r.glob}\t${r.action}\tmime=${r.mimeTypes.join(",")}\n`,
+              `${r.id}\t${r.name}\t${r.glob}\t${r.action}\t${generateSummary(r)}\tmime=${r.mimeTypes.join(",")}\n`,
             );
           }
         }
@@ -397,15 +527,32 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     )
     .requiredOption("--mime-types <csv>", 'comma-separated mime types, e.g. "image/jpeg,video/*"')
     .option("--media-type <image|video>", "generate policies only; which field set applies")
-    .option("--image-width <n>", "generate policies only, for image policies")
-    .option("--image-height <n>", "generate policies only, for image policies")
-    .option("--tile-rows <n>", "generate policies only, for video policies")
-    .option("--tile-columns <n>", "generate policies only, for video policies")
+    .option(
+      "--resizing-strategy <fit_to_box|resize_shorter_side>",
+      "generate/image policies only; which of --image-width/--image-height or --shorter-side applies",
+    )
+    .option("--image-width <n>", "generate policies only, for 'fit_to_box' image policies")
+    .option("--image-height <n>", "generate policies only, for 'fit_to_box' image policies")
+    .option(
+      "--shorter-side <n>",
+      "generate policies only, for 'resize_shorter_side' image policies -- the resized image's shorter side, in pixels",
+    )
+    .option(
+      "--output-type <mosaic|gif>",
+      "generate/video policies only; which of the tile-row/column or frame-count/delay fields applies",
+    )
+    .option("--tile-rows <n>", "generate policies only, for 'mosaic' video policies")
+    .option("--tile-columns <n>", "generate policies only, for 'mosaic' video policies")
     .option(
       "--tile-size <n>",
-      "generate policies only, for video policies -- one mosaic tile's shorter side, in pixels",
+      "generate policies only, for video policies -- one mosaic tile's or gif frame's shorter side, in pixels",
     )
-    .option("--jpeg-quality <1-100>", "generate policies only")
+    .option("--frame-count <n>", "generate policies only, for 'gif' video policies")
+    .option(
+      "--frame-delay-ms <n>",
+      "generate policies only, for 'gif' video policies -- each frame's display duration",
+    )
+    .option("--jpeg-quality <1-100>", "generate policies only, every branch except 'gif'")
     .action(async (glob: string, action: string, opts: CreateOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -452,15 +599,29 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     .option("--action <action>", "new action: skip or generate")
     .option("--mime-types <csv>", "new comma-separated mime types")
     .option("--media-type <image|video>", "new media type (generate policies only)")
-    .option("--image-width <n>", "new image width (generate/image policies only)")
-    .option("--image-height <n>", "new image height (generate/image policies only)")
-    .option("--tile-rows <n>", "new tile row count (generate/video policies only)")
-    .option("--tile-columns <n>", "new tile column count (generate/video policies only)")
+    .option(
+      "--resizing-strategy <fit_to_box|resize_shorter_side>",
+      "new resizing strategy (generate/image policies only)",
+    )
+    .option("--image-width <n>", "new image width ('fit_to_box' image policies only)")
+    .option("--image-height <n>", "new image height ('fit_to_box' image policies only)")
+    .option(
+      "--shorter-side <n>",
+      "new shorter side, in pixels ('resize_shorter_side' image policies only)",
+    )
+    .option("--output-type <mosaic|gif>", "new output type (generate/video policies only)")
+    .option("--tile-rows <n>", "new tile row count ('mosaic' video policies only)")
+    .option("--tile-columns <n>", "new tile column count ('mosaic' video policies only)")
     .option(
       "--tile-size <n>",
-      "new mosaic tile shorter side, in pixels (generate/video policies only)",
+      "new mosaic tile's or gif frame's shorter side, in pixels (generate/video policies only)",
     )
-    .option("--jpeg-quality <1-100>", "new jpeg quality (generate policies only)")
+    .option("--frame-count <n>", "new frame count ('gif' video policies only)")
+    .option("--frame-delay-ms <n>", "new per-frame display duration ('gif' video policies only)")
+    .option(
+      "--jpeg-quality <1-100>",
+      "new jpeg quality (generate policies only, every branch except 'gif')",
+    )
     .action(async (idRaw: string, opts: EditOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;

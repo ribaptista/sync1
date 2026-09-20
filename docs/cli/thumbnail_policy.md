@@ -23,6 +23,24 @@ themselves.
 `create`/`edit`/`delete` mutate shared state, so each is a real commit (new state.db version, uploaded,
 CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactive prompt).
 
+## The four `generate` branches
+
+A `generate` policy is always exactly one of four branches — an image policy picks a
+`--resizing-strategy`, a video policy picks an `--output-type` — each with its own required fields:
+
+| `--media-type` | branch flag                               | required fields                                    |
+| -------------- | ----------------------------------------- | -------------------------------------------------- |
+| `image`        | `--resizing-strategy fit_to_box`          | `--image-width`, `--image-height`                  |
+| `image`        | `--resizing-strategy resize_shorter_side` | `--shorter-side`                                   |
+| `video`        | `--output-type mosaic`                    | `--tile-rows`, `--tile-columns`, `--tile-size`     |
+| `video`        | `--output-type gif`                       | `--tile-size`, `--frame-count`, `--frame-delay-ms` |
+
+`--jpeg-quality` is required for every branch **except** `gif` — a GIF is never JPEG-encoded, so it has no
+quality setting to configure. `--tile-size` means "one mosaic tile's shorter side" for `mosaic` and "one
+GIF frame's shorter side" for `gif` — the same flag and column, deliberately reused rather than
+duplicated (see [thumbnails.md](../architecture/thumbnails.md#video-mosaics)); it's what lets an
+`edit --output-type gif` on an existing mosaic policy carry the same tile size straight over.
+
 ## Usage
 
 ```bash
@@ -32,8 +50,11 @@ sync1 thumbnail_policy create <glob> <skip|generate> [--root <local-path>] \
   --name <name> \
   --mime-types <csv> \
   --media-type <image|video> \
-  [--image-width <n>] [--image-height <n>] \
+  [--resizing-strategy <fit_to_box|resize_shorter_side>] \
+  [--image-width <n>] [--image-height <n>] [--shorter-side <n>] \
+  [--output-type <mosaic|gif>] \
   [--tile-rows <n>] [--tile-columns <n>] [--tile-size <n>] \
+  [--frame-count <n>] [--frame-delay-ms <n>] \
   [--jpeg-quality <1-100>] \
   [--json]
 
@@ -41,8 +62,11 @@ sync1 thumbnail_policy edit <id> [--root <local-path>] \
   [--name <name>] \
   [--glob <glob>] [--action <skip|generate>] [--mime-types <csv>] \
   [--media-type <image|video>] \
-  [--image-width <n>] [--image-height <n>] \
+  [--resizing-strategy <fit_to_box|resize_shorter_side>] \
+  [--image-width <n>] [--image-height <n>] [--shorter-side <n>] \
+  [--output-type <mosaic|gif>] \
   [--tile-rows <n>] [--tile-columns <n>] [--tile-size <n>] \
+  [--frame-count <n>] [--frame-delay-ms <n>] \
   [--jpeg-quality <1-100>] \
   [--json]
 
@@ -70,28 +94,22 @@ never valid on the same `generate` row, since a `generate` policy is always exac
 other, never both (a `skip` row has no such restriction: it legitimately mixes types, e.g.
 `image/*,video/*`, since matching a skip never needs to know a media type at all).
 
-Every `generate` row is **either an image policy or a video policy**, via `--media-type`, and only ever
-carries the fields relevant to its own type — no nonsense tile fields on an image-only policy, no
-image-box fields on a video-only one. `--tile-size` is a single value (the pixel length of a mosaic
-tile's _shorter_ side, not a fixed box — see [thumbnails.md](../architecture/thumbnails.md#video-mosaics))
-replacing what used to be separate `--tile-width`/`--tile-height` flags.
-
-`create`/`edit` validate the `skip`/`generate`/media-type combination before touching the network: a
-`skip` policy must not set `--media-type` or any of the five generation flags; a `generate` policy must
-set `--media-type` plus every field belonging to that type (`--image-width`, `--image-height`,
-`--jpeg-quality` for `image`; `--tile-rows`, `--tile-columns`, `--tile-size`, `--jpeg-quality` for
-`video`) and none of the other type's fields. `edit` re-validates the _merged_ result, so switching
-`--action generate` to `--action skip` (or back), or switching `--media-type` from `image` to `video`
-(or back) on an existing `generate` row, must also supply/clear the relevant fields as needed — a
-media-type switch also requires resupplying `--mime-types` to match the new type. The one field that
-survives an `image`↔`video` switch without needing to be resupplied is `--jpeg-quality`, the single
-field both `generate` branches share.
+`create`/`edit` validate the `skip`/`generate`/media-type/branch combination before touching the network:
+a `skip` policy must not set `--media-type`, `--resizing-strategy`, `--output-type`, or any generation
+flag; a `generate` policy must set `--media-type`, then (for `image`) `--resizing-strategy` or (for
+`video`) `--output-type`, then exactly that branch's own fields (see the table above) and none of the
+other branches'. `edit` re-validates the _merged_ result, so switching `--action generate` to
+`--action skip` (or back), switching `--media-type` (image↔video), or switching `--resizing-strategy`/
+`--output-type` within a media type, must also supply/clear the relevant fields as needed — a media-type
+switch also requires resupplying `--mime-types` to match the new type. A field survives a branch switch
+whenever the _new_ branch also uses it: `--jpeg-quality` survives any switch except one landing on `gif`;
+`--tile-size` survives a `mosaic`↔`gif` switch specifically, since both use it.
 
 ## Output
 
-A `generate` row's shape depends on its `mediaType` — an `image` row never carries the three `tile*`
-fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always carry `jpegQuality`. A
-`skip` row carries none of them, and no `mediaType` at all. Every row always carries `name`:
+A `generate` row's shape depends on its `mediaType` and, within that, its `resizingStrategy`/`outputType`
+— each of the four branches carries only its own fields (see the table above). A `skip` row carries none
+of them, and no `mediaType` at all. Every row always carries `name`:
 
 ```json
 {
@@ -103,6 +121,7 @@ fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always 
       "glob": "**/*.jpg",
       "action": "generate",
       "mediaType": "image",
+      "resizingStrategy": "fit_to_box",
       "mimeTypes": ["image/jpeg"],
       "imageWidth": 320,
       "imageHeight": 240,
@@ -115,6 +134,7 @@ fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always 
       "glob": "**/*.mp4",
       "action": "generate",
       "mediaType": "video",
+      "outputType": "mosaic",
       "mimeTypes": ["video/*"],
       "tileRowCount": 4,
       "tileColumnCount": 4,
@@ -124,6 +144,19 @@ fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always 
     },
     {
       "id": 3,
+      "name": "video_gif",
+      "glob": "**/*.mp4",
+      "action": "generate",
+      "mediaType": "video",
+      "outputType": "gif",
+      "mimeTypes": ["video/*"],
+      "tileSize": 64,
+      "frameCount": 8,
+      "frameDelayMs": 100,
+      "createdAt": "2026-01-01T00:00:00.000Z"
+    },
+    {
+      "id": 4,
       "name": "skip_private",
       "glob": "private/**",
       "action": "skip",
@@ -137,20 +170,33 @@ fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always 
 ## Exit codes
 
 - `0` — success.
-- `1` — the root isn't initialized/attached, an invalid glob/action/media-type/mime-type/name/dimension
-  was given, the name was already taken, the `skip`/`generate`/media-type field combination was
-  inconsistent, or `edit`/`delete` referenced an id that doesn't exist.
+- `1` — the root isn't initialized/attached, an invalid glob/action/media-type/resizing-strategy/
+  output-type/mime-type/name/dimension was given, the name was already taken, the
+  `skip`/`generate`/branch field combination was inconsistent, or `edit`/`delete` referenced an id that
+  doesn't exist.
 
 ## Example
 
 ```bash
 sync1 thumbnail_policy create "**/*.jpg" generate --root ~/Pictures \
   --name photo_thumb --mime-types image/jpeg --media-type image \
+  --resizing-strategy fit_to_box \
   --image-width 320 --image-height 240 --jpeg-quality 80 --json
+
+sync1 thumbnail_policy create "**/*.jpg" generate --root ~/Pictures \
+  --name photo_thumb_wide --mime-types image/jpeg --media-type image \
+  --resizing-strategy resize_shorter_side \
+  --shorter-side 150 --jpeg-quality 80 --json
 
 sync1 thumbnail_policy create "**/*.mp4" generate --root ~/Pictures \
   --name video_mosaic --mime-types video/* --media-type video \
+  --output-type mosaic \
   --tile-rows 4 --tile-columns 4 --tile-size 90 --jpeg-quality 80 --json
+
+sync1 thumbnail_policy create "**/*.mp4" generate --root ~/Pictures \
+  --name video_gif --mime-types video/* --media-type video \
+  --output-type gif \
+  --tile-size 64 --frame-count 8 --frame-delay-ms 100 --json
 
 sync1 thumbnail_policy create "private/**" skip --root ~/Pictures \
   --name skip_private --mime-types "image/*,video/*" --json
