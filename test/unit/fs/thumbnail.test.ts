@@ -483,7 +483,7 @@ describe("scanThumbnails", () => {
     });
   });
 
-  it("grows generation-pending on dispatch, and only advances generated once each generation resolves", async () => {
+  it("opens the generation phase on its exact, final total, and only advances generated as each resolves", async () => {
     createGeneratePolicy("*.jpg");
     writeFile("a.jpg");
     writeFile("b.jpg");
@@ -508,7 +508,7 @@ describe("scanThumbnails", () => {
       generateVideoMosaic: async () => {},
     };
 
-    const updates: { pending: number; generated: number }[] = [];
+    const updates: { total: number; generated: number }[] = [];
     const pool = new PQueue({ concurrency: 4 });
     const statsPromise = scanThumbnails(
       root,
@@ -523,17 +523,23 @@ describe("scanThumbnails", () => {
       8,
       false,
       undefined,
-      (pending, generated) => updates.push({ pending, generated }),
+      (total, generated) => updates.push({ total, generated }),
     );
 
-    // Both dispatched (pending grew to 2) before either generation call's
-    // own promise ever settles -- generated stays 0 the whole time.
+    // The denominator is right from the very first report -- not grown to
+    // 2 as the second job is dispatched. Every candidate is decided before
+    // any of them is dispatched, so there is nothing left to discover.
+    await vi.waitFor(() => expect(updates.length).toBeGreaterThan(0));
+    expect(updates[0]).toEqual({ total: 2, generated: 0 });
+
     await vi.waitFor(() => {
       expect(resolveA).toBeDefined();
       expect(resolveB).toBeDefined();
     });
-    expect(updates.some((u) => u.pending === 2 && u.generated === 0)).toBe(true);
+    // Both dispatched before either generation call's own promise ever
+    // settles -- generated stays 0 the whole time.
     expect(updates.every((u) => u.generated === 0)).toBe(true);
+    expect(updates.every((u) => u.total === 2)).toBe(true);
 
     resolveA!();
     await vi.waitFor(() => {
@@ -543,7 +549,7 @@ describe("scanThumbnails", () => {
 
     const stats = await statsPromise;
     expect(stats.toGenerate).toBe(2);
-    expect(updates.at(-1)).toEqual({ pending: 2, generated: 2 });
+    expect(updates.at(-1)).toEqual({ total: 2, generated: 2 });
   });
 
   it("advances generation progress even when a per-file generation fails", async () => {
@@ -554,7 +560,7 @@ describe("scanThumbnails", () => {
     const prober = fakeProber({ "bad.jpg": JPEG_IMAGE });
     const generator = fakeGenerator(new Set([path.join(root, "bad.jpg")]));
 
-    const updates: { pending: number; generated: number }[] = [];
+    const updates: { total: number; generated: number }[] = [];
     const pool = new PQueue({ concurrency: 4 });
     const stats = await scanThumbnails(
       root,
@@ -569,11 +575,51 @@ describe("scanThumbnails", () => {
       8,
       false,
       undefined,
-      (pending, generated) => updates.push({ pending, generated }),
+      (total, generated) => updates.push({ total, generated }),
     );
 
     expect(stats.errors).toBe(1);
-    expect(updates.at(-1)).toEqual({ pending: 1, generated: 1 });
+    expect(updates.at(-1)).toEqual({ total: 1, generated: 1 });
+  });
+
+  it("reports the walk's entry total ahead of the walk, then finalizes on the real count", async () => {
+    // A denominator for the scan bar that isn't just its own numerator:
+    // three files plus the root's one subdirectory-free walk, counted by
+    // the concurrent pass before the probing walk has finished.
+    createGeneratePolicy("*.jpg");
+    writeFile("a.jpg");
+    writeFile("b.jpg");
+    writeFile("c.txt");
+    seedCache("a.jpg", "hasha");
+    seedCache("b.jpg", "hashb");
+
+    const prober = fakeProber({ "a.jpg": JPEG_IMAGE, "b.jpg": JPEG_IMAGE });
+    const scanned: number[] = [];
+    const totals: { total: number; final: boolean }[] = [];
+    const pool = new PQueue({ concurrency: 4 });
+    await scanThumbnails(
+      root,
+      "state",
+      undefined,
+      cacheRepo,
+      policiesRepo.list(),
+      prober,
+      fakeGenerator(),
+      silentLogger,
+      pool,
+      8,
+      false,
+      (n) => scanned.push(n),
+      undefined,
+      (total, final) => totals.push({ total, final }),
+    );
+
+    // The last word is the real walk's own count, marked final -- and it
+    // agrees with what the walk actually reported as its numerator.
+    expect(totals.at(-1)).toEqual({ total: scanned.at(-1), final: true });
+    expect(scanned.at(-1)).toBe(3);
+    // Nothing published a total before that one claimed to be final.
+    expect(totals.slice(0, -1).every((t) => !t.final)).toBe(true);
   });
 
   it("never fires onGenerationProgress for state or cleanup, which never generate anything", async () => {
@@ -597,7 +643,7 @@ describe("scanThumbnails", () => {
       8,
       false,
       undefined,
-      (pending, generated) => updates.push({ pending, generated }),
+      (total, generated) => updates.push({ total, generated }),
     );
 
     expect(updates).toEqual([]);

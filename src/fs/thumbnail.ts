@@ -5,6 +5,8 @@ import type { Logger } from "../logger.js";
 import { walk } from "./walker.js";
 import { matchesAnyGlob, literalPrefixOf } from "./glob-match.js";
 import { waitForRoom } from "../concurrency/pools.js";
+import { enumerateThumbnailScan } from "./thumbnail-enumerate.js";
+import type { EnumerationControl } from "./update-cache-enumerate.js";
 import type { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import type {
   ThumbnailPolicyRow,
@@ -216,6 +218,21 @@ interface ProvisionalDecisionStub {
 type ProvisionalDecision = ProvisionalDecisionProbed | ProvisionalDecisionStub;
 
 /**
+ * One thumbnail `ensure` has decided to generate, held until every
+ * decision has been made. Reconciliation used to dispatch these as it
+ * went, which meant the generation total could only be discovered as
+ * quickly as the pool drained -- and the pool is exactly what the bar is
+ * there to report on. `staleThumbnail` set means this is a regeneration:
+ * the old file is deleted inside the job, and it's also what picks the
+ * right word for a failure's log line.
+ */
+interface GenerationJob {
+  decision: ProvisionalDecisionProbed;
+  policy: ThumbnailPolicyGenerateRow;
+  staleThumbnail: ExistingThumbnailFile | undefined;
+}
+
+/**
  * Image mime types ImageMagick can read but not write (`identify -list
  * format` shows each as `r--`) -- a thumbnail generated from one can
  * never keep the original's own extension the way an ordinary image does,
@@ -417,15 +434,24 @@ export async function scanThumbnails(
   deleteStaleStubPreviews: boolean,
   onProgress?: (scanned: number) => void,
   /**
-   * `ensure`-only: fires once per newly-discovered to-generate/to-
-   * regenerate candidate (as it's dispatched) and once per completed
-   * generation attempt (success or failure, from a `finally`) --
-   * `pending`/`generated` are always the running totals so far, not
-   * deltas, mirroring `onProgress`'s own cumulative-count shape. Never
-   * fires at all for `state`/`cleanup`, since neither mode ever
-   * generates anything.
+   * `ensure`-only: fires once as the generation phase opens, then once per
+   * completed generation attempt (success or failure, from a `finally`).
+   * `total` is the *exact, final* number of thumbnails this run will
+   * generate -- every candidate is already known by the time the first one
+   * is dispatched, so it is correct from the very first call and never
+   * revised; `generated` is the running count so far, not a delta. Never
+   * fires at all for `state`/`cleanup`, since neither mode ever generates
+   * anything.
    */
-  onGenerationProgress?: (pending: number, generated: number) => void,
+  onGenerationProgress?: (total: number, generated: number) => void,
+  /**
+   * Fires with the walk phase's running entry total, then once more with
+   * the real walk's own final count (`final: true`) once the walk has
+   * settled. Pairs with `onProgress`'s numerator -- same unit, every
+   * walked entry -- so the two together make a real ratio rather than a
+   * count standing in for its own total. See thumbnail-enumerate.ts.
+   */
+  onScanTotalKnown?: (total: number, final: boolean) => void,
 ): Promise<ThumbnailScanStats> {
   const stats: ThumbnailScanStats = {
     upToDate: 0,
@@ -446,45 +472,70 @@ export async function scanThumbnails(
   const existingThumbnails = new Map<string, ExistingThumbnailFile[]>();
   const decisions: ProvisionalDecision[] = [];
 
+  // Started, deliberately not awaited: it counts the same entries this
+  // walk is about to visit, concurrently, so the denominator is known
+  // within a walk rather than only once the last probe lands.
+  const enumerationControl: EnumerationControl = { stop: false };
+  const enumeration = enumerateThumbnailScan(
+    walkRoot,
+    onScanTotalKnown,
+    logger,
+    enumerationControl,
+  );
+
   let scanned = 0;
-  for await (const fsEntry of walk(walkRoot)) {
-    scanned++;
-    onProgress?.(scanned);
-    if (fsEntry.type === "dir") continue;
+  try {
+    for await (const fsEntry of walk(walkRoot)) {
+      scanned++;
+      onProgress?.(scanned);
+      if (fsEntry.type === "dir") continue;
 
-    const relativePath = literalPrefix ? `${literalPrefix}/${fsEntry.path}` : fsEntry.path;
+      const relativePath = literalPrefix ? `${literalPrefix}/${fsEntry.path}` : fsEntry.path;
 
-    const thumbnailEntry = parseThumbnailEntry(relativePath);
-    if (thumbnailEntry) {
-      const list = existingThumbnails.get(thumbnailEntry.originalRelativePath) ?? [];
-      list.push(thumbnailEntry);
-      existingThumbnails.set(thumbnailEntry.originalRelativePath, list);
-      continue;
+      const thumbnailEntry = parseThumbnailEntry(relativePath);
+      if (thumbnailEntry) {
+        const list = existingThumbnails.get(thumbnailEntry.originalRelativePath) ?? [];
+        list.push(thumbnailEntry);
+        existingThumbnails.set(thumbnailEntry.originalRelativePath, list);
+        continue;
+      }
+
+      if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
+      if (!anyGlobMatches(relativePath, policies)) continue;
+
+      if (fsEntry.representation === "stub") {
+        // Synchronous, no subprocess -- no pool dispatch needed.
+        decisions.push(classifyStub(relativePath, cacheRepo));
+        continue;
+      }
+
+      await waitForRoom(pool, poolQueueLimit);
+      void pool.add(async () => {
+        const decision = await classifyProbed(relativePath, root, cacheRepo, policies, prober);
+        if (decision) decisions.push(decision);
+        logger.debug({ pool: "thumbnail", inFlight: pool.pending, queued: pool.size }, "completed");
+      });
+      logger.debug({ pool: "thumbnail", inFlight: pool.pending, queued: pool.size }, "dispatched");
     }
 
-    if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
-    if (!anyGlobMatches(relativePath, policies)) continue;
-
-    if (fsEntry.representation === "stub") {
-      // Synchronous, no subprocess -- no pool dispatch needed.
-      decisions.push(classifyStub(relativePath, cacheRepo));
-      continue;
-    }
-
-    await waitForRoom(pool, poolQueueLimit);
-    void pool.add(async () => {
-      const decision = await classifyProbed(relativePath, root, cacheRepo, policies, prober);
-      if (decision) decisions.push(decision);
-      logger.debug({ pool: "thumbnail", inFlight: pool.pending, queued: pool.size }, "completed");
-    });
-    logger.debug({ pool: "thumbnail", inFlight: pool.pending, queued: pool.size }, "dispatched");
+    await pool.onIdle();
+  } finally {
+    // The walk is done (or has thrown), so whatever the counting pass has
+    // left to count is now worthless -- cut it short, join it so it can't
+    // publish after the fact, then publish the real walk's own count as
+    // the final word.
+    enumerationControl.stop = true;
+    await enumeration;
+    onScanTotalKnown?.(scanned, true);
   }
 
-  await pool.onIdle();
-
   const claimedOriginals = new Set<string>();
-  let pendingGeneration = 0;
-  let completedGeneration = 0;
+  // Collected here, dispatched below: every generation candidate is known
+  // by the time this reconciliation loop ends, so collecting them first
+  // costs nothing and lets the generation phase open with its exact,
+  // final denominator instead of one that grows as jobs are dispatched --
+  // which, throttled by waitForRoom, is exactly as slowly as they finish.
+  const generationJobs: GenerationJob[] = [];
 
   for (const decision of decisions) {
     claimedOriginals.add(decision.relativePath);
@@ -561,52 +612,50 @@ export async function scanThumbnails(
     if (existing.length > 0) {
       stats.toRegenerate++;
       if (mode === "ensure") {
-        const staleThumbnail = existing[0];
-        pendingGeneration++;
-        onGenerationProgress?.(pendingGeneration, completedGeneration);
-        await waitForRoom(pool, poolQueueLimit);
-        void pool.add(async () => {
-          try {
-            await generateForDecision(root, decision, policy, staleThumbnail, generator, logger);
-          } catch (err) {
-            if (!(err instanceof ThumbnailGenerationError)) throw err;
-            stats.errors++;
-            logger.warn(
-              { path: decision.relativePath, err: err.message },
-              "thumbnail regeneration failed -- skipping",
-            );
-          } finally {
-            completedGeneration++;
-            onGenerationProgress?.(pendingGeneration, completedGeneration);
-          }
-        });
+        generationJobs.push({ decision, policy, staleThumbnail: existing[0] });
       }
     } else {
       stats.toGenerate++;
       if (mode === "ensure") {
-        pendingGeneration++;
-        onGenerationProgress?.(pendingGeneration, completedGeneration);
-        await waitForRoom(pool, poolQueueLimit);
-        void pool.add(async () => {
-          try {
-            await generateForDecision(root, decision, policy, undefined, generator, logger);
-          } catch (err) {
-            if (!(err instanceof ThumbnailGenerationError)) throw err;
-            stats.errors++;
-            logger.warn(
-              { path: decision.relativePath, err: err.message },
-              "thumbnail generation failed -- skipping",
-            );
-          } finally {
-            completedGeneration++;
-            onGenerationProgress?.(pendingGeneration, completedGeneration);
-          }
-        });
+        generationJobs.push({ decision, policy, staleThumbnail: undefined });
       }
     }
   }
 
-  if (mode === "ensure") await pool.onIdle();
+  if (mode === "ensure") {
+    let completedGeneration = 0;
+    // Published before the first dispatch, and never revised: this is the
+    // whole generation phase's denominator, not a running discovery count.
+    onGenerationProgress?.(generationJobs.length, completedGeneration);
+    for (const job of generationJobs) {
+      await waitForRoom(pool, poolQueueLimit);
+      void pool.add(async () => {
+        try {
+          await generateForDecision(
+            root,
+            job.decision,
+            job.policy,
+            job.staleThumbnail,
+            generator,
+            logger,
+          );
+        } catch (err) {
+          if (!(err instanceof ThumbnailGenerationError)) throw err;
+          stats.errors++;
+          logger.warn(
+            { path: job.decision.relativePath, err: err.message },
+            job.staleThumbnail
+              ? "thumbnail regeneration failed -- skipping"
+              : "thumbnail generation failed -- skipping",
+          );
+        } finally {
+          completedGeneration++;
+          onGenerationProgress?.(generationJobs.length, completedGeneration);
+        }
+      });
+    }
+    await pool.onIdle();
+  }
 
   for (const [originalPath, thumbs] of existingThumbnails) {
     if (claimedOriginals.has(originalPath)) continue;
