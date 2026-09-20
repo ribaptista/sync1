@@ -110,7 +110,11 @@ async function runMaterialize(
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
     const objectsRepo = new ObjectsRepository(stateDb);
-    progress.setOverallTotals({ files: Math.max(cacheRepo.count(), 1) });
+    // No `cacheRepo.count()` pre-seed any more: it counted every row in
+    // the vault, not the glob-matched subset this run will touch, so it
+    // over-stated the denominator for exactly the narrow-glob case
+    // materialize is usually given. materializeGlob enumerates its own
+    // real total now, before its first S3 call.
     return await materializeGlob(
       root,
       glob,

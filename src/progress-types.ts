@@ -116,6 +116,18 @@ export interface ProgressTracker {
    */
   startFile(path: string, size: number): FileTracker;
   /**
+   * Bytes that were counted toward the total but resolved without any
+   * transfer at all -- an archived object a run can only request a
+   * restore for, say. Completes them outright, and deliberately emits no
+   * activity label: nothing was read or written, so claiming
+   * "downloading …" for it would be a lie.
+   *
+   * The alternative -- leaving them out of the total entirely -- would
+   * mean the denominator couldn't be known until every object had been
+   * classified, which for the commands that need this is the whole run.
+   */
+  skipBytes(size: number): void;
+  /**
    * A projection of this run's eventual totals, from an enumeration pass
    * that counted the work without doing any of it -- absolute, not a
    * delta, and free to move in *either* direction as that pass revises
@@ -193,6 +205,10 @@ export function createProgressTracker(
     },
     expectBytes(size) {
       observedBytes += size;
+      emit();
+    },
+    skipBytes(size) {
+      completedBytes += size;
       emit();
     },
     setEstimatedTotals(totals) {

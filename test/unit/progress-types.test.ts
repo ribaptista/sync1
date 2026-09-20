@@ -184,6 +184,25 @@ describe("createProgressTracker", () => {
     expect(onProgress).toHaveBeenCalledTimes(1);
   });
 
+  it("skipBytes completes bytes that were counted but never transferred, with no activity label", () => {
+    const updates: {
+      bytesDone: number;
+      bytesTotal: number;
+      activity?: { verb: string; path: string } | undefined;
+    }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["downloading", "downloaded"]);
+
+    tracker.expectBytes(100);
+    tracker.expectBytes(250);
+    tracker.startFile("a", 100).finish(); // really transferred
+    tracker.skipBytes(250); // archived: resolved without transfer
+
+    const last = updates.at(-1)!;
+    expect(last.bytesDone).toBe(350);
+    expect(last.bytesDone).toBe(last.bytesTotal); // lands at 100%, not 100/350
+    expect(last.activity).toBeUndefined();
+  });
+
   it("totals start out provisional and only an estimate marked final says otherwise", () => {
     const updates: { totalsFinal: boolean }[] = [];
     const tracker = createProgressTracker((u) => updates.push(u), ["hashing", "hashed"]);
