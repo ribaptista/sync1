@@ -1,0 +1,27 @@
+-- The CRC64NVME checksum S3 reports for an object, base64, exactly as S3
+-- reported it.
+--
+-- Not the same thing as `hash`, and the difference is the whole point:
+-- `hash` is BLAKE2b over the *plaintext* and is what content-addresses the
+-- object, while S3 only ever sees the encrypted bytes. The two are over
+-- different data with different algorithms and are never comparable.
+--
+-- CRC64NVME specifically (not CRC32, the SDK's silent default, and not
+-- SHA256) because it is the one algorithm S3 computes as a true
+-- FULL_OBJECT checksum on *both* a single PUT and a multipart upload --
+-- confirmed directly against a real container, not from documentation
+-- alone (see the LocalStack version note in test/e2e/helpers/
+-- localstack.ts). Every other supported algorithm answers a multipart
+-- upload with a COMPOSITE instead: SHA-256/CRC32/CRC32C over the
+-- concatenated per-part digests, a value that depends on where the parts
+-- were split rather than only on the content, and would silently change
+-- if the part-size constant ever did. CRC64NVME needs none of that: this
+-- column always holds the same single full-object value regardless of
+-- upload path, and is what a later HeadObject call reports back too --
+-- which is what makes it possible to audit an object's *content* remotely
+-- (sanity_check/converge, say), with no download, no decryption, and no
+-- master key, not just its *existence*.
+--
+-- Nullable: objects committed before this column existed have no recorded
+-- checksum, and NULL means "unknown", never "mismatched".
+ALTER TABLE objects ADD COLUMN ciphertext_checksum TEXT;

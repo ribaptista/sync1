@@ -5,6 +5,14 @@ export interface ObjectRow {
   hash: string;
   s3_key: string;
   size: number;
+  /**
+   * CRC64NVME checksum of the *ciphertext*, base64, as S3 reported it — see
+   * 0006_add_object_ciphertext_checksum.sql. Distinct from `hash` in both
+   * algorithm and input: that one is BLAKE2b over the plaintext, this is
+   * what S3 sees. Always the true full-object value, single PUT or
+   * multipart alike. `null` means "never recorded", never "mismatched".
+   */
+  ciphertext_checksum?: string | null;
 }
 
 interface CountRow {
@@ -24,10 +32,17 @@ export class ObjectsRepository {
 
   upsert(row: ObjectRow): void {
     this.db
-      .prepare<[string, string, number]>(
-        "INSERT INTO objects (hash, s3_key, size) VALUES (?, ?, ?) ON CONFLICT(hash) DO UPDATE SET s3_key = excluded.s3_key, size = excluded.size",
+      .prepare<[string, string, number, string | null]>(
+        `INSERT INTO objects (hash, s3_key, size, ciphertext_checksum) VALUES (?, ?, ?, ?)
+         ON CONFLICT(hash) DO UPDATE SET
+           s3_key = excluded.s3_key,
+           size = excluded.size,
+           -- COALESCE, not a plain overwrite: a re-upsert that doesn't know
+           -- the checksum (an older path, or a dedup attach) must not erase
+           -- one already recorded.
+           ciphertext_checksum = COALESCE(excluded.ciphertext_checksum, objects.ciphertext_checksum)`,
       )
-      .run(row.hash, row.s3_key, row.size);
+      .run(row.hash, row.s3_key, row.size, row.ciphertext_checksum ?? null);
   }
 
   delete(hash: string): void {

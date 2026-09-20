@@ -38,11 +38,21 @@ describe("ObjectsRepository", () => {
 
     repo.upsert({ hash: "aaa", s3_key: "objects/aaa", size: 100 });
     expect(repo.has("aaa")).toBe(true);
-    expect(repo.get("aaa")).toEqual({ hash: "aaa", s3_key: "objects/aaa", size: 100 });
+    expect(repo.get("aaa")).toEqual({
+      hash: "aaa",
+      s3_key: "objects/aaa",
+      size: 100,
+      ciphertext_checksum: null,
+    });
 
     // upsert on conflict updates fields
     repo.upsert({ hash: "aaa", s3_key: "objects/aaa-moved", size: 200 });
-    expect(repo.get("aaa")).toEqual({ hash: "aaa", s3_key: "objects/aaa-moved", size: 200 });
+    expect(repo.get("aaa")).toEqual({
+      hash: "aaa",
+      s3_key: "objects/aaa-moved",
+      size: 200,
+      ciphertext_checksum: null,
+    });
 
     repo.upsert({ hash: "bbb", s3_key: "objects/bbb", size: 50 });
     expect(repo.count()).toBe(2);
@@ -50,6 +60,34 @@ describe("ObjectsRepository", () => {
     repo.delete("aaa");
     expect(repo.has("aaa")).toBe(false);
     expect(repo.count()).toBe(1);
+  });
+
+  it("records ciphertext_checksum on upsert, and a later upsert that doesn't know it never erases it", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ObjectsRepository(db);
+
+    repo.upsert({ hash: "aaa", s3_key: "objects/aaa", size: 100, ciphertext_checksum: "crc1" });
+    expect(repo.get("aaa")?.ciphertext_checksum).toBe("crc1");
+
+    // A re-upsert that doesn't pass a checksum at all -- an older call
+    // site, or a dedup attach re-writing s3_key/size -- must not clobber
+    // one already recorded.
+    repo.upsert({ hash: "aaa", s3_key: "objects/aaa-moved", size: 200 });
+    expect(repo.get("aaa")).toEqual({
+      hash: "aaa",
+      s3_key: "objects/aaa-moved",
+      size: 200,
+      ciphertext_checksum: "crc1",
+    });
+
+    // A later upsert *can* still overwrite it with a new value.
+    repo.upsert({
+      hash: "aaa",
+      s3_key: "objects/aaa-moved",
+      size: 200,
+      ciphertext_checksum: "crc2",
+    });
+    expect(repo.get("aaa")?.ciphertext_checksum).toBe("crc2");
   });
 
   it("computes orphan count/size via an anti-join against entries, entirely in SQL", () => {

@@ -15,16 +15,19 @@ import type { ProgressUpdate } from "../../../src/progress-types.js";
 // encrypt pipeline never finishes flowing, and the source file read can race
 // past a test's own cleanup. Reinstated in every beforeEach below, because
 // mockClear() forgets recorded calls but keeps whatever implementation a
-// previous test installed (the retry test installs a failing one).
+// previous test installed (the retry test installs a failing one). Returns
+// a fixed fake checksum -- putObjectStream's real return value, which none
+// of these tests inspect -- so the mock's shape matches the real function.
 async function drainBody(
   _client: unknown,
   _bucket: unknown,
   _key: unknown,
   body: AsyncIterable<unknown>,
-): Promise<void> {
+): Promise<string> {
   for await (const _chunk of body) {
     // draining is the point
   }
+  return "fake-checksum";
 }
 
 vi.mock("../../../src/s3/client.js", () => ({
@@ -606,6 +609,7 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
         for await (const _chunk of body) {
           // draining is the point
         }
+        return "fake-checksum";
       },
     );
 

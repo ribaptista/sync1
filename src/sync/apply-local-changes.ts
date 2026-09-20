@@ -333,13 +333,16 @@ export async function applyLocalChangesToCandidate(
         // the next attempt has to re-earn. Leaving it in place would have
         // the new attempt's advance() calls pile onto bytes that no longer
         // exist anywhere.
+        // Set by the upload below; declared out here so the DB write that
+        // follows can record it.
+        let ciphertextChecksum: string | undefined;
         await withS3Retry(
           async () => {
             const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
               fileTracker.advance(n),
             );
             const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
-            await putObjectStream(
+            ciphertextChecksum = await putObjectStream(
               s3.client,
               s3.bucket,
               remoteKey(s3.location, key),
@@ -362,7 +365,12 @@ export async function applyLocalChangesToCandidate(
             },
           },
         );
-        objectsRepo.upsert({ hash, s3_key: key, size });
+        objectsRepo.upsert({
+          hash,
+          s3_key: key,
+          size,
+          ciphertext_checksum: ciphertextChecksum ?? null,
+        });
         uploadedObjects++;
         for (const sourceRow of job.sourceRows) {
           entriesRepo.upsert({

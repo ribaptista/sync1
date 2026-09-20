@@ -8,9 +8,17 @@ const execFileAsync = promisify(execFile);
 
 // Pinned per the Task 0 spike: `latest` requires a Pro license and quits on
 // startup; `3.8` lacks If-Match conditional PutObject support (only
-// If-None-Match works). 4.0 is the community edition confirmed to support
-// both, which the whole CAS design depends on.
-const LOCALSTACK_IMAGE = "localstack/localstack:4.0";
+// If-None-Match works). 4.0 was the community edition first confirmed to
+// support both, which the CAS design depends on.
+//
+// Bumped 4.0 -> 4.9 for CRC64NVME full-object checksum support (see
+// src/s3/checksum.ts): bisected directly against real containers --
+// unsupported on 4.0, present but broken for multipart on 4.1-4.2
+// (LocalStack's own recomputed checksum disagreed with the client's,
+// BadDigest), fixed from 4.3 onward. 4.9 is simply the newest tag tested
+// clean, not a hard floor -- re-verified the If-Match/If-None-Match
+// conditional-PutObject behavior above still holds on it before bumping.
+const LOCALSTACK_IMAGE = "localstack/localstack:4.9";
 
 export interface LocalStackHandle {
   endpoint: string;

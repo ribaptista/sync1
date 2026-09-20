@@ -13,6 +13,8 @@ import {
   type Tier,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
+import { UploadChecksumTap } from "./checksum.js";
+import { CorruptionError } from "../errors.js";
 
 export interface S3ClientOptions {
   /** Required-but-nullable rather than optional: sidesteps exactOptionalPropertyTypes
@@ -128,25 +130,65 @@ export const MULTIPART_THRESHOLD_BYTES = 32 * 1024 * 1024;
  * lib-storage`'s `Upload` class accepts the same streamed body directly (no
  * local temp-file staging) and manages the part uploads internally.
  */
+/**
+ * Verifies what S3 says it stored against what we streamed, throwing on any
+ * disagreement.
+ *
+ * Worth being clear about what this adds, since it is narrower than it
+ * looks. Reads are already protected end-to-end: every download decrypts
+ * and re-hashes, the AEAD authenticates each chunk, and a mismatch raises
+ * `CorruptionError`. What was missing is a check at *write* time -- until
+ * now an upload trusted its 200, so an object S3 stored wrongly would only
+ * be discovered on a later materialize, quite possibly after the local copy
+ * had been stubified away. That is the window this closes.
+ *
+ * CRC64NVME's single-value-either-way property (see checksum.ts) is what
+ * lets this be one function for both upload paths, rather than a
+ * full-object comparison for one and a composite comparison for the other.
+ */
+function verifyStoredChecksum(key: string, expected: string, reported: string | undefined): void {
+  // A backend that doesn't implement checksums at all reports nothing.
+  // Silence isn't a mismatch, and failing the run over it would make this
+  // a compatibility break rather than an integrity check.
+  if (reported === undefined || reported === "") return;
+  if (reported === expected) return;
+  throw new CorruptionError(
+    `S3 stored "${key}" with a CRC64NVME checksum of ${reported}, but the bytes we sent checksum to ${expected} -- the upload was corrupted in transit or at rest`,
+  );
+}
+
 export async function putObjectStream(
   client: S3Client,
   bucket: string,
   key: string,
   body: Readable,
   contentLength: number,
-): Promise<void> {
+): Promise<string> {
+  const tap = new UploadChecksumTap();
+
   if (contentLength < MULTIPART_THRESHOLD_BYTES) {
-    await client.send(
-      new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentLength: contentLength }),
+    const result = await client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: tap.tap(body),
+        ContentLength: contentLength,
+        ChecksumAlgorithm: "CRC64NVME",
+      }),
     );
-    return;
+    const expected = await tap.checksum();
+    verifyStoredChecksum(key, expected, result.ChecksumCRC64NVME);
+    return expected;
   }
 
   const upload = new Upload({
     client,
-    params: { Bucket: bucket, Key: key, Body: body },
+    params: { Bucket: bucket, Key: key, Body: tap.tap(body), ChecksumAlgorithm: "CRC64NVME" },
   });
-  await upload.done();
+  const result = (await upload.done()) as { ChecksumCRC64NVME?: string };
+  const expected = await tap.checksum();
+  verifyStoredChecksum(key, expected, result.ChecksumCRC64NVME);
+  return expected;
 }
 
 export async function getObject(

@@ -26,6 +26,7 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@aws-sdk/checksums": "^3.1001.0",
     "@aws-sdk/client-s3": "^3.700.0",
     "@aws-sdk/lib-storage": "^3.1131.0",
     "better-sqlite3": "^11.7.0",

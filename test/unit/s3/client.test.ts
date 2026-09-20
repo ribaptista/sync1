@@ -2,7 +2,9 @@ import { Readable } from "node:stream";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 
-const doneMock = vi.fn(async () => ({ ETag: '"complete-etag"' }));
+const doneMock = vi.fn(async (): Promise<{ ETag?: string; ChecksumCRC64NVME?: string }> => ({
+  ETag: '"complete-etag"',
+}));
 const uploadCtor = vi.fn();
 
 vi.mock("@aws-sdk/lib-storage", () => ({
@@ -63,5 +65,127 @@ describe("putObjectStream", () => {
     expect(passedClient).toBe(client);
     expect(params).toMatchObject({ Bucket: "bucket", Key: "objects/large" });
     expect(doneMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("requests ChecksumAlgorithm: CRC64NVME on both the single-PUT and multipart paths", async () => {
+    const client = fakeClient();
+
+    await putObjectStream(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client as any,
+      "bucket",
+      "objects/small",
+      makeStream("hi"),
+      MULTIPART_THRESHOLD_BYTES - 1,
+    );
+    const putCommand = client.send.mock.calls[0]![0] as { input: { ChecksumAlgorithm?: string } };
+    expect(putCommand.input.ChecksumAlgorithm).toBe("CRC64NVME");
+
+    await putObjectStream(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client as any,
+      "bucket",
+      "objects/large",
+      makeStream("hi"),
+      MULTIPART_THRESHOLD_BYTES,
+    );
+    const [{ params }] = uploadCtor.mock.calls[uploadCtor.mock.calls.length - 1] as [
+      { params: { ChecksumAlgorithm?: string } },
+    ];
+    expect(params.ChecksumAlgorithm).toBe("CRC64NVME");
+  });
+});
+
+/**
+ * The two tests above only check *wiring* -- that a PutObjectCommand or
+ * Upload gets constructed with the right args. Neither mock ever drains
+ * the tapped body or returns a Checksum* field, so verifyStoredChecksum's
+ * comparison silently no-ops (an S3-compatible backend that doesn't
+ * implement checksums is explicitly not a failure -- see client.ts). These
+ * tests drain the body themselves, the way a real client actually would,
+ * so the comparison logic genuinely runs.
+ */
+describe("putObjectStream: checksum verification", () => {
+  // Same known-correct value checksum.test.ts cross-checks against a real
+  // LocalStack container's own response for this exact buffer -- reused
+  // here as "what a real, correctly-behaving S3 would report back".
+  const CONTENT = "hello crc64";
+  const REAL_CHECKSUM = "qVz5kPyaEcE=";
+
+  async function drainingClient(reportedChecksum: string | undefined) {
+    return {
+      send: vi.fn(async (command: { input: { Body: AsyncIterable<unknown> } }) => {
+        for await (const _chunk of command.input.Body) {
+          // draining is the point -- a real client reads the whole body
+        }
+        return reportedChecksum === undefined ? {} : { ChecksumCRC64NVME: reportedChecksum };
+      }),
+    };
+  }
+
+  it("returns the checksum, unthrown, when S3's reported value matches what we computed", async () => {
+    const client = await drainingClient(REAL_CHECKSUM);
+    const result = await putObjectStream(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client as any,
+      "bucket",
+      "objects/small",
+      makeStream(CONTENT),
+      MULTIPART_THRESHOLD_BYTES - 1,
+    );
+    expect(result).toBe(REAL_CHECKSUM);
+  });
+
+  it("throws CorruptionError, naming both values, when S3's reported checksum disagrees", async () => {
+    const client = await drainingClient("wrong-checksum-entirely");
+    await expect(
+      putObjectStream(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        client as any,
+        "bucket",
+        "objects/small",
+        makeStream(CONTENT),
+        MULTIPART_THRESHOLD_BYTES - 1,
+      ),
+    ).rejects.toThrow(
+      `S3 stored "objects/small" with a CRC64NVME checksum of wrong-checksum-entirely, but the bytes we sent checksum to ${REAL_CHECKSUM} -- the upload was corrupted in transit or at rest`,
+    );
+  });
+
+  it("does not throw when S3 reports no checksum at all -- an unsupported backend, not a mismatch", async () => {
+    const client = await drainingClient(undefined);
+    const result = await putObjectStream(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      client as any,
+      "bucket",
+      "objects/small",
+      makeStream(CONTENT),
+      MULTIPART_THRESHOLD_BYTES - 1,
+    );
+    // Still returns our own computed value -- it's stored regardless of
+    // whether this particular backend could confirm it.
+    expect(result).toBe(REAL_CHECKSUM);
+  });
+
+  it("verifies multipart the same way, draining Body via the mocked Upload before resolving", async () => {
+    doneMock.mockImplementationOnce(async () => {
+      const lastCall = uploadCtor.mock.calls[uploadCtor.mock.calls.length - 1] as [
+        { params: { Body: AsyncIterable<unknown> } },
+      ];
+      for await (const _chunk of lastCall[0].params.Body) {
+        // draining is the point
+      }
+      return { ChecksumCRC64NVME: REAL_CHECKSUM };
+    });
+
+    const result = await putObjectStream(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      fakeClient() as any,
+      "bucket",
+      "objects/large",
+      makeStream(CONTENT),
+      MULTIPART_THRESHOLD_BYTES,
+    );
+    expect(result).toBe(REAL_CHECKSUM);
   });
 });
