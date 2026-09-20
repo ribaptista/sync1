@@ -304,7 +304,13 @@ unit for this command.
 
 `state` and `cleanup` drive that one bar from the filesystem walk (`scanThumbnails`'s `onProgress`
 callback) exactly as any other command would — neither mode ever generates anything, so "files scanned"
-is the only meaningful progress unit for either. `ensure` used to drive the same bar the same way, which
+is the only meaningful progress unit for either. Its _denominator_ comes from a separate callback,
+`onScanTotalKnown`, fed by a concurrent counting walk (`thumbnail-enumerate.ts`) that probes and matches
+nothing: the real walk blocks on `waitForRoom` once the probe pool is full, so left to itself it could
+only ever report its own scanned count as its own total — a bar pinned at 100%. The counting walk counts
+every entry, directories included, to match exactly what `onProgress` reports as the numerator, and the
+real walk's own final count is published last, marked final. See concurrency-and-progress.md's
+"Enumeration vs. execution" section. `ensure` used to drive the same bar the same way, which
 meant it filled during the (comparatively fast) walk and then sat static for however long the
 (comparatively slow) actual generation work took — confirmed a genuine gap, not a documented decision:
 the walk's own progress callback fired per row scanned, but the generation dispatch/join round had no
@@ -312,11 +318,14 @@ progress reporting of its own at all.
 
 `ensure` now drives the bar from a _separate_ callback, `onGenerationProgress`, entirely independent of
 the walk's `onProgress` (the two units — "files scanned" and "thumbnails generated" — aren't
-commensurable, so there's no single running count that could serve both): the bar's total grows by one
-each time the reconciliation loop dispatches a new to-generate/to-regenerate job (known synchronously,
-right as `scanThumbnails` decides a candidate needs generating, not discovered incrementally over a long
-walk the way `onProgress`'s count is), and its value advances by one each time a generation attempt
-completes — successfully or not, from a `finally`, so a per-file failure still moves the bar rather than
-silently stalling it. `ensure`'s own walk phase doesn't drive the bar at all under this scheme; since the
+commensurable, so there's no single running count that could serve both): the bar opens on the phase's
+_exact, final_ total and its value advances by one each time a generation attempt completes —
+successfully or not, from a `finally`, so a per-file failure still moves the bar rather than silently
+stalling it. The total is exact because the reconciliation loop runs after the probe pool has gone idle,
+so every candidate is already decided before any is dispatched; `scanThumbnails` collects them as
+`GenerationJob`s and dispatches them in a second loop. (It previously dispatched as it decided, growing
+the total by one per dispatch — and since dispatch blocks on `waitForRoom`, the denominator grew at
+exactly the rate the work finished, which is the failure mode described in concurrency-and-progress.md's
+"Enumeration vs. execution" section.) `ensure`'s own walk phase doesn't drive the bar at all under this scheme; since the
 walk is the fast phase and generation is the slow one, this trades a moving bar during the part that
 barely takes any time for a moving bar during the part that actually does.

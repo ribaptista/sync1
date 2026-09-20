@@ -18,7 +18,7 @@ sync1 sync [--root <local-path>] [--json] [--verbose] [--hash-parallelism <n>] [
 | `--file-stream-parallelism <n>` | no       | Max concurrent encrypt+upload / download+decrypt pipelines, used by the upload and remote-apply passes. Default 4.                                                                                           |
 
 Bucket/prefix/endpoint/region are read from `.sync1/remote.json`, written by `init_remote`/`attach_remote` — not repeated here. See
-[concurrency-and-progress.md](../architecture/concurrency-and-progress.md) for how `sync`'s three phases (scan, upload, remote-apply) each dispatch their own concurrent work.
+[concurrency-and-progress.md](../architecture/concurrency-and-progress.md) for how `sync`'s three phases (scan, upload, remote-apply) each dispatch their own concurrent work — and get their own progress bar, since a combined denominator across local hashing and network transfer was never a real quantity.
 
 ## What it does, at a high level
 

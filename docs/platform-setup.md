@@ -25,8 +25,10 @@ failures — the missing 7 simply never got a chance to report). A spawned `sync
 same abort on its own way out, which surfaces in a test as a bogus nonzero exit code rather than an
 assertion.
 
-Confirmed directly: the same e2e suite that aborts intermittently under Node 24 (`v24.21.0`) ran clean,
-multiple repeated times, under Node 22 (`v22.23.2`, current LTS) with no behavior change otherwise —
+Confirmed directly: the same e2e suite that aborts intermittently under Node 24 (`v24.21.0`) has not
+reproduced the abort across many repeated runs under Node 22 (`v22.23.2`, current LTS), with no behavior
+change otherwise. The bug is intermittent on both sides of that comparison, so treat this as "far less
+frequent", not "proven impossible" —
 **Node 22 is the recommended version for running this project's test suite** until this is fixed upstream
 (in Node, V8, or `better-sqlite3`, not in this repo). Using Node 24 is fine for normal `sync1` usage — the
 abort is a test-teardown artifact of running many short-lived `Database` instances back to back under a

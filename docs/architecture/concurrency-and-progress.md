@@ -210,18 +210,27 @@ measures:
   width keeping the **tail**, since the filename is the informative end and `linewrap: false` means the
   terminal would otherwise clip the head. The verbs are supplied by each producer, never enumerated in
   `src/cli/progress.ts` — the bar renders whatever word it is handed and knows nothing about hashing or
-  S3, which is also what lets `sync` show a different verb per phase through one session.
+  S3, which is also what lets each of `sync`'s three phase bars carry its own verb.
 
-Both session types share the same "only grows" convention for totals (`setOverallTotal`/
-`setOverallTotals` never shrinks a total that's already been set, since the true total often isn't
-known upfront for a glob-scoped or whole-tree scan) and the same null-object pattern (a no-op session
-when bars shouldn't show, so a command's own logic never branches on whether bars are actually
-rendering).
+Both session types share the same **provisional-until-final** convention for totals and the same
+null-object pattern (a no-op session when bars shouldn't show, so a command's own logic never branches
+on whether bars are actually rendering). A total arrives with a `final` flag: while it's provisional,
+`setOverallTotal`/`setOverallTotals` only ever _grow_ it (a running scan's discovery count can't be
+allowed to jitter downward), and the bar renders it as approximate — `~1.2 GB`, `~4/~9 files`,
+`~ETA 4m`. Once a total is declared final it's set absolutely, downward revisions included, clamped to
+what's already done so the bar can never render past 100%. Only the provisional→final edge forces a
+flush past the throttle described below, since that's where the format itself changes; ordinary
+revisions must not, or they'd reintroduce exactly the flood the throttle exists to damp.
+
+Downward revision is safe only because the tracker keeps _observation_ and _estimation_ in separate
+counters and emits `max(observed, estimated)`. An estimate revised down can therefore never drag the
+denominator below what has already finished; at worst it stops raising it. `settle()` (estimate :=
+observed, and final) is what lands a run on exactly 100% whichever way the estimate was wrong.
 
 Every domain function in `BytesProgressSession`'s scope takes an `onProgress?: OnProgress` parameter
 (`src/progress-types.ts` — kept as its own leaf module, not part of `src/cli/*`, since `src/fs/*` and
 `src/sync/*` never import from `src/cli/*` and this type needs to cross that boundary without inverting
-it) and reports `{ filesDone, filesTotal, bytesDone, bytesTotal, activity? }`. None of them build that
+it) and reports `{ filesDone, filesTotal, bytesDone, bytesTotal, totalsFinal, activity? }`. None of them build that
 object by hand: they all drive a `createProgressTracker`, which owns the counting rule in one place
 rather than in six near-identical `report()` closures.
 
@@ -229,8 +238,9 @@ The counting rule is the same everywhere. **`filesTotal` counts every row a scan
 _discovered_; `filesDone` counts the ones whose work has actually _resolved_** — a row needing no
 async work resolves the moment it's seen, so the two only diverge by what is genuinely in flight. They
 were previously the same variable, which is why the bar used to read a pinned `X/X`. Note the gap this
-opens is bounded by pool concurrency, since the producers block once the pool is full; the honest
-denominator early in a run comes from each command preseeding a total from its own row count.
+opens is bounded by pool concurrency, since the producers block once the pool is full — which is
+exactly why discovery alone can't produce an honest denominator, and why enumeration is split out from
+execution (below).
 
 **`bytesDone`/`bytesTotal` count only content actually hashed/uploaded/downloaded this run** — a
 directory, an already-resolved stub (hash read from the stub file itself, never hashed), a
@@ -249,14 +259,78 @@ pipeline — `countingReadable` around the plaintext read for uploads, an `onByt
 worker thread for hashing (see `createHashRunner`). All three are denominated in **plaintext** bytes so
 they sum to exactly the size the tracker was opened with; ciphertext byte counts run larger and would
 overrun the declared total. A file's partial contribution is clamped to its own size and `finish()` is
-idempotent and called from a `finally`, which together keep `bytesDone` monotonic — a property
-`performSync`'s phase accumulator below depends on.
+idempotent and called from a `finally`, which together keep `bytesDone` monotonic — the one counter
+nothing is ever allowed to walk back, since it's what the bar's fill is drawn from.
 
-`sync` is the one command whose progress spans more than one domain function: `performSync` runs three
-phases fully sequentially (`performUpdateCache`, then `applyLocalChangesToCandidate`, then
-`applyRemoteChangesToLocal`), each of which reports its own progress starting from zero. Reporting each
-phase's raw numbers straight through would make the bar visibly reset twice per run. Instead,
-`performSync` keeps a `base: ProgressUpdate` accumulator: the `onProgress` handed to whichever phase is
-currently running adds `base` on top of that phase's own numbers before forwarding outward, and once a
-phase resolves, its last reported update is folded into `base` before the next phase starts. The bar
-the user sees is one running total across the whole sync, not three resets.
+## Enumeration vs. execution
+
+A run's denominator used to come from the same loop that did the work, so it climbed for almost the
+whole run: work was counted as it was _discovered_, and discovery is throttled by backpressure from the
+pool doing the slow part. The bar and its ETA only became meaningful as a run finished — exactly when
+they stop being useful.
+
+So **enumeration is separated from execution**. A cheap, offline, unbackpressured pass counts what the
+run is about to do and publishes it through `setEstimatedTotals`; the real pass decides everything for
+itself, as before.
+
+**The denominator principle: the total counts items this run is responsible for _resolving_, decided
+offline — not items that will turn out to need transfer or generation.** An object that turns out to be
+archived resolves by requesting retrieval; a glob-matched file that probes as non-media resolves by
+being skipped; a conflicting dirty row resolves by being reported. All of them advance the bar without
+moving bytes. This is what keeps enumeration cheap enough to be honest, and it's why no counting pass
+ever issues a network request — a pass that did would be throttled by the very pool it exists to
+explain, and its answer could go stale before the real pass reached it.
+
+| Command                        | How the total is known                                                         | Extra I/O      |
+| ------------------------------ | ------------------------------------------------------------------------------ | -------------- |
+| `gc`                           | already computed by `countStagedOrphans()`                                     | none           |
+| `converge` / `status`          | `countDistinctHashesMatchingGlob(filter)`                                      | none (DB scan) |
+| `materialize`                  | glob match + `existsSync` stub + `objects.size`                                | stat only      |
+| `sync` phase 2                 | `enumerateUploadWork`: dirty rows' `entries.size`, dedup skipped via `objects` | none           |
+| `update_cache`, `sync` phase 1 | concurrent counting walk (`update-cache-enumerate.ts`)                         | one extra walk |
+| `sanity_check`                 | concurrent counting merge-join (`sanity-check-enumerate.ts`)                   | one extra walk |
+| `stubify`                      | concurrent counting scan over cache rows (`stubify-enumerate.ts`)              | stat only      |
+| `thumbnail state`/`cleanup`    | concurrent counting walk (`thumbnail-enumerate.ts`)                            | one extra walk |
+| `thumbnail ensure`             | exact: every generation candidate is decided before the first is dispatched    | none           |
+
+The walking/scanning passes run **concurrently** with the real pass, not before it: on an unchanged
+tree the walk _is_ the entire cost of `update_cache`, so a sequential pre-pass would roughly double the
+runtime of by far the most common case — a no-op `sync` — in exchange for a bar nobody is watching. Run
+alongside, the cost is overlapped and the dentry cache is warmed for the pass following behind.
+
+Every such pass is **advisory in the strongest sense**: it never throws (a failure just means the run
+proceeds with the denominator it would have had anyway), never mutates anything, and its numbers are
+only ever a floor-raising estimate that `settle()` discards at the end. There is therefore no staleness
+protocol, no mtime revalidation and no persisted work list: the real pass re-decides from scratch, and
+any disagreement is absorbed by `max(observed, estimated)` on the way up and by `settle()` on the way
+down. Each is cut short by an `EnumerationControl { stop }` flag and joined in a `finally`, so it can
+never publish into a tracker that has already settled.
+
+Two concurrent iterations on one SQLite connection are safe here because repository iterators are
+keyset-paginated (`src/db/keyset-pagination.ts`): each page is a `.all()` that drains in one
+synchronous turn, so neither pass ever leaves a cursor _paused_ — the only thing better-sqlite3
+actually forbids (see the note at the top of this document).
+
+## `sync`: one bar per phase
+
+`performSync` runs three phases fully sequentially — `performUpdateCache` (hashing),
+`applyLocalChangesToCandidate` (uploading), `applyRemoteChangesToLocal` (downloading) — each reporting
+its own progress from zero. They used to be welded into a single bar by a `base` offset accumulated
+across phase boundaries. They now get **one bar each**, minted lazily as its phase begins
+(`BytesProgressSession.startPhase(label)`, within the `MultiBar` the session already owned).
+
+A combined denominator was never a real quantity: phase 2 works on the dirty set phase 1 produces, and
+phase 3 diffs against a candidate DB that doesn't exist until the remote snapshot has been fetched, so
+no counting pass could ever have known the grand total up front. Summing was also apples-to-oranges — a
+gigabyte hashed off a local disk and a gigabyte pushed over an uplink are not the same work — which
+made the single combined ETA partly fiction. Three ETAs over homogeneous workloads are each genuinely
+accurate. Two failure modes disappear rather than needing handling: an inflated _estimate_ being baked
+permanently into the offset, and `totalsFinal` leaking out of phase 1 to claim a trustworthy
+denominator while two-thirds of the run is unaccounted for.
+
+Bars are created when their phase actually starts, never up front: a bar sitting at 0 for a phase whose
+inputs don't exist yet is a lie with a progress indicator attached. `clearOnComplete: false` means the
+run ends showing all three, complete, as a summary. Known and accepted: the gap between phase 1 and
+phase 2 — an S3 `getObject` for `/current`, plus downloading and decrypting the whole remote state.db
+when the remote moved — reports nothing. With one bar that read as "frozen"; with three it reads as
+"phase 1 done, phase 2 not started", which is the same reality correctly attributed.
