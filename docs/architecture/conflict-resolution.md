@@ -105,6 +105,15 @@ only the genuinely conflicting paths are reported and left dirty for manual reso
 `git`'s behavior more than a strict two-phase-commit would: an unrelated conflict elsewhere in the tree
 doesn't stop you from getting today's other changes backed up.
 
+A row whose upload genuinely _fails_ (not a conflict -- the content was never applied at all) gets the
+same treatment, for the same reason: `applyLocalChangesToCandidate`'s dispatched job catches it, marks
+neither `handledPaths` nor `appliedCount` for any row riding on that job (the dispatcher and any
+same-batch dedup attach alike), and leaves every one of them dirty. The candidate DB never learns about
+the failed content at all -- no `entries`/`objects` row is written for it -- so the run's other,
+unrelated successes still land in the new version, and the failed path is simply retried on the next
+`sync`. See `src/progress-types.ts`'s `FileTracker.abort()` for the matching progress-accounting half:
+a failed file must not be reported as transferred either.
+
 ## What decides whether a new version gets created at all
 
 Not "were there dirty rows" — a dirty row might resolve as a no-op (nothing to write) or a conflict

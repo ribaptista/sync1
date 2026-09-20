@@ -753,3 +753,234 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     candidateDb.close();
   });
 });
+
+describe("applyLocalChangesToCandidate: upload failure", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-failure-test-"));
+    putObjectStreamMock.mockReset();
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function touch(relPath: string, content: string): void {
+    fs.writeFileSync(path.join(root, relPath), content);
+  }
+
+  it("leaves a failed upload's path dirty, with no entry written, while an unrelated success still lands", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const goodContent = "fine content";
+    const badContent = "b".repeat(300); // well past the 100-byte contentLength threshold below
+    touch("good.txt", goodContent);
+    touch("bad.txt", badContent);
+
+    putObjectStreamMock.mockImplementation(
+      async (
+        _client: unknown,
+        _bucket: unknown,
+        _key: unknown,
+        body: AsyncIterable<unknown>,
+        contentLength: unknown,
+      ): Promise<string> => {
+        for await (const _chunk of body) {
+          // draining is the point
+        }
+        // Distinguished by contentLength, not the S3 key: sync1 is
+        // content-addressed, so the key is derived from the hash, never
+        // the path/filename -- a mock keyed off "bad" in the key would
+        // never actually match either file. contentLength is real,
+        // deterministic ciphertext framing (encryptedSize) that differs
+        // enough between the two bodies below to tell them apart cleanly.
+        // The error itself is a plain, unclassified Error, so withS3Retry
+        // treats it as non-transient and throws on the very first attempt
+        // rather than retrying it away.
+        if (Number(contentLength) > 100) throw new Error("simulated permanent failure");
+        return "fake-checksum";
+      },
+    );
+
+    const dirtyRows = [
+      {
+        path: "good.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash: hashBufferHex(Buffer.from(goodContent)),
+        size: goodContent.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+      {
+        path: "bad.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash: hashBufferHex(Buffer.from(badContent)),
+        size: badContent.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    // A p-queue task rejecting produces an unlistened 'error' event
+    // (PQueue extends eventemitter3, which would otherwise print a
+    // warning) -- listened here purely to keep the test's own output
+    // clean, not because anything needs to react to it.
+    const streamPool = new PQueue({ concurrency: 4 });
+    streamPool.on("error", () => {});
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      streamPool,
+      8,
+    );
+
+    // The point of this whole fix: a row whose upload failed is not
+    // reported as applied, and the run still completes rather than
+    // losing track of the unrelated row that succeeded.
+    expect(result.handledPaths.has("bad.txt")).toBe(false);
+    expect(result.handledPaths.get("good.txt")).toBe("v1");
+    expect(result.appliedCount).toBe(1);
+    expect(result.uploadedObjects).toBe(1);
+    expect(result.conflicts).toEqual([]); // failed, not merely conflicted -- a different case
+
+    const entriesRepo = new EntriesRepository(candidateDb);
+    expect(entriesRepo.get("bad.txt")).toBeUndefined();
+    expect(entriesRepo.get("good.txt")?.hash).toEqual(expect.any(String));
+
+    candidateDb.close();
+  });
+
+  it("leaves a same-batch dedup attach dirty too, when the job it rode on fails", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "shared content that will fail to upload";
+    const hash = hashBufferHex(Buffer.from(content));
+    touch("a.txt", content);
+    touch("b.txt", content);
+
+    putObjectStreamMock.mockImplementation(async (): Promise<string> => {
+      throw new Error("simulated permanent failure");
+    });
+
+    const dirtyRows = [
+      {
+        path: "a.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+      {
+        path: "b.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const streamPool = new PQueue({ concurrency: 4 });
+    streamPool.on("error", () => {});
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      streamPool,
+      8,
+    );
+
+    // b.txt never got a dispatch of its own -- it attached to a.txt's job,
+    // which failed. Neither is applied, and b.txt is not miscounted as a
+    // successful dedup either: nothing about this batch actually landed.
+    expect(result.handledPaths.has("a.txt")).toBe(false);
+    expect(result.handledPaths.has("b.txt")).toBe(false);
+    expect(result.appliedCount).toBe(0);
+    expect(result.uploadedObjects).toBe(0);
+    expect(result.dedupedObjects).toBe(0);
+
+    const entriesRepo = new EntriesRepository(candidateDb);
+    expect(entriesRepo.get("a.txt")).toBeUndefined();
+    expect(entriesRepo.get("b.txt")).toBeUndefined();
+
+    candidateDb.close();
+  });
+
+  it("does not count a failed file's bytes as transferred", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "a".repeat(500);
+    touch("bad.txt", content);
+
+    putObjectStreamMock.mockImplementation(
+      async (
+        _client: unknown,
+        _bucket: unknown,
+        _key: unknown,
+        body: AsyncIterable<unknown>,
+      ): Promise<string> => {
+        // Reads some of the body -- so bytesDone would be nonzero if abort()
+        // failed to rewind it the way retrying() does -- then fails outright.
+        for await (const _chunk of body) break;
+        throw new Error("simulated permanent failure");
+      },
+    );
+
+    const updates: ProgressUpdate[] = [];
+    const streamPool = new PQueue({ concurrency: 4 });
+    streamPool.on("error", () => {});
+
+    await applyLocalChangesToCandidate(
+      candidateDb,
+      [
+        {
+          path: "bad.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash: hashBufferHex(Buffer.from(content)),
+          size: content.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+      ],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      streamPool,
+      8,
+      (u) => updates.push({ ...u }),
+    );
+
+    // The file never actually finished, so it must never be reported as
+    // fully done the way a successful finish() would -- settle() still
+    // brings the phase to 100% (every row, including the failed one, did
+    // get *resolved*), but zero of this file's bytes are counted done.
+    expect(updates.at(-1)).toMatchObject({
+      bytesDone: 0,
+      filesDone: 1,
+      filesTotal: 1,
+      totalsFinal: true,
+    });
+
+    candidateDb.close();
+  });
+});

@@ -241,10 +241,19 @@ export async function applyLocalChangesToCandidate(
 
     // decision.kind === "apply" -- every branch below writes this path into
     // `entries` at `versionStamp`, so that is what the vault will hold.
-    handledPaths.set(row.path, versionStamp);
-    appliedCount++;
+    // `handledPaths`/`appliedCount` themselves, though, are recorded at
+    // each branch's own point of actually succeeding, not here: a row
+    // whose upload later fails must never be reported as applied, or
+    // reconcileCacheAfterCommit would mark it 'unchanged' and silently
+    // lose the pending local change it represents. Only the branches with
+    // no async gap between "decided" and "written" (this one, and the
+    // dedup-hit branch below) can safely record it immediately; the
+    // dispatched-upload branch further down records it from the job's own
+    // success path instead.
 
     if (row.type !== "file") {
+      handledPaths.set(row.path, versionStamp);
+      appliedCount++;
       entriesRepo.upsert({
         path: row.path,
         type: row.type,
@@ -267,21 +276,24 @@ export async function applyLocalChangesToCandidate(
     const existingJob = inFlightByHash.get(hash);
     if (existingJob) {
       existingJob.sourceRows.push({ path: row.path, type: row.type });
-      dedupedObjects++;
       logger.debug(
         { path: row.path, hash },
         "content already in flight this batch, attaching (dedup)",
       );
-      // rowResolved() deliberately NOT called here -- this row has no
-      // upload of its own. It attaches to the already-in-flight job above
-      // and resolves alongside every other row riding on it, whenever
-      // that job's own dispatch settles (see the streamPool.add callback
-      // below), not at attach time.
+      // Not counted as deduped here, and rowResolved() deliberately NOT
+      // called here either -- this row has no upload of its own and
+      // hasn't actually been applied yet, only provisionally attached to
+      // a job that might still fail. It resolves (and is counted, either
+      // way) alongside every other row riding on that job, from the same
+      // success/failure accounting the dispatching row itself goes
+      // through -- see the streamPool.add callback below.
       continue;
     }
 
     if (objectsRepo.has(hash)) {
       dedupedObjects++;
+      handledPaths.set(row.path, versionStamp);
+      appliedCount++;
       logger.debug({ path: row.path, hash }, "content already known, skipping upload (dedup)");
       entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
       progress.rowResolved();
@@ -372,7 +384,22 @@ export async function applyLocalChangesToCandidate(
           ciphertext_checksum: ciphertextChecksum ?? null,
         });
         uploadedObjects++;
-        for (const sourceRow of job.sourceRows) {
+        // Every row riding on this job -- the one that dispatched it, plus
+        // any dedup attach that arrived before it settled (job.sourceRows
+        // can have grown since dispatch, above) -- is only now genuinely
+        // applied: handledPaths/appliedCount are recorded here, at the
+        // point of actual success, not back when the row was merely
+        // decided. A row that never gets here (the catch block below)
+        // stays out of both, so it stays dirty in cache.db instead of
+        // being wrongly reconciled to 'unchanged'. sourceRows[0] is
+        // always the row that dispatched this job -- its own content
+        // upload, not a dedup hit -- everything after it attached to a
+        // job someone else already started.
+        for (let i = 0; i < job.sourceRows.length; i++) {
+          const sourceRow = job.sourceRows[i]!;
+          if (i > 0) dedupedObjects++;
+          handledPaths.set(sourceRow.path, versionStamp);
+          appliedCount++;
           entriesRepo.upsert({
             path: sourceRow.path,
             type: sourceRow.type,
@@ -381,18 +408,53 @@ export async function applyLocalChangesToCandidate(
           });
         }
         inFlightByHash.delete(hash);
+        // Success only, per FileTracker's own contract -- abort() below is
+        // the failure counterpart, and the two are mutually exclusive.
+        fileTracker.finish();
         logger.debug(
           { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
           "completed",
         );
+      } catch (err) {
+        // Deliberately NOT reported as applied: handledPaths/appliedCount/
+        // entriesRepo were never touched above for any row riding on this
+        // job, so every one of them -- the dispatcher and every dedup
+        // attach alike -- stays dirty in cache.db, exactly as if this run
+        // had never touched it. abort() (not finish()) is what keeps the
+        // bar honest: this file's bytes never actually reached S3, so
+        // they must not be counted as transferred.
+        //
+        // Also removed from inFlightByHash on failure, not just success:
+        // the main loop can race ahead of this job settling (it awaits
+        // waitForRoom between rows), so a later row sharing this hash
+        // could otherwise attach to a job that has already failed and
+        // will never revisit job.sourceRows again -- silently losing that
+        // row instead of starting a fresh upload attempt for it.
+        fileTracker.abort();
+        inFlightByHash.delete(hash);
+        // Swallowed here, deliberately: every row riding on this job stays
+        // dirty (see above) and the run continues, rather than the whole
+        // process dying on an unhandled rejection the way an uncaught
+        // failure would have without this catch -- letting a bulk sync
+        // lose every OTHER file's progress over one bad one would be a
+        // worse outcome than a clean per-file failure. Surfacing this
+        // properly to the command's own exit code/output (today it's
+        // silent beyond this log line) is the next fix, not this one --
+        // this catch exists to make that fix safe to add, by guaranteeing
+        // a swallowed failure can never be mistaken for a success.
+        logger.warn(
+          {
+            paths: job.sourceRows.map((r) => r.path),
+            hash,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "upload failed -- row(s) left dirty, will retry on the next sync",
+        );
       } finally {
-        // Unconditional, per FileTracker's own contract -- see
-        // update-cache.ts's dispatchHash for why this matters even on the
-        // error paths above. Every row riding on this job -- the one that
-        // dispatched it, plus any dedup attach that arrived before it
-        // settled (job.sourceRows can have grown since dispatch, above) --
-        // resolves together here, success or failure alike.
-        fileTracker.finish();
+        // Unconditional regardless of outcome, matching filesDone's own
+        // contract ("how far through the tree", not "how many
+        // succeeded") -- every row riding on this job has settled either
+        // way by the time this runs.
         for (let i = 0; i < job.sourceRows.length; i++) progress.rowResolved();
       }
     });

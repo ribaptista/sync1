@@ -105,12 +105,33 @@ export interface FileTracker {
    * Moves this file's contribution from in-flight partial to completed --
    * always the full `size`, regardless of how much `advance` actually
    * reported, so a file whose byte source never fires (or under-reports)
-   * still finishes exactly accounted for. Idempotent: call it from a
-   * `finally` unconditionally and a second call is a no-op, which matters
-   * because a rejected job's cleanup path and its ordinary completion path
-   * can both end up calling it.
+   * still finishes exactly accounted for. Call this only once the transfer
+   * has genuinely succeeded; see `abort()` for the failure counterpart.
+   * Idempotent, and mutually idempotent with `abort()` -- once either has
+   * been called, the other (and any further call to either) is a no-op,
+   * which matters because a job's success and failure cleanup paths can
+   * both end up calling into this contract from the same `finally`.
    */
   finish(): void;
+  /**
+   * This file's transfer failed outright (not a retry -- see `retrying()`
+   * for that) and will not be attempted again by this job. **Discards the
+   * partial bytes it had accumulated, same as `retrying()`, but -- unlike
+   * `finish()` -- never adds `size` to the tracker's completed total**: a
+   * file whose content never reached its destination must not be reported
+   * as transferred. This is what makes it safe for a caller to treat a
+   * caught upload/download failure as non-fatal (leaving the row dirty,
+   * say) without the bar silently claiming the failed bytes as done.
+   *
+   * No activity label, deliberately: unlike a retry (which can run for
+   * minutes and needs an ongoing "something is happening" signal), an
+   * abort is terminal and instantaneous -- the file simply stops being in
+   * flight. The caller's own logging is the right place to say why.
+   *
+   * Idempotent, and mutually idempotent with `finish()` -- see its own
+   * doc comment.
+   */
+  abort(): void;
 }
 
 /**
@@ -309,6 +330,17 @@ export function createProgressTracker(
           completedBytes += size;
           inFlightBytes -= partial;
           emit({ verb: verbs[1], path });
+        },
+        abort() {
+          if (finished) return;
+          finished = true;
+          // Same rewind as retrying() -- give back this file's own share
+          // of inFlightBytes -- but nothing is added to completedBytes:
+          // this file never actually finished, so it must not be counted
+          // as transferred. No activity emitted; see this method's own
+          // doc comment on FileTracker.
+          inFlightBytes -= partial;
+          emit();
         },
       };
     },

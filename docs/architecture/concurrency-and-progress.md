@@ -276,16 +276,22 @@ pipeline — `countingReadable` around the plaintext read for uploads, an `onByt
 `decryptStreamToFile`'s plaintext loop for downloads, and a shared-memory counter sampled off the
 worker thread for hashing (see `createHashRunner`). All three are denominated in **plaintext** bytes so
 they sum to exactly the size the tracker was opened with; ciphertext byte counts run larger and would
-overrun the declared total. A file's partial contribution is clamped to its own size and `finish()` is
-idempotent and called from a `finally`, which together keep `bytesDone` non-decreasing.
+overrun the declared total. A file's partial contribution is clamped to its own size, and both
+`finish()` and `abort()` (below) are idempotent and mutually idempotent with each other, which together
+keep `bytesDone` non-decreasing.
 
-There is exactly one deliberate exception, and it earns it: `FileTracker.retrying()`. When a transfer
-fails transiently and is about to restart from byte zero (see **Retrying transient S3 failures**
-below), it hands that file's accumulated partial back, so `bytesDone` rewinds to what is actually
-committed — which is precisely what the next attempt has to re-earn. Leaving the partial in place
-would have the retry's `advance` calls pile onto bytes that no longer exist anywhere, with only the
-clamp stopping the file over-claiming. The invariant that actually matters is
-`bytesDone <= bytesTotal`, and a rewind can't violate it.
+There are two deliberate exceptions to "only ever grows", and both earn it. `FileTracker.retrying()`:
+when a transfer fails transiently and is about to restart from byte zero (see **Retrying transient S3
+failures** below), it hands that file's accumulated partial back, so `bytesDone` rewinds to what is
+actually committed — which is precisely what the next attempt has to re-earn. Leaving the partial in
+place would have the retry's `advance` calls pile onto bytes that no longer exist anywhere, with only
+the clamp stopping the file over-claiming. `FileTracker.abort()`: when a transfer fails outright (not a
+retry — the caller has given up on this file, not merely this attempt), it does the same rewind, but
+unlike `finish()` never adds the file's `size` to `completedBytes` at all — a file whose content never
+reached its destination must not be reported as transferred. This is what makes it safe for a caller to
+catch an upload failure and leave the row dirty (see **Partial success, not all-or-nothing** in
+conflict-resolution.md) without the bar silently claiming those bytes as done. Both exceptions preserve
+the invariant that actually matters, `bytesDone <= bytesTotal`, which neither rewind can violate.
 
 ## Retrying transient S3 failures
 
