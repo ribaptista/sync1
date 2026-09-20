@@ -29,7 +29,22 @@ export interface UpdateCacheStats {
   modified: number;
   deleted: number;
   unchanged: number;
+  /** A brand-new local path matching an ignore policy -- never staged into cache.db at all, so there's no row for it to name. */
   ignored: number;
+  /**
+   * A path already sitting in cache.db, uncommitted (`state === 'created'`
+   * -- never synced), whose content a policy created *after* it was first
+   * discovered now matches -- dropped (`cacheRepo.delete`) rather than left
+   * to be uploaded on the next `sync`. Named explicitly, not just counted:
+   * unlike `ignored` above, this is a row the user might reasonably expect
+   * was already on its way in, so which paths it was matters.
+   *
+   * Deliberately never a committed row (`'unchanged'`/`'modified'`): a
+   * local drop there would be indistinguishable from a local delete and
+   * would propagate as one to every other machine on the next sync. See
+   * docs/architecture/ignore-and-storage-policies.md.
+   */
+  droppedIgnored: string[];
   caseCollisions: CaseCollision[];
 }
 
@@ -91,6 +106,7 @@ export async function performUpdateCache(
     deleted: 0,
     unchanged: 0,
     ignored: 0,
+    droppedIgnored: [],
     caseCollisions: [],
   };
 
@@ -175,18 +191,43 @@ export async function performUpdateCache(
         progress.rowResolved();
         cacheNext = cacheIter.next();
       } else if (fsEntry !== null && cacheEntry !== null) {
-        await dispatchExistingRow(
-          fsEntry,
-          cacheEntry,
-          root,
-          objectsRepo,
-          stats,
-          logger,
-          hashRunner,
-          hashJobs,
-          staging,
-          progress,
-        );
+        // Only ever checked for an uncommitted row: 'unchanged'/'modified'
+        // means this path already exists in the shared vault, and dropping
+        // its cache row locally would be indistinguishable from a local
+        // delete -- propagating as one to every other machine on the next
+        // sync. An ignore policy created after a path was first discovered
+        // never retroactively un-tracks something already committed; it
+        // only ever stops something not yet sent from being sent.
+        const ignoreMatch =
+          cacheEntry.state === "created" ? matchesAnyGlob(fsEntry.path, ignoreGlobs) : undefined;
+        if (ignoreMatch?.matched) {
+          // Deleted immediately, not deferred to an apply-after-the-loop
+          // step the way staged rows are: cacheIter is keyset-paginated
+          // (src/db/keyset-pagination.ts), not a live cursor, and keyset
+          // pagination only ever asks for rows *after* the last path it
+          // already consumed -- deleting the row this exact step just read
+          // can't perturb what a later page's own query returns.
+          cacheRepo.delete(fsEntry.path);
+          stats.droppedIgnored.push(fsEntry.path);
+          logger.debug(
+            { path: fsEntry.path, pattern: ignoreMatch.pattern },
+            "uncommitted path now matches an ignore policy -- dropping from cache.db",
+          );
+          progress.rowResolved();
+        } else {
+          await dispatchExistingRow(
+            fsEntry,
+            cacheEntry,
+            root,
+            objectsRepo,
+            stats,
+            logger,
+            hashRunner,
+            hashJobs,
+            staging,
+            progress,
+          );
+        }
         fsNext = await fsIter.next();
         cacheNext = cacheIter.next();
       }

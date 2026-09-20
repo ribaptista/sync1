@@ -59,6 +59,7 @@ export function registerUpdateCacheCommand(program: Command): void {
             deleted: stats.deleted,
             unchanged: stats.unchanged,
             ignored: stats.ignored,
+            dropped_ignored: stats.droppedIgnored,
             case_collisions: stats.caseCollisions.map((c) => ({
               path: c.path,
               collides_with: c.collidesWith,
@@ -66,8 +67,11 @@ export function registerUpdateCacheCommand(program: Command): void {
           });
         } else {
           process.stdout.write(
-            `update_cache: ${stats.created} created, ${stats.modified} modified, ${stats.deleted} deleted, ${stats.unchanged} unchanged, ${stats.ignored} ignored\n`,
+            `update_cache: ${stats.created} created, ${stats.modified} modified, ${stats.deleted} deleted, ${stats.unchanged} unchanged, ${stats.ignored} ignored, ${stats.droppedIgnored.length} dropped (now ignored)\n`,
           );
+          for (const p of stats.droppedIgnored) {
+            process.stdout.write(`  dropped (uncommitted, now matches an ignore policy): "${p}"\n`);
+          }
           for (const c of stats.caseCollisions) {
             process.stdout.write(
               `  case collision: "${c.path}" vs "${c.collidesWith}" -- rename or remove one of them, then run update_cache again\n`,

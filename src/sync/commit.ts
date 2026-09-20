@@ -70,6 +70,12 @@ export interface SyncResult {
    * apply here.
    */
   ignoredButSynced: IgnoredButSyncedEntry[];
+  /**
+   * Paths dropped from cache.db by this run's own internal update_cache
+   * scan -- uncommitted (never synced) local content that a since-added
+   * ignore policy now matches. See `UpdateCacheStats.droppedIgnored`.
+   */
+  droppedIgnored: string[];
 }
 
 export class RemoteDivergedError extends Error {
@@ -420,6 +426,7 @@ export async function performSync(
           conflicts: localResult.conflicts,
           caseCollisions: updateCacheStats.caseCollisions,
           ignoredButSynced: remoteResult.ignoredButSynced,
+          droppedIgnored: updateCacheStats.droppedIgnored,
         };
       }
 
@@ -477,6 +484,7 @@ export async function performSync(
         conflicts: localResult.conflicts,
         caseCollisions: updateCacheStats.caseCollisions,
         ignoredButSynced: remoteResult.ignoredButSynced,
+        droppedIgnored: updateCacheStats.droppedIgnored,
       };
     } finally {
       if (fs.existsSync(candidatePath)) fs.rmSync(candidatePath);

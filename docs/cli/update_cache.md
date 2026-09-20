@@ -41,6 +41,10 @@ known in `cache.db`, in lockstep sorted order:
   `modified`/`created` with a fresh baseline; if it was already pending (`created`/`modified` from an
   earlier, not-yet-synced run), it stays in that same category — its original baseline isn't disturbed,
   only its recorded hash/mtime are refreshed.
+- **Uncommitted, and a since-added ignore policy now matches it** → dropped from `cache.db` entirely
+  (`dropped_ignored` in `--json`, by path) rather than left to be uploaded on the next `sync`. Only ever
+  a not-yet-synced (`created`) row — a path already shared with the vault is never un-tracked this way;
+  see [ignore-and-storage-policies.md](../architecture/ignore-and-storage-policies.md).
 
 ## Output
 

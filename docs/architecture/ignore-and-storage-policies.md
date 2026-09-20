@@ -38,12 +38,33 @@ path, since one side of each merge-join (a filesystem walk) was never SQL rows t
 - **New local creation** (`update_cache`): a match means the path is skipped entirely — not staged into
   `cache.db` at all, not even as a rejected/reported row (unlike a case collision). Just a debug log and
   a summary count (`stats.ignored`).
+- **An uncommitted local creation already in `cache.db`** (`update_cache`): the same merge-join's other
+  branch, for a path the _previous_ scan already staged as `state === 'created'` — never synced, so
+  nothing else has ever seen it. A policy created _after_ that discovery now matching it drops the row
+  (`cacheRepo.delete`, not a `'deleted'` tombstone — a tombstone would propagate as a delete on the next
+  sync, which is not what happened) rather than leaving it to be uploaded on the next `sync`. Reported by
+  path, not just counted (`stats.droppedIgnored`, threaded through into `sync`'s own
+  `dropped_ignored` output field) — unlike a brand-new ignored path, this is content the user might
+  reasonably have expected was already on its way into the vault, so which paths were dropped matters.
+
+  Deliberately narrower than "any dirty row": a **committed** row (`'unchanged'`/`'modified'`) is never
+  dropped this way, no matter what policy shows up later. An ignore policy gates what's allowed to
+  _start_ entering the shared vault — it never retroactively un-tracks content already there, because a
+  local-only removal of an already-shared path's cache row is indistinguishable from a local delete, and
+  would propagate as one to every other machine on the next sync. (Un-sharing already-committed content
+  on purpose is a different, deliberate operation — `stubify`/removing the path outright — not a side
+  effect of adding an ignore rule.)
+
 - **New remote arrival** (`apply-remote-changes.ts`): a match does **not** block materialization. Ignore
   policies gate new local creations from ever entering the vault — they never retroactively un-share
   content some other machine already committed. This situation can only arise from a timing/history
   quirk (the content was committed before the policy existed, or before this machine had synced the
   policy), so it's surfaced as a warning (`ignoredButSynced` / `sync`'s `ignored_but_synced` output field)
   rather than a failure — it never changes `sync`'s exit code.
+
+Since `sync` runs `performUpdateCache` internally as its own first phase, both local-creation cases
+above take effect identically whether the scan runs via the standalone `update_cache` command or as part
+of a full `sync` — there is no separate code path to keep in sync (no pun intended).
 
 ## `sanity_check`'s relationship to ignore policies
 

@@ -46,6 +46,7 @@ describe("update_cache", () => {
       deleted: number;
       unchanged: number;
       ignored: number;
+      dropped_ignored: unknown[];
       case_collisions: unknown[];
     };
     expect(firstStats).toEqual({
@@ -55,6 +56,7 @@ describe("update_cache", () => {
       deleted: 0,
       unchanged: 0,
       ignored: 0,
+      dropped_ignored: [],
       case_collisions: [],
     });
 

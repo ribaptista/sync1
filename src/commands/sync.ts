@@ -80,6 +80,7 @@ export function registerSyncCommand(program: Command): void {
               path: c.path,
               matched_glob: c.matchedGlob,
             })),
+            dropped_ignored: result.droppedIgnored,
           });
         } else if (result.nothingToSync) {
           process.stdout.write("sync: nothing to sync\n");
@@ -105,6 +106,14 @@ export function registerSyncCommand(program: Command): void {
             );
             for (const c of result.ignoredButSynced) {
               process.stdout.write(`  - "${c.path}" matches "${c.matchedGlob}"\n`);
+            }
+          }
+          if (result.droppedIgnored.length > 0) {
+            process.stdout.write(
+              `${result.droppedIgnored.length} uncommitted path(s) dropped, now matching an ignore policy:\n`,
+            );
+            for (const p of result.droppedIgnored) {
+              process.stdout.write(`  - "${p}"\n`);
             }
           }
         }

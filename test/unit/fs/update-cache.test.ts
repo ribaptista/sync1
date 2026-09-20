@@ -118,6 +118,7 @@ describe("performUpdateCache", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -141,6 +142,7 @@ describe("performUpdateCache", () => {
       modified: 0,
       deleted: 0,
       unchanged: 1,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -170,6 +172,7 @@ describe("performUpdateCache", () => {
       modified: 1,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -203,6 +206,7 @@ describe("performUpdateCache", () => {
       modified: 0,
       deleted: 0,
       unchanged: 1,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -222,6 +226,7 @@ describe("performUpdateCache", () => {
       modified: 0,
       deleted: 1,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -277,6 +282,7 @@ describe("performUpdateCache", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -298,6 +304,7 @@ describe("performUpdateCache", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -318,6 +325,7 @@ describe("performUpdateCache", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -336,6 +344,7 @@ describe("performUpdateCache", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -356,6 +365,7 @@ describe("performUpdateCache: ignore policies", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 1,
     });
@@ -374,11 +384,100 @@ describe("performUpdateCache: ignore policies", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 1,
     });
     expect(repo.get("scratch.tmp")).toBeUndefined();
     expect(repo.get("keep.txt")?.state).toBe("created");
+  });
+
+  it("drops an uncommitted row when a policy created after its own discovery starts matching it", async () => {
+    touch("new.tmp", "not yet synced");
+    const repo = makeRepo();
+    // First run: no policy yet, so this is discovered and staged as an
+    // ordinary uncommitted creation, exactly like any other new file.
+    const first = await run(repo);
+    expect(first.created).toBe(1);
+    expect(repo.get("new.tmp")?.state).toBe("created");
+
+    // A policy shows up between runs -- the realistic order of events this
+    // whole fix exists for.
+    ignorePoliciesRepo.create("*.tmp");
+
+    const second = await run(repo);
+    expect(second).toEqual({
+      created: 0,
+      modified: 0,
+      deleted: 0,
+      unchanged: 0,
+      ignored: 0,
+      droppedIgnored: ["new.tmp"],
+      caseCollisions: [],
+    });
+    expect(repo.get("new.tmp")).toBeUndefined();
+  });
+
+  it("never drops a row already committed ('unchanged'), even if a new policy would match it", async () => {
+    const content = "already synced before this policy existed";
+    touch("shared.tmp", content);
+    const repo = makeRepo();
+    repo.upsert({
+      path: "shared.tmp",
+      type: "file",
+      mtime: Math.round(fs.statSync(path.join(root, "shared.tmp")).mtimeMs),
+      hash: hashBufferHex(Buffer.from(content)),
+      size: content.length,
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+
+    ignorePoliciesRepo.create("*.tmp");
+
+    const stats = await run(repo);
+    // Untouched: still tracked, still 'unchanged' -- dropping it here would
+    // be indistinguishable from a local delete and would propagate as one
+    // to every other machine on the next sync.
+    expect(stats.droppedIgnored).toEqual([]);
+    expect(repo.get("shared.tmp")?.state).toBe("unchanged");
+  });
+
+  it("never drops a row already committed and locally 'modified' either", async () => {
+    const original = "original synced content";
+    touch("edited.tmp", original);
+    const repo = makeRepo();
+    repo.upsert({
+      path: "edited.tmp",
+      type: "file",
+      mtime: 1,
+      hash: hashBufferHex(Buffer.from(original)),
+      size: original.length,
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+    // Edited locally since -- mtime no longer matches, so this run's own
+    // merge-join will want to re-resolve it as 'modified'.
+    touch("edited.tmp", "edited after last sync");
+
+    ignorePoliciesRepo.create("*.tmp");
+
+    const stats = await run(repo);
+    expect(stats.droppedIgnored).toEqual([]);
+    expect(repo.get("edited.tmp")?.state).toBe("modified");
+  });
+
+  it("still applies an unrelated dirty row in the same run as a dropped one", async () => {
+    touch("drop-me.tmp", "will be dropped");
+    touch("keep-me.txt", "will stay dirty");
+    const repo = makeRepo();
+    await run(repo); // both discovered and staged as 'created'
+
+    ignorePoliciesRepo.create("*.tmp");
+
+    const stats = await run(repo);
+    expect(stats.droppedIgnored).toEqual(["drop-me.tmp"]);
+    expect(repo.get("drop-me.tmp")).toBeUndefined();
+    expect(repo.get("keep-me.txt")?.state).toBe("created");
   });
 });
 
@@ -395,6 +494,7 @@ describe("performUpdateCache: stub files", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -430,6 +530,7 @@ describe("performUpdateCache: stub files", () => {
       modified: 0,
       deleted: 0,
       unchanged: 0,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });
@@ -461,6 +562,7 @@ describe("performUpdateCache: stub files", () => {
       modified: 0,
       deleted: 0,
       unchanged: 1,
+      droppedIgnored: [],
       caseCollisions: [],
       ignored: 0,
     });

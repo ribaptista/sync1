@@ -246,6 +246,7 @@ describe("sync (local-to-remote, single machine)", () => {
       conflicts: [],
       case_collisions: [],
       ignored_but_synced: [],
+      dropped_ignored: [],
     });
 
     // B's first sync pulls A's committed state down -- exercises
@@ -268,6 +269,7 @@ describe("sync (local-to-remote, single machine)", () => {
       conflicts: [],
       case_collisions: [],
       ignored_but_synced: [],
+      dropped_ignored: [],
     });
 
     fs.rmSync(rootA, { recursive: true, force: true });
