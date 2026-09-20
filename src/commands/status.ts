@@ -114,10 +114,8 @@ async function runStatus(
       logger,
       pools.s3,
       pools.s3.concurrency * 2,
-      (n) => {
-        progress.setOverallTotal(n);
-        progress.advanceOverall(1);
-      },
+      (checked) => progress.setOverallProgress(checked),
+      (total) => progress.setOverallTotal(total, { final: true }),
     );
   } finally {
     progress.stop();

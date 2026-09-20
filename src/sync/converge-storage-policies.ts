@@ -67,7 +67,15 @@ export async function convergeStoragePolicies(
   logger: Logger,
   s3Pool: PQueue,
   s3QueueLimit: number,
-  onProgress?: (scanned: number) => void,
+  onProgress?: (checked: number) => void,
+  /**
+   * The number of distinct objects this run will check, reported once
+   * before the first `HEAD` goes out. Knowable offline: it's a count over
+   * the already-local state.db, and only the *classification* of each
+   * object needs S3 -- so the denominator never costs a network round
+   * trip, however long the run itself takes.
+   */
+  onTotalKnown?: (total: number) => void,
 ): Promise<ConvergeResult> {
   const db = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
   const counts: ConvergeCounts = {
@@ -91,10 +99,15 @@ export async function convergeStoragePolicies(
     // resolved from *every* path referencing it (below), regardless of
     // --filter scope, since warmest-wins has to see the whole picture.
     // See docs/architecture/ignore-and-storage-policies.md.
-    let scanned = 0;
+    onTotalKnown?.(entriesRepo.countDistinctHashesMatchingGlob(filter));
+
+    // Counted on completion, not dispatch: dispatch deliberately runs
+    // ahead of the pool (that's what the backpressure below bounds), so
+    // advancing here would race the bar to 100% while every HEAD was
+    // still in flight. That was invisible while the denominator was
+    // itself the dispatch count; against a real total it isn't.
+    let checked = 0;
     for (const { hash } of entriesRepo.iterateDistinctHashesMatchingGlob(filter)) {
-      scanned++;
-      onProgress?.(scanned);
       const paths = [...entriesRepo.iterateByHash(hash)].map((e) => e.path);
       const { targetClass, conflicted } = resolveHashTargetClass(
         paths,
@@ -155,6 +168,8 @@ export async function convergeStoragePolicies(
             break;
         }
         logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "completed");
+        checked++;
+        onProgress?.(checked);
       });
       logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "dispatched");
     }

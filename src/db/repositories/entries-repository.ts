@@ -147,6 +147,25 @@ export class EntriesRepository {
   }
 
   /**
+   * How many hashes `iterateDistinctHashesMatchingGlob` would yield, so a
+   * caller can know its own total before starting rather than inferring
+   * one from how far it has got.
+   *
+   * Deliberately the same scan rather than a `SELECT COUNT(DISTINCT
+   * hash)`: glob matching happens in JS via minimatch, not in SQL --
+   * `literalPrefixOf` only narrows the keyset range the scan walks (see
+   * src/db/glob-scan.ts) -- so SQL alone can't answer this for anything
+   * but a wildcard-free pattern. It still touches nothing but the
+   * already-local database: no filesystem, no network, no S3.
+   */
+  countDistinctHashesMatchingGlob(pattern: string): number {
+    const hashes = this.iterateDistinctHashesMatchingGlob(pattern);
+    let count = 0;
+    while (!hashes.next().done) count++;
+    return count;
+  }
+
+  /**
    * Finds a row with the given normalized (lowercased) path, other than
    * `excludePath` itself -- used for case-insensitive collision detection
    * against the candidate state.db being folded into a commit. Uses the

@@ -200,6 +200,42 @@ describe("EntriesRepository (state.db)", () => {
       expect(hashes).toEqual(["h1", "h2"]);
     });
   });
+
+  describe("countDistinctHashesMatchingGlob", () => {
+    function seedSharedHashVault(): EntriesRepository {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      const objects = new ObjectsRepository(db);
+      objects.upsert({ hash: "h1", s3_key: "objects/h1", size: 1 });
+      objects.upsert({ hash: "h2", s3_key: "objects/h2", size: 1 });
+      const repo = new EntriesRepository(db);
+      repo.upsert({ path: "photos/a.jpg", type: "file", hash: "h1", state_version: "v0" });
+      repo.upsert({ path: "archive/a.jpg", type: "file", hash: "h1", state_version: "v0" });
+      repo.upsert({ path: "photos/b.jpg", type: "file", hash: "h2", state_version: "v0" });
+      return repo;
+    }
+
+    it("agrees exactly with what iterateDistinctHashesMatchingGlob yields", () => {
+      const repo = seedSharedHashVault();
+      for (const pattern of ["photos/*", "archive/*", "**/*", "nothing/*"]) {
+        expect(repo.countDistinctHashesMatchingGlob(pattern)).toBe(
+          [...repo.iterateDistinctHashesMatchingGlob(pattern)].length,
+        );
+      }
+    });
+
+    it("counts a hash shared by several paths once, matching the dedup the iterator does", () => {
+      const repo = seedSharedHashVault();
+      // h1 is referenced by two paths, only one of which matches.
+      expect(repo.countDistinctHashesMatchingGlob("photos/*")).toBe(2);
+      expect(repo.countDistinctHashesMatchingGlob("archive/*")).toBe(1);
+    });
+
+    it("is zero when nothing matches, rather than falling back to everything", () => {
+      const repo = seedSharedHashVault();
+      expect(repo.countDistinctHashesMatchingGlob("no/such/dir/*")).toBe(0);
+    });
+  });
 });
 
 describe("CacheEntriesRepository (cache.db)", () => {
