@@ -1,7 +1,7 @@
 # `sync1 thumbnail`
 
-Generates and manages low-resolution thumbnails (images) and mosaics (videos) according to
-[`thumbnail_policy`](thumbnail_policy.md) rules, so a user can browse a vault's actual content without
+Generates and manages low-resolution thumbnails (images), mosaics, and animated GIFs (videos) according
+to [`thumbnail_policy`](thumbnail_policy.md) rules, so a user can browse a vault's actual content without
 materializing full-size originals. See [thumbnails.md](../architecture/thumbnails.md) for the full design
 — naming convention, resolution rules, the stubbed-original limitation, and the external tools used.
 
@@ -54,7 +54,10 @@ documented consequence of scoping by directory rather than a bug; see
   "stubbed_original": 1,
   "stubbed_preserved": 3,
   "stale_stub_previews": [
-    { "path": "clip.mp4", "thumbnail_path": "_thumbnail/clip.mp4.p1-tr4-tc4-ts90-q80.a1b2c3.jpg" }
+    {
+      "path": "clip.mp4",
+      "thumbnail_path": "_thumbnail/clip.mp4.p1-video_mosaic-tr4-tc4-ts90-q80.a1b2c3.jpg"
+    }
   ],
   "errors": 0
 }
@@ -91,7 +94,8 @@ all).
 
 ```bash
 sync1 thumbnail_policy create "**/*.jpg" generate --root ~/Pictures \
-  --mime-types image/jpeg --media-type image \
+  --name jpg_thumb --mime-types image/jpeg --media-type image \
+  --resizing-strategy fit_to_box \
   --image-width 320 --image-height 240 --jpeg-quality 80 --json
 
 sync1 update_cache --root ~/Pictures --json

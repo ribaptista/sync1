@@ -22,7 +22,7 @@ Windows.
 | [`status`](cli/status.md)                     | Read-only report: actual S3 storage class vs. what storage_policy implies.                     |
 | [`converge`](cli/converge.md)                 | Apply storage_policy: move objects' actual S3 storage class to match it.                       |
 | [`thumbnail_policy`](cli/thumbnail_policy.md) | Manage global thumbnail-generation policies -- glob + mime type mapped to skip/generate.       |
-| [`thumbnail`](cli/thumbnail.md)               | Generate/report/clean up thumbnails and video mosaics per thumbnail_policy.                    |
+| [`thumbnail`](cli/thumbnail.md)               | Generate/report/clean up thumbnails, video mosaics, and animated GIFs per thumbnail_policy.    |
 
 ## Glob syntax
 

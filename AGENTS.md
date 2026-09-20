@@ -14,6 +14,18 @@ following pass, in this order:
 
 `npm run verify` runs all five in order in one command.
 
+`npm run test:e2e` is real: it starts LocalStack, spawns the CLI as a real child process per assertion,
+and shells out to `ffmpeg`/`identify`/`ffprobe` for the thumbnail suites. Expect roughly 3 minutes for the
+full suite (45 files, 140+ tests) under normal file-level parallelism — this is contention-bound, not
+hung, and there is deliberately no per-test timeout in the e2e project (`vitest.workspace.ts`) to enforce
+one: a wall-clock ceiling sized like a duration budget fired on ordinary load rather than on genuine
+hangs, producing false failures with zero true ones. The unit project keeps vitest's default timeout,
+since unit durations are tight and predictable (400+ tests in ~3s) and a hung promise there should fail
+fast — the asymmetry is deliberate, not an oversight. See the comment block above `testTimeout: 0` in
+`vitest.workspace.ts` for the full rationale and the specific hangs that stay bounded another way
+(`waitForHealth`'s own deadline, `lock.test.ts`'s polling bail-outs, `runCli` reporting a killed or
+unspawnable child instead of disguising it as exit 1).
+
 This is enforced locally by a `husky` pre-commit hook (`lint-staged`: `eslint --fix` + `prettier --write`
 on staged files), but pre-commit only covers staged-file lint/format — it does **not** run the test
 suites. Running the full definition-of-done list above before considering any task finished is a manual
