@@ -158,7 +158,11 @@ async function runSanityCheck(
     const entriesRepo = new EntriesRepository(db);
     const objectsRepo = new ObjectsRepository(db);
     const ignorePoliciesRepo = new IgnorePoliciesRepository(db);
-    progress.setOverallTotals({ files: Math.max(entriesRepo.count(), 1) });
+    // No `entriesRepo.count()` pre-seed any more: it counted tracked rows
+    // only -- never the untracked filesystem paths the merge-join also
+    // walks -- and said nothing at all about bytes, which is what actually
+    // drives the bar and the ETA. performSanityCheck enumerates both for
+    // real now, concurrently with the merge-join itself.
 
     const objectExists = async (s3Key: string): Promise<boolean> => {
       const head = await headObject(client, remoteConfig.bucket, remoteKey(location, s3Key));

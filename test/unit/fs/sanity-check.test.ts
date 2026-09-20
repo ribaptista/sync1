@@ -45,7 +45,11 @@ const alwaysExists: ObjectExistsChecker = (s3Key) => Promise.resolve(existingS3K
 function run(
   objectExists: ObjectExistsChecker,
   filterGlob?: string,
-  options: { hashRunner?: HashRunner; onProgress?: OnProgress } = {},
+  options: {
+    hashRunner?: HashRunner;
+    onProgress?: OnProgress;
+    maxInFlightHashes?: number;
+  } = {},
 ): Promise<SanityCheckResult> {
   return performSanityCheck(
     root,
@@ -55,7 +59,7 @@ function run(
     objectExists,
     silentLogger,
     options.hashRunner ?? defaultHashRunner,
-    4,
+    options.maxInFlightHashes ?? 4,
     new PQueue({ concurrency: 4 }),
     8,
     filterGlob,
@@ -435,5 +439,77 @@ describe("performSanityCheck: byte progress", () => {
     await run(alwaysExists, undefined, { onProgress: (u) => updates.push({ ...u }) });
 
     expect(updates.every((u) => u.bytesDone === 0 && u.bytesTotal === 0)).toBe(true);
+  });
+
+  it("knows the whole byte total while the hash pool is still blocking the merge-join", async () => {
+    // The regression the enumeration pass exists to prevent. Three tracked
+    // files, a hash pool of one, and a runner that never resolves until
+    // the gate opens: the merge-join dispatches the first file and then
+    // blocks on the pool. Discovery-driven totals could only ever have
+    // seen ONE file's bytes by now.
+    for (const [name, content] of [
+      ["a.txt", "a".repeat(100)],
+      ["b.txt", "b".repeat(200)],
+      ["c.txt", "c".repeat(400)],
+    ] as const) {
+      const hash = hashBufferHex(Buffer.from(content));
+      touch(name, content);
+      seedObject(hash, `objects/${name}`, content.length);
+      seedEntry(name, hash);
+    }
+
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => (openGate = resolve));
+    const hashRunner: HashRunner = {
+      run: async (absolutePath) => {
+        await gate;
+        return hashFile(absolutePath);
+      },
+    };
+
+    const updates: { bytesDone: number; bytesTotal: number; filesTotal: number }[] = [];
+    const resultPromise = run(alwaysExists, undefined, {
+      hashRunner,
+      maxInFlightHashes: 1,
+      onProgress: (u) => updates.push({ ...u }),
+    });
+
+    await vi.waitFor(() => {
+      expect(updates.some((u) => u.bytesTotal === 700)).toBe(true);
+    });
+    // Nothing has finished hashing: the total came from the enumeration
+    // pass running ahead of the blocked merge-join, not from dispatch,
+    // which by now has only ever seen a.txt's 100 bytes.
+    expect(updates.every((u) => u.bytesDone === 0)).toBe(true);
+
+    openGate();
+    const result = await resultPromise;
+    expect(result.hashMismatch).toEqual([]);
+    expect(result.missingInS3).toEqual([]);
+
+    const last = updates.at(-1)!;
+    expect(last.bytesDone).toBe(700);
+    expect(last.bytesTotal).toBe(700);
+  });
+
+  it("counts only the --filter's scope, not the whole tree it still has to walk", async () => {
+    // The merge-join always walks everything (it can't tell "filtered out"
+    // from "genuinely missing" otherwise), but only in-scope paths are
+    // ever hashed -- so only those may show up in the byte total.
+    for (const [name, content] of [
+      ["keep/a.txt", "a".repeat(100)],
+      ["other/b.txt", "b".repeat(200)],
+    ] as const) {
+      const hash = hashBufferHex(Buffer.from(content));
+      touch(name, content);
+      seedObject(hash, `objects/${name}`, content.length);
+      seedEntry(name, hash);
+    }
+
+    const updates: { bytesDone: number; bytesTotal: number }[] = [];
+    await run(alwaysExists, "keep/**", { onProgress: (u) => updates.push({ ...u }) });
+
+    expect(updates.every((u) => u.bytesTotal <= 100)).toBe(true);
+    expect(updates.at(-1)).toMatchObject({ bytesDone: 100, bytesTotal: 100 });
   });
 });

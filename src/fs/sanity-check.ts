@@ -10,6 +10,8 @@ import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policie
 import { BoundedTaskTracker, waitForRoom } from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
 import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
+import { enumerateSanityCheckWork } from "./sanity-check-enumerate.js";
+import type { EnumerationControl } from "./update-cache-enumerate.js";
 
 export interface HashMismatch {
   path: string;
@@ -132,74 +134,107 @@ export async function performSanityCheck(
   // file that needed hashing.
   const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
 
-  const fsIter = walk(root);
-  const entryIter = entriesRepo.iterateAllSortedByPath();
+  // Started, deliberately not awaited: it merge-joins the same two
+  // sequences this loop is about to, concurrently, so the denominator is
+  // known within a walk rather than only once the last hash lands. See
+  // sanity-check-enumerate.ts.
+  const enumerationControl: EnumerationControl = { stop: false };
+  const enumeration = enumerateSanityCheckWork(
+    root,
+    entriesRepo,
+    filterGlob,
+    progress,
+    logger,
+    enumerationControl,
+  );
 
-  let fsNext = await fsIter.next();
-  let entryNext = entryIter.next();
-
-  while (!fsNext.done || !entryNext.done) {
-    const fsEntry = fsNext.done ? null : fsNext.value;
-    const entry = entryNext.done ? null : entryNext.value;
-
-    progress.rowDiscovered();
-
-    if (fsEntry !== null && (entry === null || fsEntry.path < entry.path)) {
-      if (inScope(fsEntry.path)) {
-        const ignoreMatch = matchesAnyGlob(fsEntry.path, ignoreGlobs);
-        if (ignoreMatch.matched) {
-          result.ignoredCount++;
-        } else {
-          result.untracked.push(fsEntry.path);
-        }
-      }
-      // Synchronous either way -- an untracked/ignored path (or one
-      // filtered out by --filter) needs no further work.
-      progress.rowResolved();
-      fsNext = await fsIter.next();
-    } else if (entry !== null && (fsEntry === null || entry.path < fsEntry.path)) {
-      if (inScope(entry.path)) {
-        result.missingLocally.push(entry.path);
-        logger.debug({ path: entry.path }, "sanity_check: tracked but missing locally");
-      }
-      progress.rowResolved();
-      entryNext = entryIter.next();
-    } else if (fsEntry !== null && entry !== null) {
-      if (inScope(entry.path)) {
-        await dispatchTrackedEntryCheck(
-          fsEntry,
-          entry,
-          root,
-          objectsRepo,
-          objectExists,
-          logger,
-          result,
-          hashRunner,
-          hashJobs,
-          s3Pool,
-          s3QueueLimit,
-          progress,
-        );
-      } else {
-        // Matched on both sides but out of --filter's scope -- still
-        // discovered, still resolved, just never checked.
-        progress.rowResolved();
-      }
-      fsNext = await fsIter.next();
-      entryNext = entryIter.next();
-    }
+  try {
+    return await runMergeJoin();
+  } finally {
+    // The real pass is done (or has thrown), so whatever the counting pass
+    // still has left to count is now worthless -- cut it short, join it so
+    // it can't publish into a settled tracker, then settle on what
+    // actually happened.
+    enumerationControl.stop = true;
+    await enumeration;
+    progress.settle();
   }
 
-  // Draining order matters: a hash job's own completion is what enqueues
-  // its follow-on S3 check, so every such enqueue has happened by the time
-  // hashJobs.onIdle() resolves -- only then is it safe to drain s3Pool too.
-  await hashJobs.onIdle();
-  await s3Pool.onIdle();
+  // The whole body of this function, unchanged, just moved behind a name
+  // so the enumeration above can be joined and settled in a `finally`
+  // without re-indenting or splitting up the merge-join itself. Hoisted,
+  // so it's declared after the call that uses it and reads in the order it
+  // runs.
+  async function runMergeJoin(): Promise<SanityCheckResult> {
+    const fsIter = walk(root);
+    const entryIter = entriesRepo.iterateAllSortedByPath();
 
-  result.hashMismatch.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  result.missingInS3.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    let fsNext = await fsIter.next();
+    let entryNext = entryIter.next();
 
-  return result;
+    while (!fsNext.done || !entryNext.done) {
+      const fsEntry = fsNext.done ? null : fsNext.value;
+      const entry = entryNext.done ? null : entryNext.value;
+
+      progress.rowDiscovered();
+
+      if (fsEntry !== null && (entry === null || fsEntry.path < entry.path)) {
+        if (inScope(fsEntry.path)) {
+          const ignoreMatch = matchesAnyGlob(fsEntry.path, ignoreGlobs);
+          if (ignoreMatch.matched) {
+            result.ignoredCount++;
+          } else {
+            result.untracked.push(fsEntry.path);
+          }
+        }
+        // Synchronous either way -- an untracked/ignored path (or one
+        // filtered out by --filter) needs no further work.
+        progress.rowResolved();
+        fsNext = await fsIter.next();
+      } else if (entry !== null && (fsEntry === null || entry.path < fsEntry.path)) {
+        if (inScope(entry.path)) {
+          result.missingLocally.push(entry.path);
+          logger.debug({ path: entry.path }, "sanity_check: tracked but missing locally");
+        }
+        progress.rowResolved();
+        entryNext = entryIter.next();
+      } else if (fsEntry !== null && entry !== null) {
+        if (inScope(entry.path)) {
+          await dispatchTrackedEntryCheck(
+            fsEntry,
+            entry,
+            root,
+            objectsRepo,
+            objectExists,
+            logger,
+            result,
+            hashRunner,
+            hashJobs,
+            s3Pool,
+            s3QueueLimit,
+            progress,
+          );
+        } else {
+          // Matched on both sides but out of --filter's scope -- still
+          // discovered, still resolved, just never checked.
+          progress.rowResolved();
+        }
+        fsNext = await fsIter.next();
+        entryNext = entryIter.next();
+      }
+    }
+
+    // Draining order matters: a hash job's own completion is what enqueues
+    // its follow-on S3 check, so every such enqueue has happened by the time
+    // hashJobs.onIdle() resolves -- only then is it safe to drain s3Pool too.
+    await hashJobs.onIdle();
+    await s3Pool.onIdle();
+
+    result.hashMismatch.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    result.missingInS3.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+    return result;
+  }
 }
 
 async function dispatchTrackedEntryCheck(
