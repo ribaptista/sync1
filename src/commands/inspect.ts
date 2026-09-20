@@ -1,9 +1,8 @@
-import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { localCacheDbPath, localStateDbPath } from "../vault/local-dir.js";
-import { openCacheDb } from "../db/connection.js";
+import { openCacheDb, openStateDbReadOnly } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
@@ -83,7 +82,7 @@ async function runInspect(
   const root = resolveRoot(opts.root);
 
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
-  const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const stateDb = openStateDbReadOnly(localStateDbPath(root));
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);

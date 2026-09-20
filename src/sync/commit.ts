@@ -1,10 +1,9 @@
 import fs from "node:fs";
 import { randomBytes } from "node:crypto";
-import Database from "better-sqlite3";
 import { tempSiblingPath } from "../fs/temp-path.js";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
-import { openStateDb, openCacheDb } from "../db/connection.js";
+import { openStateDb, openCacheDb, openStateDbReadOnly } from "../db/connection.js";
 import {
   CacheEntriesRepository,
   type CacheEntryRow,
@@ -229,10 +228,7 @@ export async function performSync(
       // Read-only, scoped to this call: only used to validate stub-declared
       // hashes against known objects. Local state.db is already decrypted
       // on disk, so this needs no password.
-      const stateDbForScan = new Database(localStateDbPath(root), {
-        readonly: true,
-        fileMustExist: true,
-      });
+      const stateDbForScan = openStateDbReadOnly(localStateDbPath(root));
       try {
         updateCacheStats = await performUpdateCache(
           root,

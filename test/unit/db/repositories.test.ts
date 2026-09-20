@@ -505,6 +505,53 @@ describe("CacheEntriesRepository (cache.db)", () => {
     expect(repo.findByNormalizedPath("file.txt", "FILE.txt")).toBeUndefined();
   });
 
+  describe("transaction", () => {
+    function row(path: string): CacheEntryRow {
+      return {
+        path,
+        type: "file",
+        mtime: 1,
+        hash: "h1",
+        size: 1,
+        state: "created",
+        parent_state_version: "v0",
+      };
+    }
+
+    it("commits every write made inside the callback as one transaction", () => {
+      const db = openCacheDb(":memory:");
+      const repo = new CacheEntriesRepository(db);
+      repo.transaction(() => {
+        repo.upsert(row("a.txt"));
+        repo.upsert(row("b.txt"));
+      });
+      expect(repo.get("a.txt")).toBeDefined();
+      expect(repo.get("b.txt")).toBeDefined();
+    });
+
+    it("rolls back every write made inside the callback if it throws", () => {
+      const db = openCacheDb(":memory:");
+      const repo = new CacheEntriesRepository(db);
+      expect(() =>
+        repo.transaction(() => {
+          repo.upsert(row("a.txt"));
+          throw new Error("boom");
+        }),
+      ).toThrow("boom");
+      expect(repo.get("a.txt")).toBeUndefined();
+    });
+
+    it("returns the callback's own return value", () => {
+      const db = openCacheDb(":memory:");
+      const repo = new CacheEntriesRepository(db);
+      const result = repo.transaction(() => {
+        repo.upsert(row("a.txt"));
+        return 42;
+      });
+      expect(result).toBe(42);
+    });
+  });
+
   describe("iterateByGlobSortedByPath", () => {
     function row(path: string): CacheEntryRow {
       return {

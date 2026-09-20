@@ -1,4 +1,3 @@
-import Database from "better-sqlite3";
 import type PQueue from "p-queue";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
@@ -17,6 +16,7 @@ import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { StoragePoliciesRepository } from "../db/repositories/storage-policies-repository.js";
 import { CorruptionError } from "../errors.js";
 import { waitForRoom } from "../concurrency/pools.js";
+import { openStateDbReadOnly } from "../db/connection.js";
 
 // Not exposed as flags -- a reasonable default balance of cost/latency for
 // the temporary restore window.
@@ -77,7 +77,7 @@ export async function convergeStoragePolicies(
    */
   onTotalKnown?: (total: number) => void,
 ): Promise<ConvergeResult> {
-  const db = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const db = openStateDbReadOnly(localStateDbPath(root));
   const counts: ConvergeCounts = {
     alreadyCorrect: 0,
     changedImmediate: 0,

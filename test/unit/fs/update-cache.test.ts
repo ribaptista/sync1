@@ -913,3 +913,25 @@ describe("performUpdateCache: byte progress", () => {
     expect(updates.every((u) => u.bytesDone === 0 && u.bytesTotal === 0)).toBe(true);
   });
 });
+
+describe("performUpdateCache: batched cache.db apply", () => {
+  it("applies every staged row even when the count crosses the internal batch boundary", async () => {
+    // APPLY_BATCH_SIZE (update-cache.ts) and StagingRepository's own
+    // INSERT_BATCH_SIZE are both 500 -- 501 files crosses both, so a bug
+    // in either flush boundary (an off-by-one, or a final partial batch
+    // never flushed) would show up as a row silently missing from cache.db.
+    const fileCount = 501;
+    for (let i = 0; i < fileCount; i++) {
+      touch(`f-${i}.txt`, `content-${i}`);
+    }
+    const repo = makeRepo();
+
+    const stats = await run(repo);
+    expect(stats.created).toBe(fileCount);
+
+    const rows = [...repo.iterateAllSortedByPath()];
+    expect(rows).toHaveLength(fileCount);
+    expect(repo.get("f-0.txt")?.state).toBe("created");
+    expect(repo.get(`f-${fileCount - 1}.txt`)?.state).toBe("created");
+  });
+});

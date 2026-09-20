@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
@@ -14,7 +13,7 @@ import {
 } from "../vault/local-dir.js";
 import { resolveRoot } from "../cli/resolve-root.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
-import { openCacheDb } from "../db/connection.js";
+import { openCacheDb, openStateDbReadOnly } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { materializeGlob, type MaterializeStats } from "../fs/materialize.js";
@@ -103,7 +102,7 @@ async function runMaterialize(
   const location: RemoteLocation = { bucket: remoteConfig.bucket, prefix };
 
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
-  const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const stateDb = openStateDbReadOnly(localStateDbPath(root));
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
   const progress = startBytesProgressSession({ show: showProgress, overallLabel: "materializing" });
 

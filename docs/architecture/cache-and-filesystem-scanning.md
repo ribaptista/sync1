@@ -61,6 +61,44 @@ itself is bounded by how much actually _changed_, not by the size of the tree, a
 keyset-paginated when read back — a scan over a huge, mostly-untouched library still only buffers a
 handful of rows, never the whole `cache.db` table.
 
+## Writes are batched, and pragmas are tuned by durability tier
+
+A first-ever scan of a large, previously-untracked tree stages and applies one row per changed
+path — 54,529 of each on the real vault's initial run — and until this was fixed, each `insert()`/
+`upsert()` was its own implicit transaction: roughly 109,000 separate fsyncing commits, interleaved
+with the sequential reads hashing does. Measured synthetically (20,100 rows, same physical filesystem
+class as the real vault's `.sync1/`): ~80s unbatched vs. ~3s batched, about 27x.
+
+Both `StagingRepository.insert()` and the cache-apply loop in `performUpdateCache` now buffer rows and
+commit them via `db.transaction()` in chunks of 500 — small enough that a crash mid-scan only redoes a
+few hundred rows' worth of work (the staging table is thrown away in a `finally` regardless; a crash
+mid-apply-loop just means the next `update_cache` re-derives the same rows from a merge-join against
+whatever _did_ land in `cache.db`), large enough that ~109,000 commits becomes ~200. Staging batches
+internally, transparently — `insert()` is called from five different branches scattered through the
+merge-join, so every read method (`iterateAll`, `isDeletedInBatch`, `liveCollisionGroups`,
+`liveRowsForNormalizedPath`) flushes the buffer first, making the batching invisible to callers.
+`cache.db`'s apply loop is a single, contained loop instead, so it batches explicitly via a
+`CacheEntriesRepository.transaction()` escape hatch rather than teaching `upsert()` itself to buffer —
+`upsert()`/`delete()` are called from many other, less predictable call sites across the codebase
+(`materialize`, `stubify`, `apply-remote-changes`, …), where an interleaved read expecting to see its
+own just-written row would silently see stale data if buffering were the default there too.
+
+`synchronous` is set per database by how expendable its writes are, not uniformly:
+
+- **`cache.db`**: `NORMAL`. Fully regenerable from the filesystem by a fresh `update_cache` — losing
+  the last few fsyncs to a crash costs a rescan of a handful of paths, not real data.
+- **the staging DB**: `OFF`. Deleted in a `finally` every run, successful or not — there is nothing to
+  protect against a crash losing its fsyncs, since the whole file is thrown away either way.
+- **`state.db`**: `FULL`, explicitly (the pre-existing default, made explicit rather than changed). The
+  one durable database — synced to S3, the source every machine reconstructs from — and its writes are
+  rare (once per commit), so the cost buys real safety at essentially no price.
+
+All three, plus a shared `openStateDbReadOnly`/`openCacheDbReadOnly` opener now used by the ~11 call
+sites that previously opened a raw read-only `better-sqlite3` handle directly (bypassing pragmas
+entirely), also get `temp_store = MEMORY`, a larger `cache_size`, and a `busy_timeout`. Every prepared
+statement in `CacheEntriesRepository`/`StagingRepository` is now cached at construction rather than
+recompiled on every call — better-sqlite3 does not do this on its own.
+
 ## Directories carry no content
 
 A directory's cache row always has `hash = null` and is never rehashed (there's nothing to hash) —

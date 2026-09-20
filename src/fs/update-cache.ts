@@ -243,10 +243,7 @@ export async function performUpdateCache(
       logger.warn({ collisions }, "case-insensitive path collision(s) detected -- not applying");
     }
 
-    for (const row of staging.iterateAll()) {
-      if (excludedPaths.has(row.path)) continue;
-      cacheRepo.upsert(row);
-    }
+    applyStagedRows(staging, cacheRepo, excludedPaths);
   } finally {
     // Joined before settling, not after: an enumeration still publishing
     // estimates after settle() would push the denominator back up off a
@@ -264,6 +261,42 @@ export async function performUpdateCache(
   }
 
   return stats;
+}
+
+/**
+ * How many staged rows accumulate before `applyStagedRows` below commits
+ * them to cache.db as one transaction -- see StagingRepository's own
+ * INSERT_BATCH_SIZE comment for why this table's write pattern is batched
+ * at all. Matches that constant's value, not its meaning: cache.db's
+ * durability is real (a crash here loses committed cache state, unlike the
+ * throwaway staging DB), but `synchronous = NORMAL` already accepts losing
+ * the last few fsyncs to a crash in exchange for not fsyncing per row, so
+ * this batch size is just "how much redone-by-the-next-scan work" is an
+ * acceptable unit, same reasoning as the staging side.
+ */
+const APPLY_BATCH_SIZE = 500;
+
+/** Commits every non-excluded staged row into cache.db, chunked so a first-ever scan isn't one fsync per row. */
+function applyStagedRows(
+  staging: StagingRepository,
+  cacheRepo: CacheEntriesRepository,
+  excludedPaths: Set<string>,
+): void {
+  let batch: CacheEntryRow[] = [];
+  const flush = (): void => {
+    if (batch.length === 0) return;
+    const toApply = batch;
+    batch = [];
+    cacheRepo.transaction(() => {
+      for (const row of toApply) cacheRepo.upsert(row);
+    });
+  };
+  for (const row of staging.iterateAll()) {
+    if (excludedPaths.has(row.path)) continue;
+    batch.push(row);
+    if (batch.length >= APPLY_BATCH_SIZE) flush();
+  }
+  flush();
 }
 
 /**

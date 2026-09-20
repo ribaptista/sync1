@@ -1,10 +1,9 @@
 import fs from "node:fs";
-import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
 import { localCacheDbPath, localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { resolveRoot } from "../cli/resolve-root.js";
-import { openCacheDb } from "../db/connection.js";
+import { openCacheDb, openStateDbReadOnly } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
@@ -101,7 +100,7 @@ async function runUpdateCache(
   // Read-only: only used to validate stub-declared hashes against known
   // objects. Local state.db is already decrypted on disk, so this needs no
   // password.
-  const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const stateDb = openStateDbReadOnly(localStateDbPath(root));
   const objectsRepo = new ObjectsRepository(stateDb);
   const ignorePoliciesRepo = new IgnorePoliciesRepository(stateDb);
 

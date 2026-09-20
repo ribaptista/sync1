@@ -1,7 +1,7 @@
-import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
 import { localCacheDbPath, localStateDbPath } from "../vault/local-dir.js";
+import { openCacheDbReadOnly, openStateDbReadOnly } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ThumbnailPoliciesRepository } from "../db/repositories/thumbnail-policies-repository.js";
 import { scanThumbnails, type ThumbnailRunMode, type ThumbnailScanStats } from "../fs/thumbnail.js";
@@ -43,9 +43,9 @@ async function runThumbnailMode(
 ): Promise<ThumbnailScanStats> {
   const root = resolveRoot(opts.root);
 
-  const cacheDb = new Database(localCacheDbPath(root), { readonly: true, fileMustExist: true });
+  const cacheDb = openCacheDbReadOnly(localCacheDbPath(root));
   const cacheRepo = new CacheEntriesRepository(cacheDb);
-  const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const stateDb = openStateDbReadOnly(localStateDbPath(root));
   const policiesRepo = new ThumbnailPoliciesRepository(stateDb);
 
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));

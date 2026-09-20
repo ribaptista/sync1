@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
+import { openStateDbReadOnly } from "../db/connection.js";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
 import { createS3Client, headObject } from "../s3/client.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
@@ -150,7 +150,7 @@ async function runSanityCheck(
   // cursor, so the connection is free between pages -- objectsRepo and
   // ignorePoliciesRepo can safely be queried mid-loop on the same
   // connection now, unlike when this held a real cursor open throughout.
-  const db = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const db = openStateDbReadOnly(localStateDbPath(root));
   const pools = createConcurrencyPools(resolveConcurrencyOptions(globalOpts));
   const progress = startBytesProgressSession({ show: showProgress, overallLabel: "checking" });
 

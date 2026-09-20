@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import Database from "better-sqlite3";
 import type { Command, OptionValues } from "commander";
 import { createLogger, type Logger } from "../logger.js";
 import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
@@ -15,6 +14,7 @@ import {
 } from "../db/repositories/ignore-policies-repository.js";
 import { mutateStateDb } from "../sync/mutate-state-db.js";
 import { resolveRoot } from "../cli/resolve-root.js";
+import { openStateDbReadOnly } from "../db/connection.js";
 
 interface RootOption extends OptionValues {
   root?: string;
@@ -53,7 +53,7 @@ async function setupMutationContext(opts: RootOption): Promise<MutationContext> 
 
 async function runList(opts: RootOption): Promise<IgnorePolicyRow[]> {
   const root = resolveRoot(opts.root);
-  const stateDb = new Database(localStateDbPath(root), { readonly: true, fileMustExist: true });
+  const stateDb = openStateDbReadOnly(localStateDbPath(root));
   try {
     return new IgnorePoliciesRepository(stateDb).list();
   } finally {
