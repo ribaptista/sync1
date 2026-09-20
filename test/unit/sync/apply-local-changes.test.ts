@@ -554,17 +554,18 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     );
 
     expect(result.appliedCount).toBe(1);
-    // Two updates now, not one: rowDiscovered() and rowResolved() each emit
-    // their own update, even for a delete (fully synchronous, no byte work
-    // at all) -- the last one is what matters, and equals the final tally.
+    // Several updates now, not one: rowDiscovered() and rowResolved() each
+    // emit their own, even for a delete (fully synchronous, no byte work at
+    // all), and settle() emits a last one -- which is what matters, and
+    // equals the final tally.
     expect(updates.at(-1)).toEqual({
       filesDone: 1,
       filesTotal: 1,
       bytesDone: 0,
       bytesTotal: 0,
-      // Provisional: this phase never enumerated ahead of itself, so
-      // nothing ever declared its totals exact.
-      totalsFinal: false,
+      // settle() runs at the end of every phase, estimate or no estimate:
+      // once the pool is idle the totals genuinely are exact.
+      totalsFinal: true,
     });
     // The regression test for the discovered/resolved split itself: every
     // row -- even a synchronous one like this delete -- passes through a
@@ -572,6 +573,96 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     // yet resolved, because rowDiscovered() and rowResolved() are always
     // two separate calls (see progress-types.ts's createProgressTracker).
     expect(updates.some((u) => u.filesTotal > u.filesDone)).toBe(true);
+
+    candidateDb.close();
+  });
+
+  it("publishes the enumerated totals before the first row is consumed", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "new upload content";
+    touch("a.txt", content);
+
+    const dirtyRow = {
+      path: "a.txt",
+      type: "file" as const,
+      mtime: 1,
+      hash: hashBufferHex(Buffer.from(content)),
+      size: content.length,
+      state: "created" as const,
+      parent_state_version: "v0",
+    };
+
+    const updates: ProgressUpdate[] = [];
+    await applyLocalChangesToCandidate(
+      candidateDb,
+      [dirtyRow],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      (u) => updates.push(u),
+      { files: 1, bytes: content.length },
+    );
+
+    // The point of the whole exercise: the very first thing the bar is told
+    // is the real denominator -- not 0, and not a number that grows as rows
+    // are walked.
+    expect(updates[0]).toMatchObject({
+      filesDone: 0,
+      filesTotal: 1,
+      bytesDone: 0,
+      bytesTotal: content.length,
+      totalsFinal: false,
+    });
+    expect(updates.every((u) => u.bytesTotal === content.length)).toBe(true);
+
+    candidateDb.close();
+  });
+
+  it("settles an over-counted estimate back down so the phase lands on 100%", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+
+    // A delete transfers nothing, so an estimate that claimed bytes for it
+    // (as enumerateUploadWork would for a row it can't tell will conflict)
+    // is pure over-count.
+    const dirtyRow = {
+      path: "gone.txt",
+      type: "file" as const,
+      mtime: 1000,
+      hash: null,
+      size: null,
+      state: "deleted" as const,
+      parent_state_version: "v0",
+    };
+
+    const updates: ProgressUpdate[] = [];
+    await applyLocalChangesToCandidate(
+      candidateDb,
+      [dirtyRow],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      (u) => updates.push(u),
+      { files: 1, bytes: 9999 },
+    );
+
+    expect(updates[0]).toMatchObject({ bytesTotal: 9999, totalsFinal: false });
+    expect(updates.at(-1)).toEqual({
+      filesDone: 1,
+      filesTotal: 1,
+      bytesDone: 0,
+      bytesTotal: 0,
+      totalsFinal: true,
+    });
 
     candidateDb.close();
   });

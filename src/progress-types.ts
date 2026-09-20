@@ -70,7 +70,9 @@ export interface FileTracker {
    * contribution never exceeds the `size` given to `startFile`: a source
    * that over-reports would otherwise push `bytesDone` past `bytesTotal`,
    * and `finish()` would then have to *decrease* it to correct course --
-   * breaking the monotonicity `advanceBase` (see commit.ts) depends on.
+   * breaking the monotonicity the bar's rendering depends on (`bytesDone`
+   * is the one counter nothing is ever allowed to walk back; see the
+   * observed-vs-estimated split above).
    * A no-op once `finish()` has been called.
    */
   advance(deltaBytes: number): void;

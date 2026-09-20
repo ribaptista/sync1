@@ -16,15 +16,27 @@ vi.mock("../../../src/logger.js", () => ({
 // startBytesProgressSession's real implementation renders to a real
 // cli-progress MultiBar, which would spam actual ANSI output in a test
 // run -- mocked here so its `.update()`/`.setTotal()` calls can be
-// observed directly instead. Shared across bar instances since every test
-// below creates at most one session (and therefore one bar) at a time.
+// observed directly instead. These two see every bar's calls, in order --
+// use `createdBars` below when a test needs to tell one bar from another.
 const barUpdateMock = vi.fn();
 const barSetTotalMock = vi.fn();
-const multibarCreateMock = vi.fn(() => ({
-  update: barUpdateMock,
-  setTotal: barSetTotalMock,
-  getTotal: vi.fn(() => 1),
-}));
+// Every bar the session creates, in creation order, each with its *own*
+// update/setTotal spies -- needed since `sync` now mints one bar per phase
+// and the point of several of the tests below is that those bars don't
+// share state. The shared barUpdateMock/barSetTotalMock above still see
+// every call, in order, so the single-bar tests that predate this are
+// unaffected.
+const createdBars: Array<{ update: ReturnType<typeof vi.fn>; setTotal: ReturnType<typeof vi.fn> }> =
+  [];
+const multibarCreateMock = vi.fn((..._createArgs: unknown[]) => {
+  const bar = {
+    update: vi.fn((...args: unknown[]) => barUpdateMock(...args)),
+    setTotal: vi.fn((...args: unknown[]) => barSetTotalMock(...args)),
+    getTotal: vi.fn(() => 1),
+  };
+  createdBars.push(bar);
+  return bar;
+});
 const multibarStopMock = vi.fn();
 const multibarRemoveMock = vi.fn();
 
@@ -125,6 +137,7 @@ describe("startBytesProgressSession", () => {
     multibarCreateMock.mockClear();
     multibarStopMock.mockClear();
     multibarRemoveMock.mockClear();
+    createdBars.length = 0;
     // createLoggerForRun's own beforeEach (above) calls vi.restoreAllMocks(),
     // which wipes this mock's .mockImplementation() back to a no-op for the
     // rest of the file -- reinstated here so these tests don't depend on
@@ -272,6 +285,87 @@ describe("startBytesProgressSession", () => {
     expect(multibarStopMock).toHaveBeenCalledTimes(1);
   });
 
+  it("startPhase mints one labelled bar per phase, and the session's own bar stays unborn", () => {
+    const session = startBytesProgressSession({ show: true, overallLabel: "syncing" });
+    // Nothing yet: a session that will only ever be driven through phases
+    // (sync) must not also render an idle "syncing" bar nothing advances.
+    expect(multibarCreateMock).not.toHaveBeenCalled();
+
+    session.startPhase("scanning");
+    session.startPhase("uploading");
+    session.startPhase("downloading");
+
+    expect(multibarCreateMock).toHaveBeenCalledTimes(3);
+    const labels = multibarCreateMock.mock.calls.map(
+      (call) => (call[3] as { format: string }).format.split(" ")[0],
+    );
+    expect(labels).toEqual(["scanning", "uploading", "downloading"]);
+  });
+
+  it("the session's own bar is created on first direct use, after any phase bars", () => {
+    const session = startBytesProgressSession({ show: true, overallLabel: "scanning" });
+    session.setOverallTotals({ bytes: 100 });
+    expect(multibarCreateMock).toHaveBeenCalledTimes(1);
+    // Repeated use reuses it rather than minting another.
+    session.setOverallProgress({ bytes: 10 });
+    expect(multibarCreateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("phase bars keep entirely separate totals -- no offset arithmetic between them", () => {
+    const session = startBytesProgressSession({ show: true, overallLabel: "syncing" });
+    const scanning = session.startPhase("scanning");
+    const uploading = session.startPhase("uploading");
+
+    // Activity-bearing so each lands immediately rather than waiting out
+    // its bar's own flush throttle -- the subject here is the numbers, not
+    // the throttle (which has its own tests above).
+    const activity = { verb: "working", path: "f" };
+    scanning.setOverallTotals({ bytes: 1000, files: 4, final: true });
+    scanning.setOverallProgress({ bytes: 1000, files: 4, activity });
+    uploading.setOverallTotals({ bytes: 30, files: 1, final: true });
+    uploading.setOverallProgress({ bytes: 10, files: 1, activity });
+
+    const [scanBar, uploadBar] = createdBars;
+    // The upload bar counts its own 30 bytes from zero -- it knows nothing
+    // about the 1000 the scan phase just finished.
+    expect(uploadBar!.setTotal).toHaveBeenLastCalledWith(30);
+    expect(uploadBar!.update).toHaveBeenLastCalledWith(
+      10,
+      expect.objectContaining({ filesDone: "1", filesTotal: "1", sizeTotal: prettyBytes(30) }),
+    );
+    // ...and the finished phase's bar keeps showing its own completed
+    // tally, untouched by the phase that came after it.
+    expect(scanBar!.setTotal).toHaveBeenLastCalledWith(1000);
+    expect(scanBar!.update).toHaveBeenLastCalledWith(
+      1000,
+      expect.objectContaining({ filesDone: "4", filesTotal: "4", sizeTotal: prettyBytes(1000) }),
+    );
+  });
+
+  it("stop() flushes every phase bar, not just the last one", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const session = startBytesProgressSession({ show: true, overallLabel: "syncing" });
+      const scanning = session.startPhase("scanning");
+      const uploading = session.startPhase("uploading");
+      // Both bars flushed once on construction; these land inside that
+      // window and are throttled away on both.
+      scanning.setOverallProgress({ bytes: 7 });
+      uploading.setOverallProgress({ bytes: 9 });
+
+      const [scanBar, uploadBar] = createdBars;
+      expect(scanBar!.update).toHaveBeenCalledTimes(1);
+      expect(uploadBar!.update).toHaveBeenCalledTimes(1);
+
+      session.stop();
+
+      expect(scanBar!.update).toHaveBeenLastCalledWith(7, expect.anything());
+      expect(uploadBar!.update).toHaveBeenLastCalledWith(9, expect.anything());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("renders whatever caller-supplied verb it's given, with no vocabulary of its own", () => {
     // "frobnicating" isn't a real verb anywhere in this codebase -- the
     // point is that the module doesn't care, it renders exactly what it's
@@ -311,16 +405,27 @@ describe("startBytesProgressSession", () => {
     }
   });
 
-  it("flushes once immediately on construction, before any real progress exists", () => {
-    startBytesProgressSession({ show: true, overallLabel: "x" });
-    expect(barUpdateMock).toHaveBeenCalledTimes(1);
+  it("flushes once immediately when a bar is born, before any real progress exists", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+      session.setOverallTotals({ bytes: 100 });
+      // One call, not two: the bar's birth flush renders it straight away
+      // (carrying zeroes -- nothing has happened yet), and the update that
+      // triggered that birth lands inside its own throttle window.
+      expect(barUpdateMock).toHaveBeenCalledTimes(1);
+      expect(barUpdateMock).toHaveBeenLastCalledWith(0, expect.anything());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("throttles a burst of numeric-only updates, flushing again only once the interval elapses", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      barUpdateMock.mockClear(); // clear the constructor's own immediate flush
+      session.setOverallProgress({ bytes: 0 }); // births the bar
+      barUpdateMock.mockClear(); // clear the bar's own immediate birth flush
 
       session.setOverallProgress({ bytes: 10 });
       session.setOverallProgress({ bytes: 20 });
@@ -346,6 +451,7 @@ describe("startBytesProgressSession", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+      session.setOverallProgress({ bytes: 0 }); // births the bar
       barUpdateMock.mockClear();
 
       session.setOverallProgress({ bytes: 10 }); // no activity, no clock advance -- throttled away

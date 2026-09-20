@@ -109,6 +109,15 @@ export async function applyLocalChangesToCandidate(
   streamPool: PQueue,
   streamQueueLimit: number,
   onProgress?: OnProgress,
+  /**
+   * Offline-enumerated totals for this phase, published before the first
+   * row is consumed so the bar has a real denominator from t=0 instead of
+   * one that climbs as the dirty set is walked. Purely advisory: this
+   * function still decides everything for itself, and `settle()` below
+   * lands the bar on exactly 100% whether the estimate over- or
+   * under-counted. See `enumerateUploadWork` in commit.ts.
+   */
+  estimatedTotals?: { files: number; bytes: number },
 ): Promise<ApplyLocalChangesResult> {
   const objectsRepo = new ObjectsRepository(candidateDb);
   const entriesRepo = new EntriesRepository(candidateDb);
@@ -138,6 +147,7 @@ export async function applyLocalChangesToCandidate(
   // attach, which rides along on the same in-flight upload rather than
   // getting one of its own (see the Pass 2 dispatch below).
   const progress = createProgressTracker(onProgress, ["uploading", "uploaded"]);
+  if (estimatedTotals) progress.setEstimatedTotals(estimatedTotals);
 
   const iter = dirtyRows[Symbol.iterator]();
   let next = iter.next();
@@ -358,6 +368,11 @@ export async function applyLocalChangesToCandidate(
   }
 
   await streamPool.onIdle();
+  // Drops the estimate back onto what actually happened: a row that turned
+  // out to conflict was counted as bytes up front (conflict detection needs
+  // the candidate's entries table, which the offline count deliberately
+  // doesn't consult), so without this the bar would stop short of 100%.
+  progress.settle();
 
   return { uploadedObjects, dedupedObjects, handledPaths, appliedCount, conflicts };
 }

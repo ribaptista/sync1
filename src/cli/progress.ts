@@ -140,19 +140,42 @@ export function startProgressSession(opts: {
  * free by building a fresh `ProgressTracker` per phase rather than by this
  * session clearing anything itself.
  */
-export interface BytesProgressSession {
+export interface BytesProgressTarget {
   setOverallTotals(totals: { files?: number; bytes?: number; final?: boolean }): void;
   setOverallProgress(current: {
     files?: number;
     bytes?: number;
     activity?: { verb: string; path: string } | undefined;
   }): void;
+}
+
+export interface BytesProgressSession extends BytesProgressTarget {
+  /**
+   * Mints an additional bar, labelled `label`, in this session's display.
+   *
+   * For a run built from sequential phases whose work isn't commensurable
+   * -- `sync` hashes locally, then uploads, then downloads -- one bar per
+   * phase is both simpler and more honest than summing them. A combined
+   * denominator can't be known anyway (each phase operates on a set the
+   * previous one produces), and a single ETA over a mixture of local
+   * hashing and network transfer is partly fiction; three ETAs over
+   * homogeneous work are each real.
+   *
+   * Call it when the phase actually begins, not up front: bars are
+   * rendered from the moment they exist, and a bar sitting at 0 for a
+   * phase whose inputs don't exist yet is just a lie with a progress
+   * indicator attached.
+   */
+  startPhase(label: string): BytesProgressTarget;
   stop(): void;
 }
 
 class NullBytesProgressSession implements BytesProgressSession {
   setOverallTotals(): void {}
   setOverallProgress(): void {}
+  startPhase(): BytesProgressTarget {
+    return this;
+  }
   stop(): void {}
 }
 
@@ -196,8 +219,14 @@ export function fitPath(path: string, columns: number | undefined, verb: string)
   return TRUNCATION_MARK + path.slice(path.length - (budget - TRUNCATION_MARK.length));
 }
 
-class MultiBarBytesProgressSession implements BytesProgressSession {
-  private readonly multibar: MultiBar;
+/**
+ * One byte-progress bar's own state and rendering. Split out from the
+ * session below so a session can host several: a single-phase command
+ * has exactly one, `sync` has one per phase. Every counter here is
+ * per-bar -- including the flush throttle, since two bars competing for
+ * one shared throttle would each suppress the other's updates.
+ */
+class MultiBarByteBar implements BytesProgressTarget {
   private readonly overall: SingleBar;
   private filesTotal = 0;
   private filesDone = 0;
@@ -224,22 +253,18 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
   // at Date.now() === 0" (a frozen/fake clock in a test, say).
   private lastFlushedAt: number | null = null;
 
-  constructor(overallLabel: string) {
-    this.multibar = new MultiBar(
-      {
-        clearOnComplete: false,
-        hideCursor: true,
-        // `{etaPrefix}` carries the "~" for the ETA the same way
-        // `{filesTotal}`/`{sizeTotal}` carry their own: cli-progress
-        // computes `{eta_formatted}` internally, so the marker has to sit
-        // beside it rather than inside it.
-        format: `${overallLabel} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- {etaPrefix}ETA {eta_formatted} {activity}`,
-      },
-      Presets.shades_classic,
-    );
+  constructor(multibar: MultiBar, label: string) {
     // Seeded to 1 (never 0) to avoid a divide-by-zero before the first real
     // total arrives -- same trick the plain item-count bar above uses.
-    this.overall = this.multibar.create(1, 0);
+    // The format is per-bar rather than on the MultiBar, since each bar
+    // carries its own label.
+    this.overall = multibar.create(1, 0, undefined, {
+      // `{etaPrefix}` carries the "~" for the ETA the same way
+      // `{filesTotal}`/`{sizeTotal}` carry their own: cli-progress
+      // computes `{eta_formatted}` internally, so the marker has to sit
+      // beside it rather than inside it.
+      format: `${label} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- {etaPrefix}ETA {eta_formatted} {activity}`,
+    });
     this.flush(true);
   }
 
@@ -276,7 +301,7 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
     if (
       !force &&
       this.lastFlushedAt !== null &&
-      now - this.lastFlushedAt < MultiBarBytesProgressSession.FLUSH_INTERVAL_MS
+      now - this.lastFlushedAt < MultiBarByteBar.FLUSH_INTERVAL_MS
     ) {
       return;
     }
@@ -331,8 +356,57 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
     this.flush(isNewActivity);
   }
 
-  stop(): void {
+  /**
+   * Lands any update the throttle was still holding. `MultiBar.stop()`
+   * re-renders each bar's *current* value one last time (with
+   * `clearOnComplete: false`), so without this a run could end on a stale
+   * mid-throttle snapshot.
+   */
+  flushFinal(): void {
     this.flush(true);
+  }
+}
+
+class MultiBarBytesProgressSession implements BytesProgressSession {
+  private readonly multibar: MultiBar;
+  private readonly bars: MultiBarByteBar[] = [];
+  // Created on first use rather than in the constructor: a run that only
+  // ever uses startPhase() (sync) must not also render an empty
+  // session-level bar that nothing will ever advance.
+  private ownBar: MultiBarByteBar | undefined;
+
+  constructor(private readonly overallLabel: string) {
+    this.multibar = new MultiBar(
+      { clearOnComplete: false, hideCursor: true },
+      Presets.shades_classic,
+    );
+  }
+
+  private own(): MultiBarByteBar {
+    this.ownBar ??= this.startPhase(this.overallLabel) as MultiBarByteBar;
+    return this.ownBar;
+  }
+
+  setOverallTotals(totals: { files?: number; bytes?: number; final?: boolean }): void {
+    this.own().setOverallTotals(totals);
+  }
+
+  setOverallProgress(current: {
+    files?: number;
+    bytes?: number;
+    activity?: { verb: string; path: string } | undefined;
+  }): void {
+    this.own().setOverallProgress(current);
+  }
+
+  startPhase(label: string): BytesProgressTarget {
+    const bar = new MultiBarByteBar(this.multibar, label);
+    this.bars.push(bar);
+    return bar;
+  }
+
+  stop(): void {
+    for (const bar of this.bars) bar.flushFinal();
     this.multibar.stop();
   }
 }
@@ -354,7 +428,7 @@ export function startBytesProgressSession(opts: {
  * materialize, stubify, sanity_check) into a single call each command
  * makes when it builds its tracker.
  */
-export function reporterFor(session: BytesProgressSession): OnProgress {
+export function reporterFor(session: BytesProgressTarget): OnProgress {
   return (update: ProgressUpdate) => {
     session.setOverallTotals({
       files: update.filesTotal,

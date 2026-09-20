@@ -28,7 +28,7 @@ import {
 import { localCacheDbPath, localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
 import { renameWithRetry, copyFileWithRetry } from "../fs/safe-fs.js";
-import type { OnProgress, ProgressUpdate } from "../progress-types.js";
+import type { OnProgress } from "../progress-types.js";
 
 export interface SyncConflict {
   path: string;
@@ -82,6 +82,39 @@ function* tapPaths(rows: Iterable<CacheEntryRow>, sink: Set<string>): Generator<
   }
 }
 
+/**
+ * Counts the upload phase's work offline, before a single byte moves:
+ * every dirty row is one file to resolve, and a row's bytes count only if
+ * its content isn't already an object the candidate knows (a dedup attach)
+ * and isn't already claimed by an earlier row in the same batch (a
+ * same-batch dedup, which rides along on that row's upload).
+ *
+ * Deliberately does *not* consult the candidate's `entries` table to
+ * predict conflicts or no-ops. That would mean re-deriving
+ * decideLocalChange's whole ruleset here, and getting it subtly wrong is
+ * worse than over-counting: a conflicting row's bytes are simply never
+ * uploaded, and `settle()` at the end of the phase brings the bar back
+ * down to what really happened.
+ */
+function enumerateUploadWork(
+  dirtyRows: Iterable<CacheEntryRow>,
+  objectsRepo: ObjectsRepository,
+): { files: number; bytes: number } {
+  let files = 0;
+  let bytes = 0;
+  const claimedHashes = new Set<string>();
+  for (const row of dirtyRows) {
+    files++;
+    // Deletes, directories, and rows with no content hash resolve without
+    // transferring anything -- counted as files, worth zero bytes.
+    if (row.state === "deleted" || row.type !== "file" || row.hash === null) continue;
+    if (objectsRepo.has(row.hash) || claimedHashes.has(row.hash)) continue;
+    claimedHashes.add(row.hash);
+    bytes += row.size ?? 0;
+  }
+  return { files, bytes };
+}
+
 /** Yields only the rows from `rows` whose path was handled by this run. */
 function* filterByPath(
   rows: Iterable<CacheEntryRow>,
@@ -110,63 +143,33 @@ export async function performSync(
   s3: { client: S3Client; bucket: string; location: RemoteLocation },
   logger: Logger,
   pools: ConcurrencyPools,
-  onProgress?: OnProgress,
+  /**
+   * Asked for one progress sink per phase, as each phase begins -- not a
+   * single sink for the whole run. See the note below on why sync's three
+   * phases get three bars rather than one stitched total.
+   */
+  onPhase?: (label: string) => OnProgress | undefined,
 ): Promise<SyncResult> {
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
 
   // performSync runs three phases fully sequentially (performUpdateCache,
   // then applyLocalChangesToCandidate, then applyRemoteChangesToLocal),
-  // each reporting its own progress from zero -- but sync's caller wants
-  // one running total across all three, not a counter that resets twice
-  // mid-run. `base` accumulates the final tally of every phase already
-  // finished; `phaseProgress` (handed to whichever phase is currently
-  // running) adds `base` on top of that phase's own numbers before
-  // forwarding outward. `advanceBase()` folds the just-finished phase's
-  // last reported update into `base` and resets the tracker for the next
-  // phase to start from zero again.
-  const ZERO_PHASE: ProgressUpdate = {
-    filesDone: 0,
-    filesTotal: 0,
-    bytesDone: 0,
-    bytesTotal: 0,
-    // Never true for the stitched total, however confidently an individual
-    // phase settles its own: phases 2 and 3 operate on sets that don't
-    // exist until phase 1 has finished, so the combined denominator is
-    // genuinely unknowable while the run is in progress and must keep
-    // rendering as approximate.
-    totalsFinal: false,
-  };
-  let base: ProgressUpdate = ZERO_PHASE;
-  let lastPhaseUpdate: ProgressUpdate = base;
-  const phaseProgress: OnProgress = (u) => {
-    lastPhaseUpdate = u;
-    onProgress?.({
-      filesDone: base.filesDone + u.filesDone,
-      filesTotal: base.filesTotal + u.filesTotal,
-      bytesDone: base.bytesDone + u.bytesDone,
-      bytesTotal: base.bytesTotal + u.bytesTotal,
-      totalsFinal: false,
-      // Passed through verbatim, never summed with anything from `base` --
-      // it's a per-file label, not a numeric tally. Also never carried
-      // across advanceBase() below: each phase builds its own tracker with
-      // its own verb pair, so a stale "uploaded ..." label from the phase
-      // that just finished naturally stops arriving the moment the next
-      // phase's tracker starts emitting its own (typically "downloading
-      // ...") activity -- nothing here needs to reset it explicitly.
-      activity: u.activity,
-    });
-  };
-  const advanceBase = (): void => {
-    base = {
-      filesDone: base.filesDone + lastPhaseUpdate.filesDone,
-      filesTotal: base.filesTotal + lastPhaseUpdate.filesTotal,
-      bytesDone: base.bytesDone + lastPhaseUpdate.bytesDone,
-      bytesTotal: base.bytesTotal + lastPhaseUpdate.bytesTotal,
-      totalsFinal: false,
-    };
-    lastPhaseUpdate = ZERO_PHASE;
-  };
+  // each reporting its own progress from zero. They used to be welded into
+  // a single bar by a `base` offset accumulated across phase boundaries;
+  // they now get one bar each, because a combined denominator was never a
+  // real quantity: phase 2 works on the dirty set phase 1 produces, and
+  // phase 3 diffs against a candidate DB that doesn't exist until the
+  // remote snapshot has been fetched, so no amount of counting could have
+  // known the total up front. Summing them was also apples-to-oranges --
+  // a gigabyte hashed off a local disk and a gigabyte pushed over an
+  // uplink are not the same work -- which made the single combined ETA
+  // partly fiction. Three bars, each with a real denominator and a real
+  // ETA over homogeneous work, are both simpler and more honest.
+  //
+  // Each phase asks for its bar when it actually starts, so a phase whose
+  // inputs don't exist yet never renders an empty bar claiming otherwise.
+  const phaseProgress = (label: string): OnProgress | undefined => onPhase?.(label);
 
   try {
     const cacheRepo = new CacheEntriesRepository(cacheDb);
@@ -197,13 +200,12 @@ export async function performSync(
           logger,
           pools.hashRunner,
           pools.hash.maxThreads,
-          phaseProgress,
+          phaseProgress("scanning"),
         );
       } finally {
         stateDbForScan.close();
       }
     }
-    advanceBase();
 
     const dirtyCount = cacheRepo.countDirty();
 
@@ -269,6 +271,15 @@ export async function performSync(
         // it needs every dirty path (not just handled ones), which isn't
         // known until this loop actually runs.
         const excludePaths = new Set<string>();
+        // A second, independent walk of the same dirty set -- pure SQL, no
+        // filesystem and no network -- so the upload bar opens with a real
+        // denominator instead of one that grows as rows are consumed.
+        // Safe on this shared connection: iterateDirty() is keyset-
+        // paginated, never a paused cursor (see the note above).
+        const uploadTotals = enumerateUploadWork(
+          cacheRepo.iterateDirty(),
+          new ObjectsRepository(candidateDb),
+        );
         localResult = await applyLocalChangesToCandidate(
           candidateDb,
           tapPaths(cacheRepo.iterateDirty(), excludePaths),
@@ -279,9 +290,9 @@ export async function performSync(
           logger,
           pools.stream,
           pools.stream.concurrency * 2,
-          phaseProgress,
+          phaseProgress("uploading"),
+          uploadTotals,
         );
-        advanceBase();
 
         // A version is only worth committing if something *actually*
         // mutated entries/objects -- a sync where every dirty row resolved
@@ -301,9 +312,8 @@ export async function performSync(
           logger,
           pools.stream,
           pools.stream.concurrency * 2,
-          phaseProgress,
+          phaseProgress("downloading"),
         );
-        advanceBase();
       } finally {
         candidateDb.close(); // checkpoints WAL before we read the file back
       }
