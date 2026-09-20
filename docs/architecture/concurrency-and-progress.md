@@ -286,9 +286,9 @@ that waits out the outage — but it shifts weight onto three things:
   fd 3, clear of the bars.
 
 What is _not_ retried matters as much: anything outside the transient classification throws on its
-first occurrence, including `CasConflictError` (which has its own retry loops with their own
-semantics) and `CorruptionError` (a truncated download that hashes wrong must never be mistaken for
-a flaky link). `ECONNREFUSED` is deliberately absent from the transient list while `ENOTFOUND` is on
+first occurrence, including `CasConflictError` (a real answer about the vault's state, not a transport
+failure — see the commit section below) and `CorruptionError` (a truncated download that hashes wrong
+must never be mistaken for a flaky link). `ECONNREFUSED` is deliberately absent from the transient list while `ENOTFOUND` is on
 it — "resolved but nothing listening" is usually a wrong endpoint, while a DNS failure is the classic
 dropped-link symptom.
 
@@ -296,6 +296,32 @@ The retriable unit is always the whole request _including_ building its body: a 
 already errored cannot be replayed, so an upload opens a fresh read stream on each attempt and a
 download re-issues its GET and writes to a fresh temp path. DB writes and progress bookkeeping stay
 outside the retried closure — a retry re-sends bytes, it does not re-run bookkeeping.
+
+### The one non-idempotent write: committing `/current`
+
+Everything a sync uploads before the commit is idempotent — content objects are content-addressed
+(`objects/<hash>`), the snapshot is version-addressed (`states/<stamp>`) — so re-sending either is
+harmless. The CAS write that moves `/current` is not, and retrying it blindly is subtly wrong: if the
+PUT reaches S3 and succeeds but its _response_ is lost, the retry re-sends `If-Match` against an ETag
+we ourselves just replaced, S3 answers 412, and a commit that genuinely landed is reported as another
+machine's conflict.
+
+`commitCurrentPointer` (`src/sync/commit-pointer.ts`) handles it by asking instead of assuming: on
+_any_ failure it reads `/current` back, and if the pointer already holds this run's own version stamp
+then the commit landed, whatever the client saw. Only this run can have written that value —
+`generateVersionStamp()` is an ISO timestamp plus four random bytes.
+
+Leaving it unretried would not have been unsafe, only wasteful, and it is worth being precise about
+why. A spuriously-reported conflict self-heals on the next run: the still-dirty rows re-evaluate
+against a state.db that now holds this machine's own commit, and each resolves as a no-op through the
+leniency rules in `conflict-rules.ts` — the same mechanism documented in
+[conflict-resolution.md](conflict-resolution.md#the-no-op-leniency-rules-are-also-what-makes-crash-recovery-self-heal)
+for a crash at exactly this point. But self-healing costs an entire extra run, and by the commit point
+the expensive part has already been paid for, so it is worth one small GET to avoid.
+
+The read-back runs on every failure, including a genuine conflict on the first attempt where it cannot
+possibly be ours. That spends one GET in a case already headed for a full re-run, and buys a function
+with no attempt-number special-casing to get wrong.
 
 ## Enumeration vs. execution
 

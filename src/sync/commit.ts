@@ -18,8 +18,9 @@ import { applyRemoteChangesToLocal, type IgnoredButSyncedEntry } from "./apply-r
 import { reconcileCacheAfterCommit } from "./reconcile-cache.js";
 import { generateVersionStamp } from "../vault/version-stamp.js";
 import { encryptBuffer, decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
-import { getObject, putObject, putObjectCas, CasConflictError } from "../s3/client.js";
+import { getObject, putObject, CasConflictError } from "../s3/client.js";
 import { withS3Retry, type RetryNotice } from "../s3/retry.js";
+import { commitCurrentPointer } from "./commit-pointer.js";
 import {
   remoteKey,
   stateSnapshotKey,
@@ -407,8 +408,8 @@ export async function performSync(
 
       logger.debug({ versionStamp, ifMatch: current.etag }, "attempting CAS commit of /current");
       try {
-        await putObjectCas(s3.client, s3.bucket, currentKey, Buffer.from(versionStamp, "utf8"), {
-          ifMatch: current.etag,
+        await commitCurrentPointer(s3, currentKey, versionStamp, current.etag, logger, {
+          onRetry: retryLogger(logger, "committing the /current pointer"),
         });
       } catch (err) {
         if (err instanceof CasConflictError) throw new RemoteDivergedError();
