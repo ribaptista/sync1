@@ -159,12 +159,12 @@ Add a photo, then tell sync1 to generate a thumbnail for any JPEG:
 cp ~/Pictures/sunset.jpg ~/backups/photos/sunset.jpg
 SYNC1_PASSWORD='correct horse battery staple' \
   sync1 thumbnail_policy create "*.jpg" generate --root ~/backups/photos \
-  --mime-types image/jpeg --media-type image \
+  --name jpg_thumb --mime-types image/jpeg --media-type image \
   --image-width 320 --image-height 240 --jpeg-quality 80
 ```
 
 ```
-thumbnail policy 1 created (version 20260101T021200000Z-c3d4e5f6): *.jpg -> generate
+thumbnail policy 1 (jpg_thumb) created (version 20260101T021200000Z-c3d4e5f6): *.jpg -> generate
 ```
 
 Sync the new file so its content hash is recorded, then generate thumbnails for everything the policy
@@ -179,11 +179,12 @@ sync1 thumbnail ensure --root ~/backups/photos
 thumbnail ensure: 0 up to date, 1 to generate, 0 to regenerate, 0 to delete, 0 missing cache entry, 0 stubbed original, 0 stubbed preserved, 0 stale stub preview(s), 0 error(s)
 ```
 
-A small `sunset.jpg.p1-iw320-ih240-q80.<hash>.jpg` now sits in `_thumbnail/` next to the original — a
-preview you can browse without materializing (or downloading) the full-size photo. The `p1-iw320-ih240-
-q80` segment encodes the policy's own configured parameters, so editing the policy later (a different
-size or quality) naturally produces a different expected filename and triggers regeneration, even though
-`sunset.jpg` itself never changed.
+A small `sunset.jpg.p1-jpg_thumb-iw320-ih240-q80.<hash>.jpg` now sits in `_thumbnail/` next to the
+original — a preview you can browse without materializing (or downloading) the full-size photo. The
+`p1-jpg_thumb-iw320-ih240-q80` segment encodes the policy's own name and configured parameters, so
+editing the policy later (a different size or quality) naturally produces a different expected filename
+and triggers regeneration, even though `sunset.jpg` itself never changed -- and a second policy matching
+the same file would produce its own, separately-named thumbnail alongside this one, never a conflict.
 
 ### Manage S3 storage classes
 

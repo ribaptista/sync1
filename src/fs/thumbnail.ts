@@ -57,30 +57,48 @@ export function isUnderThumbnailDir(relativePath: string): boolean {
 }
 
 /**
- * Encodes a policy's raw *configured* generation parameters (never a
- * per-file computed/derived size) into a filename segment, so a policy
- * config change naturally produces a different expected filename even
- * when the original's own content hash hasn't changed -- the existing
- * orphan-reconciliation logic already handles that case for free (a
- * mismatched expected filename means "not up to date"), no separate
- * regeneration-detection mechanism needed. Literal abbreviated fields
- * rather than a hash of them: worst case (`p1-tr9999-tc9999-ts65535-
- * q100`, 29 bytes) leaves well over a hundred spare bytes of the 255-byte
- * path-component limit even after the hash and extension, so length was
- * never the binding constraint -- a human being able to `ls _thumbnail/`
- * and read off what config produced a file, with no database
- * cross-reference, is worth far more than the ~13 bytes a hash would
- * reclaim. `PARAMS_VERSION` exists so a future incompatible change to
- * this segment's own shape can be told apart from today's, rather than
+ * Encodes a policy's *identity* (its name -- now that more than one
+ * 'generate' policy can match the same original, the params segment must
+ * tell their outputs apart) and raw *configured* generation parameters
+ * (never a per-file computed/derived size) into a filename segment, so a
+ * policy config change naturally produces a different expected filename
+ * even when the original's own content hash hasn't changed -- the
+ * existing orphan-reconciliation logic already handles that case for free
+ * (a mismatched expected filename means "not up to date"), no separate
+ * regeneration-detection mechanism needed. A side effect, deliberate: a
+ * policy *rename* is therefore indistinguishable from deleting the old
+ * policy and creating a new one under a new name -- reconciliation
+ * produces exactly one deletion and one regeneration, which is the
+ * correct reaction to a rename it has no other way to detect.
+ *
+ * Literal abbreviated fields rather than a hash of them: worst case
+ * (`p1-somepolicyname-tr9999-tc9999-ts65535-q100`) still leaves plenty of
+ * the 255-byte path-component limit spare even after the hash and
+ * extension, so length was never the binding constraint -- a human being
+ * able to `ls _thumbnail/` and read off what config produced a file, with
+ * no database cross-reference, is worth far more than the bytes a hash
+ * would reclaim. `PARAMS_VERSION` exists so a future incompatible change
+ * to this segment's own shape can be told apart from today's, rather than
  * silently misparsed.
  */
 const PARAMS_VERSION = "p1";
-const PARAMS_SEGMENT_RE = /^p1-[a-z]+\d+(?:-[a-z]+\d+)*$/;
+/**
+ * Deliberately loose about the name segment specifically: parsing an
+ * existing filename never extracts individual fields out of this segment
+ * (see `parseThumbnailEntry` below) -- it's only ever compared for whole-
+ * string equality against a freshly recomputed `expectedParamsSegment`,
+ * so there's no ambiguity to resolve between "the name" and "a field"
+ * even though both share the same charset. This regex exists purely to
+ * reject a filename that doesn't look like *any* recognized shape (fewer
+ * than one name plus one field pair) so it's left alone rather than
+ * mis-tracked -- see the fuller discussion at `parseThumbnailEntry`.
+ */
+const PARAMS_SEGMENT_RE = /^p1-[A-Za-z0-9_]+(?:-[a-z]+\d+)+$/;
 
 function expectedParamsSegment(policy: ThumbnailPolicyGenerateRow): string {
   return policy.mediaType === "image"
-    ? `${PARAMS_VERSION}-iw${policy.imageWidth}-ih${policy.imageHeight}-q${policy.jpegQuality}`
-    : `${PARAMS_VERSION}-tr${policy.tileRowCount}-tc${policy.tileColumnCount}-ts${policy.tileSize}-q${policy.jpegQuality}`;
+    ? `${PARAMS_VERSION}-${policy.name}-iw${policy.imageWidth}-ih${policy.imageHeight}-q${policy.jpegQuality}`
+    : `${PARAMS_VERSION}-${policy.name}-tr${policy.tileRowCount}-tc${policy.tileColumnCount}-ts${policy.tileSize}-q${policy.jpegQuality}`;
 }
 
 interface ExistingThumbnailFile {
@@ -89,6 +107,16 @@ interface ExistingThumbnailFile {
   /** relative to the vault root -- the original this thumbnail is for */
   originalRelativePath: string;
   paramsSegment: string;
+  /**
+   * The params segment's own second token -- structurally always the
+   * policy name that produced it (see `expectedParamsSegment`), extracted
+   * once at parse time so reconciliation can ask "is this *this policy's*
+   * previous output" (by name, surviving a field change like a resized
+   * image box) without re-deriving it from the full segment string each
+   * time. `paramsSegment` itself stays the *whole-string* identity used
+   * for the separate, stricter "is this up to date" check.
+   */
+  policyName: string;
   hash: string;
   thumbExt: string;
 }
@@ -120,6 +148,11 @@ function parseThumbnailEntry(relativePath: string): ExistingThumbnailFile | unde
   const hash = parts[parts.length - 2]!;
   const paramsSegment = parts[parts.length - 3]!;
   if (!PARAMS_SEGMENT_RE.test(paramsSegment)) return undefined;
+  // Position, not content, is what's guaranteed here: PARAMS_SEGMENT_RE
+  // has already confirmed the shape is "p1-<name>-<field><num>...", so
+  // the second dash-separated token is always the policy name, whatever
+  // it happens to look like.
+  const policyName = paramsSegment.split("-")[1]!;
   const originalName = parts.slice(0, -3).join(".");
   if (originalName.length === 0) return undefined;
 
@@ -127,7 +160,7 @@ function parseThumbnailEntry(relativePath: string): ExistingThumbnailFile | unde
   const originalRelativePath =
     originalDir === "." ? originalName : `${originalDir}/${originalName}`;
 
-  return { relativePath, originalRelativePath, paramsSegment, hash, thumbExt };
+  return { relativePath, originalRelativePath, paramsSegment, policyName, hash, thumbExt };
 }
 
 function fileExtension(relativePath: string): string {
@@ -172,10 +205,19 @@ function anyGlobMatches(relativePath: string, policies: readonly ThumbnailPolicy
 }
 
 type PolicyResolution =
-  { action: "skip" } | { action: "generate"; policy: ThumbnailPolicyGenerateRow };
+  { action: "skip" } | { action: "generate"; policies: ThumbnailPolicyGenerateRow[] };
 
-/** Any matching 'skip' wins outright (monotonic OR, like ignore_policies); otherwise the lowest-priority matching 'generate' row wins. `undefined` = not a candidate at all. */
-function resolvePolicy(
+/**
+ * Any matching 'skip' wins outright (monotonic OR, like ignore_policies)
+ * and suppresses every 'generate' match, same as before -- there's still
+ * no priority among 'skip' rows, since they all agree with each other by
+ * construction. Unlike before, there's no winner among 'generate' matches
+ * either: *every* matching 'generate' row produces its own thumbnail, one
+ * per policy (see `expectedParamsSegment`, which is what keeps their
+ * outputs from colliding). `undefined` = not a candidate at all (no
+ * match, skip or generate).
+ */
+function resolvePolicies(
   relativePath: string,
   mimeType: string,
   policies: readonly ThumbnailPolicyRow[],
@@ -185,14 +227,11 @@ function resolvePolicy(
   );
   if (skipMatch) return { action: "skip" };
 
-  const generateMatches = policies
-    .filter(
-      (p): p is ThumbnailPolicyGenerateRow =>
-        p.action === "generate" && policyMatches(p, relativePath, mimeType),
-    )
-    .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
-  const best = generateMatches[0];
-  return best ? { action: "generate", policy: best } : undefined;
+  const generateMatches = policies.filter(
+    (p): p is ThumbnailPolicyGenerateRow =>
+      p.action === "generate" && policyMatches(p, relativePath, mimeType),
+  );
+  return generateMatches.length > 0 ? { action: "generate", policies: generateMatches } : undefined;
 }
 
 /**
@@ -258,7 +297,7 @@ async function classifyProbed(
   const probed = await prober.detectMedia(path.join(root, relativePath));
   if (!probed) return undefined;
 
-  const resolution = resolvePolicy(relativePath, probed.mimeType, policies);
+  const resolution = resolvePolicies(relativePath, probed.mimeType, policies);
   if (!resolution) return undefined;
 
   const cacheRow = cacheRepo.get(relativePath);
@@ -299,10 +338,10 @@ function deleteThumbnailFile(root: string, thumb: ExistingThumbnailFile): void {
  * thumbnail. Per-file failures become `ThumbnailGenerationError`, caught
  * by the caller.
  *
- * `policy` is `ThumbnailPolicyGenerateRow` -- `resolvePolicy`'s "generate"
- * branch is narrowed at the source, so there's no 'skip' branch left to
- * guard against here. The `mediaType` checks below are still real,
- * necessary runtime narrowing, not dead code: `ThumbnailPolicyGenerateRow`
+ * `policy` is `ThumbnailPolicyGenerateRow` -- `resolvePolicies`'s
+ * "generate" branch is narrowed at the source, so there's no 'skip'
+ * branch left to guard against here. The `mediaType` checks below are
+ * still real, necessary runtime narrowing, not dead code: `ThumbnailPolicyGenerateRow`
  * is itself still a union of an "image" branch and a "video" branch, and
  * nothing in the type system connects that to `decision.probed.kind` --
  * `scanThumbnails` only ever reaches this function for a resolution whose
@@ -589,36 +628,60 @@ export async function scanThumbnails(
       continue;
     }
 
-    const policy = decision.resolution.policy;
+    // An original can now match more than one 'generate' policy at once,
+    // each producing its own thumbnail -- so each policy is reconciled
+    // against `existing` independently, keyed by its own params segment
+    // (which embeds the policy's name, so two policies' outputs for the
+    // same original never collide). `claimedThumbs` tracks which existing
+    // files any policy accounted for; whatever's left over at the end --
+    // an orphan from a deleted/renamed policy, or a leftover duplicate --
+    // is swept the same way a single-policy setup always has been.
     const expectedExt = expectedThumbExtension(decision);
-    const expectedParams = expectedParamsSegment(policy);
-    const upToDateMatch = existing.find(
-      (t) =>
-        t.hash === decision.cacheHash &&
-        t.thumbExt === expectedExt &&
-        t.paramsSegment === expectedParams,
-    );
+    const claimedThumbs = new Set<ExistingThumbnailFile>();
 
-    if (upToDateMatch) {
-      stats.upToDate++;
-      for (const thumb of existing) {
-        if (thumb === upToDateMatch) continue;
-        stats.toDelete++;
-        if (mode === "cleanup") deleteThumbnailFile(root, thumb);
+    for (const policy of decision.resolution.policies) {
+      const expectedParams = expectedParamsSegment(policy);
+      const upToDateMatch = existing.find(
+        (t) =>
+          t.hash === decision.cacheHash &&
+          t.thumbExt === expectedExt &&
+          t.paramsSegment === expectedParams,
+      );
+
+      if (upToDateMatch) {
+        stats.upToDate++;
+        claimedThumbs.add(upToDateMatch);
+        continue;
       }
-      continue;
+
+      // Not up to date for *this* policy specifically -- an existing file
+      // whose params segment names this same policy (by name, regardless
+      // of whether its *other* fields -- a resized box, say -- have since
+      // changed) is this policy's own previous output, safe to delete-
+      // and-regenerate; absent that, this policy has never produced
+      // anything for this original before, so it's a fresh generation,
+      // not a regeneration. Matching by name rather than the whole
+      // segment is what lets an ordinary config edit (not a rename) still
+      // read as "regenerate", exactly as it always has.
+      const staleForThisPolicy = existing.find((t) => t.policyName === policy.name);
+      if (staleForThisPolicy) {
+        stats.toRegenerate++;
+        claimedThumbs.add(staleForThisPolicy);
+        if (mode === "ensure") {
+          generationJobs.push({ decision, policy, staleThumbnail: staleForThisPolicy });
+        }
+      } else {
+        stats.toGenerate++;
+        if (mode === "ensure") {
+          generationJobs.push({ decision, policy, staleThumbnail: undefined });
+        }
+      }
     }
 
-    if (existing.length > 0) {
-      stats.toRegenerate++;
-      if (mode === "ensure") {
-        generationJobs.push({ decision, policy, staleThumbnail: existing[0] });
-      }
-    } else {
-      stats.toGenerate++;
-      if (mode === "ensure") {
-        generationJobs.push({ decision, policy, staleThumbnail: undefined });
-      }
+    for (const thumb of existing) {
+      if (claimedThumbs.has(thumb)) continue;
+      stats.toDelete++;
+      if (mode === "cleanup") deleteThumbnailFile(root, thumb);
     }
   }
 

@@ -4,8 +4,11 @@ Manages **global thumbnail-generation policies**: a glob pattern (real `**` supp
 [thumbnails.md](../architecture/thumbnails.md)) paired with a mime-type filter and a `skip`/`generate`
 disposition. Like `storage_policy`/`ignore`, these live in `state.db` — shared and versioned, so every
 machine agrees on the same rules. Unlike `storage_policy`, there is **no mandatory default row**: a path
-matching no policy at all is simply not a thumbnail candidate. `sync1 thumbnail state/ensure/cleanup`
-apply these policies; `thumbnail_policy` only manages the rules themselves.
+matching no policy at all is simply not a thumbnail candidate. Unlike `storage_policy`, there is also
+**no priority**: every matching `generate` policy produces its own thumbnail, not just the "best" one —
+see [thumbnails.md](../architecture/thumbnails.md#thumbnail_policy-deciding-what-gets-a-thumbnail).
+`sync1 thumbnail state/ensure/cleanup` apply these policies; `thumbnail_policy` only manages the rules
+themselves.
 
 ## Subcommands
 
@@ -26,8 +29,8 @@ CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactive prompt).
 sync1 thumbnail_policy list [--root <local-path>] [--json]
 
 sync1 thumbnail_policy create <glob> <skip|generate> [--root <local-path>] \
+  --name <name> \
   --mime-types <csv> \
-  [--priority <n>] \
   --media-type <image|video> \
   [--image-width <n>] [--image-height <n>] \
   [--tile-rows <n>] [--tile-columns <n>] [--tile-size <n>] \
@@ -35,7 +38,8 @@ sync1 thumbnail_policy create <glob> <skip|generate> [--root <local-path>] \
   [--json]
 
 sync1 thumbnail_policy edit <id> [--root <local-path>] \
-  [--glob <glob>] [--action <skip|generate>] [--mime-types <csv>] [--priority <n>] \
+  [--name <name>] \
+  [--glob <glob>] [--action <skip|generate>] [--mime-types <csv>] \
   [--media-type <image|video>] \
   [--image-width <n>] [--image-height <n>] \
   [--tile-rows <n>] [--tile-columns <n>] [--tile-size <n>] \
@@ -47,6 +51,16 @@ sync1 thumbnail_policy delete <id> [--root <local-path>] [--json]
 
 `--root` is optional on every subcommand — omitted, it defaults to the nearest ancestor directory
 containing a `.sync1/`, searched from the current directory upward.
+
+`--name` is required on `create` and, unlike every other field, has nothing to do with matching: it's a
+unique identifier (letters, digits, and underscores only, enforced by a `CHECK` constraint plus a
+`UNIQUE` index — a duplicate name is rejected as a raw database constraint error) that appears verbatim
+in every thumbnail this policy generates (see [thumbnails.md](../architecture/thumbnails.md#naming-convention-and-where-thumbnails-live)).
+It exists so two policies matching the same file never collide on disk, and doubles as how
+reconciliation recognizes "this policy's own previous output" versus another policy's or a genuine
+orphan — which also means renaming a policy (`edit --name`) is indistinguishable, on disk, from
+replacing it: the next `ensure` regenerates under the new name, and the next `cleanup` removes the old
+name's now-orphaned file.
 
 `--mime-types` is a comma-separated list, e.g. `"image/jpeg,video/*"` — the subtype half of any entry may
 be a literal `*` wildcard, nothing else is a wildcard here. Required on `create` (even for a `skip`
@@ -63,23 +77,21 @@ tile's _shorter_ side, not a fixed box — see [thumbnails.md](../architecture/t
 replacing what used to be separate `--tile-width`/`--tile-height` flags.
 
 `create`/`edit` validate the `skip`/`generate`/media-type combination before touching the network: a
-`skip` policy must not set `--priority`, `--media-type`, or any of the five generation flags; a
-`generate` policy must set `--media-type` plus every field belonging to that type (`--image-width`,
-`--image-height`, `--jpeg-quality` for `image`; `--tile-rows`, `--tile-columns`, `--tile-size`,
-`--jpeg-quality` for `video`) and none of the other type's fields. `--priority`, if omitted on `create`,
-auto-assigns to run after every existing `generate` policy (lower numbers are checked first among
-matching `generate` rows; irrelevant among `skip` rows, which always win outright regardless of
-priority). `edit` re-validates the _merged_ result, so switching `--action generate` to `--action skip`
-(or back), or switching `--media-type` from `image` to `video` (or back) on an existing `generate` row,
-must also supply/clear the relevant fields as needed — a media-type switch also requires resupplying
-`--mime-types` to match the new type. The one field that survives an `image`↔`video` switch without
-needing to be resupplied is `--jpeg-quality`, the single field both `generate` branches share.
+`skip` policy must not set `--media-type` or any of the five generation flags; a `generate` policy must
+set `--media-type` plus every field belonging to that type (`--image-width`, `--image-height`,
+`--jpeg-quality` for `image`; `--tile-rows`, `--tile-columns`, `--tile-size`, `--jpeg-quality` for
+`video`) and none of the other type's fields. `edit` re-validates the _merged_ result, so switching
+`--action generate` to `--action skip` (or back), or switching `--media-type` from `image` to `video`
+(or back) on an existing `generate` row, must also supply/clear the relevant fields as needed — a
+media-type switch also requires resupplying `--mime-types` to match the new type. The one field that
+survives an `image`↔`video` switch without needing to be resupplied is `--jpeg-quality`, the single
+field both `generate` branches share.
 
 ## Output
 
 A `generate` row's shape depends on its `mediaType` — an `image` row never carries the three `tile*`
 fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always carry `jpegQuality`. A
-`skip` row carries none of them, and no `mediaType` at all:
+`skip` row carries none of them, and no `mediaType` at all. Every row always carries `name`:
 
 ```json
 {
@@ -87,10 +99,10 @@ fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always 
   "policies": [
     {
       "id": 1,
+      "name": "photo_thumb",
       "glob": "**/*.jpg",
       "action": "generate",
       "mediaType": "image",
-      "priority": 0,
       "mimeTypes": ["image/jpeg"],
       "imageWidth": 320,
       "imageHeight": 240,
@@ -99,10 +111,10 @@ fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always 
     },
     {
       "id": 2,
+      "name": "video_mosaic",
       "glob": "**/*.mp4",
       "action": "generate",
       "mediaType": "video",
-      "priority": 1,
       "mimeTypes": ["video/*"],
       "tileRowCount": 4,
       "tileColumnCount": 4,
@@ -112,9 +124,9 @@ fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always 
     },
     {
       "id": 3,
+      "name": "skip_private",
       "glob": "private/**",
       "action": "skip",
-      "priority": null,
       "mimeTypes": ["image/*", "video/*"],
       "createdAt": "2026-01-01T00:00:00.000Z"
     }
@@ -125,22 +137,23 @@ fields, and a `video` row never carries `imageWidth`/`imageHeight`; both always 
 ## Exit codes
 
 - `0` — success.
-- `1` — the root isn't initialized/attached, an invalid glob/action/media-type/mime-type/priority/
-  dimension was given, the `skip`/`generate`/media-type field combination was inconsistent, or
-  `edit`/`delete` referenced an id that doesn't exist.
+- `1` — the root isn't initialized/attached, an invalid glob/action/media-type/mime-type/name/dimension
+  was given, the name was already taken, the `skip`/`generate`/media-type field combination was
+  inconsistent, or `edit`/`delete` referenced an id that doesn't exist.
 
 ## Example
 
 ```bash
 sync1 thumbnail_policy create "**/*.jpg" generate --root ~/Pictures \
-  --mime-types image/jpeg --media-type image \
+  --name photo_thumb --mime-types image/jpeg --media-type image \
   --image-width 320 --image-height 240 --jpeg-quality 80 --json
 
 sync1 thumbnail_policy create "**/*.mp4" generate --root ~/Pictures \
-  --mime-types video/* --media-type video \
+  --name video_mosaic --mime-types video/* --media-type video \
   --tile-rows 4 --tile-columns 4 --tile-size 90 --jpeg-quality 80 --json
 
-sync1 thumbnail_policy create "private/**" skip --root ~/Pictures --mime-types "image/*,video/*" --json
+sync1 thumbnail_policy create "private/**" skip --root ~/Pictures \
+  --name skip_private --mime-types "image/*,video/*" --json
 
 sync1 thumbnail_policy list --root ~/Pictures --json
 ```

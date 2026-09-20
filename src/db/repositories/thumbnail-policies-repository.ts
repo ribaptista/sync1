@@ -4,9 +4,12 @@ export type ThumbnailPolicyAction = "skip" | "generate";
 export type ThumbnailPolicyMediaType = "image" | "video";
 
 const MIME_TYPE_PATTERN = /^[a-zA-Z0-9.+-]+\/(\*|[a-zA-Z0-9.+-]+)$/;
+/** Matches the table's own CHECK constraint: non-empty, alphanumeric plus underscore only -- see 0007's migration comment and src/fs/thumbnail.ts's filename-grammar use of it. */
+const NAME_PATTERN = /^[A-Za-z0-9_]+$/;
 
 interface Base {
   id: number;
+  name: string;
   glob: string;
   mimeTypes: string[];
   createdAt: string;
@@ -24,11 +27,10 @@ interface Base {
  * scattered through consuming code.
  */
 export type ThumbnailPolicyRow =
-  | (Base & { action: "skip"; priority: null })
+  | (Base & { action: "skip" })
   | (Base & {
       action: "generate";
       mediaType: "image";
-      priority: number;
       imageWidth: number;
       imageHeight: number;
       jpegQuality: number;
@@ -36,34 +38,33 @@ export type ThumbnailPolicyRow =
   | (Base & {
       action: "generate";
       mediaType: "video";
-      priority: number;
       tileRowCount: number;
       tileColumnCount: number;
       tileSize: number;
       jpegQuality: number;
     });
 
-/** What a `resolvePolicy` match actually is -- a 'skip' row is never useful past the fact that it matched. */
+/** What a policy match actually is -- a 'skip' row is never useful past the fact that it matched. */
 export type ThumbnailPolicyGenerateRow = Extract<ThumbnailPolicyRow, { action: "generate" }>;
 
 export type ThumbnailPolicyCreateInput =
-  | { glob: string; action: "skip"; mimeTypes: string[] }
+  | { name: string; glob: string; action: "skip"; mimeTypes: string[] }
   | {
+      name: string;
       glob: string;
       action: "generate";
       mediaType: "image";
       mimeTypes: string[];
-      priority?: number;
       imageWidth: number;
       imageHeight: number;
       jpegQuality: number;
     }
   | {
+      name: string;
       glob: string;
       action: "generate";
       mediaType: "video";
       mimeTypes: string[];
-      priority?: number;
       tileRowCount: number;
       tileColumnCount: number;
       tileSize: number;
@@ -79,10 +80,10 @@ export type ThumbnailPolicyCreateInput =
  * flags) can never statically know the existing row's branch anyway.
  */
 export interface ThumbnailPolicyUpdate {
+  name?: string;
   glob?: string;
   action?: ThumbnailPolicyAction;
   mimeTypes?: string[];
-  priority?: number;
   mediaType?: ThumbnailPolicyMediaType;
   imageWidth?: number;
   imageHeight?: number;
@@ -94,9 +95,9 @@ export interface ThumbnailPolicyUpdate {
 
 /** The all-nullable shape both the SQL layer and `update()`'s merge work in -- every field a row could possibly have, regardless of which branch is actually live. */
 interface FlatPolicyFields {
+  name: string;
   glob: string;
   action: ThumbnailPolicyAction;
-  priority: number | null;
   mimeTypes: string[];
   mediaType: ThumbnailPolicyMediaType | null;
   imageWidth: number | null;
@@ -112,6 +113,14 @@ type TypeSpecificFieldName =
 
 const IMAGE_FIELD_NAMES = ["imageWidth", "imageHeight"] as const;
 const VIDEO_FIELD_NAMES = ["tileRowCount", "tileColumnCount", "tileSize"] as const;
+
+function validateName(name: string): void {
+  if (!NAME_PATTERN.test(name)) {
+    throw new Error(
+      `invalid policy name "${name}" -- must be non-empty and contain only letters, digits, and underscores`,
+    );
+  }
+}
 
 function validateMimeTypes(mimeTypes: string[]): void {
   if (mimeTypes.length === 0) {
@@ -129,13 +138,12 @@ function validateMimeTypes(mimeTypes: string[]): void {
 /**
  * Every `mimeTypes` entry's *type* segment (never wildcarded, only the
  * subtype can be `*` -- see `MIME_TYPE_PATTERN`) must equal `mediaType`.
- * This is what makes a `resolvePolicy`-selected policy's `mediaType`
- * **provably** agree with what actually got probed (`resolvePolicy` only
- * ever returns a policy whose `mimeTypes` matched the file's real, sniffed
- * mime type) -- not just usually-true. Only meaningful for a 'generate'
- * row; a 'skip' row's `mimeTypes` legitimately mixes types (e.g.
- * `["image/*", "video/*"]"`), since matching it never needs a media type
- * at all.
+ * This is what makes a matched policy's `mediaType` **provably** agree
+ * with what actually got probed (policy resolution only ever returns a
+ * policy whose `mimeTypes` matched the file's real, sniffed mime type) --
+ * not just usually-true. Only meaningful for a 'generate' row; a 'skip'
+ * row's `mimeTypes` legitimately mixes types (e.g. `["image/*",
+ * "video/*"]"`), since matching it never needs a media type at all.
  */
 function validateMediaTypeMimeConsistency(
   mediaType: ThumbnailPolicyMediaType,
@@ -152,20 +160,17 @@ function validateMediaTypeMimeConsistency(
 }
 
 /**
- * Checks the action/priority/media-type/generate-fields consistency
- * invariant the `thumbnail_policies` table's own three-way CHECK
- * constraint also enforces, but ahead of time with a friendly, field-
- * naming error message. A 'skip' row must have no priority, no media
- * type, and none of the six generate fields at all. A 'generate' row must
- * have a priority and a media type; given that media type, it must have
- * every field belonging to its own type (image fields ∪ jpegQuality, or
- * video fields ∪ jpegQuality) and none of the other type's fields.
+ * Checks the action/media-type/generate-fields consistency invariant the
+ * `thumbnail_policies` table's own three-way CHECK constraint also
+ * enforces, but ahead of time with a friendly, field-naming error message.
+ * A 'skip' row must have no media type, and none of the six generate
+ * fields at all. A 'generate' row must have a media type; given that media
+ * type, it must have every field belonging to its own type (image fields ∪
+ * jpegQuality, or video fields ∪ jpegQuality) and none of the other type's
+ * fields.
  */
 function validateActionConsistency(flat: FlatPolicyFields): void {
   if (flat.action === "skip") {
-    if (flat.priority != null) {
-      throw new Error("a 'skip' policy can't have a priority");
-    }
     if (flat.mediaType != null) {
       throw new Error("a 'skip' policy can't have a media type");
     }
@@ -178,9 +183,6 @@ function validateActionConsistency(flat: FlatPolicyFields): void {
     return;
   }
 
-  if (flat.priority == null) {
-    throw new Error("a 'generate' policy needs a priority");
-  }
   if (flat.mediaType == null) {
     throw new Error("a 'generate' policy needs a media type");
   }
@@ -202,14 +204,14 @@ function validateActionConsistency(flat: FlatPolicyFields): void {
 }
 
 const ROW_COLUMNS =
-  "id, glob, action, priority, mime_types, media_type, image_width, image_height, " +
+  "id, name, glob, action, mime_types, media_type, image_width, image_height, " +
   "tile_row_count, tile_column_count, tile_size, jpeg_quality, created_at";
 
 interface RawRow {
   id: number;
+  name: string;
   glob: string;
   action: ThumbnailPolicyAction;
-  priority: number | null;
   mime_types: string;
   media_type: ThumbnailPolicyMediaType | null;
   image_width: number | null;
@@ -224,24 +226,24 @@ interface RawRow {
 function fromRawRow(row: RawRow): ThumbnailPolicyRow {
   const base: Base = {
     id: row.id,
+    name: row.name,
     glob: row.glob,
     mimeTypes: JSON.parse(row.mime_types) as string[],
     createdAt: row.created_at,
   };
 
   if (row.action === "skip") {
-    return { ...base, action: "skip", priority: null };
+    return { ...base, action: "skip" };
   }
 
   // Non-null assertions below rely on the table's own three-way CHECK
   // constraint: a 'generate' row's media-type-appropriate fields (plus
-  // priority and jpegQuality) are always NOT NULL, never on trust alone.
+  // jpegQuality) are always NOT NULL, never on trust alone.
   if (row.media_type === "image") {
     return {
       ...base,
       action: "generate",
       mediaType: "image",
-      priority: row.priority!,
       imageWidth: row.image_width!,
       imageHeight: row.image_height!,
       jpegQuality: row.jpeg_quality!,
@@ -253,7 +255,6 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
     ...base,
     action: "generate",
     mediaType: "video",
-    priority: row.priority!,
     tileRowCount: row.tile_row_count!,
     tileColumnCount: row.tile_column_count!,
     tileSize: row.tile_size!,
@@ -263,12 +264,11 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
 
 /** The inverse of `fromRawRow`'s narrowing -- flattens a validated row back to the all-nullable shape `update()`'s merge and the SQL layer both need. */
 function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
-  const base = { glob: row.glob, mimeTypes: row.mimeTypes };
+  const base = { name: row.name, glob: row.glob, mimeTypes: row.mimeTypes };
   if (row.action === "skip") {
     return {
       ...base,
       action: "skip",
-      priority: null,
       mediaType: null,
       imageWidth: null,
       imageHeight: null,
@@ -282,7 +282,6 @@ function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
     return {
       ...base,
       action: "generate",
-      priority: row.priority,
       mediaType: "image",
       imageWidth: row.imageWidth,
       imageHeight: row.imageHeight,
@@ -295,7 +294,6 @@ function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
   return {
     ...base,
     action: "generate",
-    priority: row.priority,
     mediaType: "video",
     imageWidth: null,
     imageHeight: null,
@@ -319,10 +317,10 @@ function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
 function flatFromCreateInput(input: ThumbnailPolicyCreateInput): FlatPolicyFields {
   const loose = input as unknown as Partial<FlatPolicyFields>;
   return {
+    name: input.name,
     glob: input.glob,
     action: input.action,
     mimeTypes: input.mimeTypes,
-    priority: loose.priority ?? null,
     mediaType: loose.mediaType ?? null,
     imageWidth: loose.imageWidth ?? null,
     imageHeight: loose.imageHeight ?? null,
@@ -337,7 +335,9 @@ function flatFromCreateInput(input: ThumbnailPolicyCreateInput): FlatPolicyField
  * state.db's `thumbnail_policies` table -- global, versioned, shared across
  * every machine. Unlike `storage_policies`, there is no mandatory default
  * row: a path matching no policy glob at all is simply not a thumbnail
- * candidate.
+ * candidate. Unlike `storage_policies`, there is also no priority: every
+ * matching 'generate' policy produces its own thumbnail (a 'skip' match
+ * still vetoes all of them) -- see docs/architecture/thumbnails.md.
  */
 export class ThumbnailPoliciesRepository {
   constructor(private readonly db: Database.Database) {}
@@ -356,11 +356,11 @@ export class ThumbnailPoliciesRepository {
     return row ? fromRawRow(row) : undefined;
   }
 
-  /** Every 'generate' row, ordered by priority (lower first) -- what thumbnail-policy resolution walks after checking for a 'skip' match. */
-  listGenerateByPriority(): ThumbnailPolicyRow[] {
+  /** Every 'generate' row -- what thumbnail-policy resolution filters (every match generates, so there's no ordering to apply). */
+  listGenerate(): ThumbnailPolicyRow[] {
     return this.db
       .prepare<[], RawRow>(
-        `SELECT ${ROW_COLUMNS} FROM thumbnail_policies WHERE action = 'generate' ORDER BY priority ASC, id ASC`,
+        `SELECT ${ROW_COLUMNS} FROM thumbnail_policies WHERE action = 'generate' ORDER BY id ASC`,
       )
       .all()
       .map(fromRawRow);
@@ -376,6 +376,7 @@ export class ThumbnailPoliciesRepository {
 
   create(input: ThumbnailPolicyCreateInput): number {
     const flat = flatFromCreateInput(input);
+    validateName(flat.name);
     validateActionConsistency(flat);
     validateMimeTypes(flat.mimeTypes);
     if (flat.mediaType) validateMediaTypeMimeConsistency(flat.mediaType, flat.mimeTypes);
@@ -384,8 +385,8 @@ export class ThumbnailPoliciesRepository {
       .prepare<
         [
           string,
+          string,
           ThumbnailPolicyAction,
-          number | null,
           string,
           ThumbnailPolicyMediaType | null,
           number | null,
@@ -398,14 +399,14 @@ export class ThumbnailPoliciesRepository {
         ]
       >(
         `INSERT INTO thumbnail_policies (
-          glob, action, priority, mime_types, media_type, image_width, image_height,
+          name, glob, action, mime_types, media_type, image_width, image_height,
           tile_row_count, tile_column_count, tile_size, jpeg_quality, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
+        flat.name,
         flat.glob,
         flat.action,
-        flat.priority,
         JSON.stringify(flat.mimeTypes),
         flat.mediaType,
         flat.imageWidth,
@@ -441,6 +442,7 @@ export class ThumbnailPoliciesRepository {
     const old = toFlatFields(row);
 
     const action = changes.action ?? old.action;
+    const name = changes.name ?? old.name;
     const glob = changes.glob ?? old.glob;
     const mimeTypes = changes.mimeTypes ?? old.mimeTypes;
     const mediaType =
@@ -466,13 +468,10 @@ export class ThumbnailPoliciesRepository {
           ? null
           : old.jpegQuality;
 
-    const priority =
-      action === "skip" ? null : changes.priority !== undefined ? changes.priority : old.priority;
-
     const flat: FlatPolicyFields = {
+      name,
       glob,
       action,
-      priority,
       mimeTypes,
       mediaType,
       imageWidth: typeField("imageWidth"),
@@ -483,6 +482,7 @@ export class ThumbnailPoliciesRepository {
       jpegQuality,
     };
 
+    validateName(flat.name);
     validateActionConsistency(flat);
     validateMimeTypes(flat.mimeTypes);
     if (flat.mediaType) validateMediaTypeMimeConsistency(flat.mediaType, flat.mimeTypes);
@@ -491,8 +491,8 @@ export class ThumbnailPoliciesRepository {
       .prepare<
         [
           string,
+          string,
           ThumbnailPolicyAction,
-          number | null,
           string,
           ThumbnailPolicyMediaType | null,
           number | null,
@@ -505,14 +505,14 @@ export class ThumbnailPoliciesRepository {
         ]
       >(
         `UPDATE thumbnail_policies SET
-          glob = ?, action = ?, priority = ?, mime_types = ?, media_type = ?, image_width = ?, image_height = ?,
+          name = ?, glob = ?, action = ?, mime_types = ?, media_type = ?, image_width = ?, image_height = ?,
           tile_row_count = ?, tile_column_count = ?, tile_size = ?, jpeg_quality = ?
         WHERE id = ?`,
       )
       .run(
+        flat.name,
         flat.glob,
         flat.action,
-        flat.priority,
         JSON.stringify(flat.mimeTypes),
         flat.mediaType,
         flat.imageWidth,

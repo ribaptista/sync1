@@ -35,15 +35,15 @@ interface GenerateFieldOptions {
 }
 
 interface CreateOptions extends RootOption, GenerateFieldOptions {
+  name: string;
   mimeTypes: string;
-  priority?: string;
 }
 
 interface EditOptions extends RootOption, GenerateFieldOptions {
+  name?: string;
   glob?: string;
   action?: string;
   mimeTypes?: string;
-  priority?: string;
 }
 
 interface GlobalOptions extends OptionValues {
@@ -77,14 +77,6 @@ function parseMediaType(raw: string): ThumbnailPolicyMediaType {
     throw new Error(`invalid media type "${raw}" — expected "image" or "video"`);
   }
   return raw;
-}
-
-function parsePriority(raw: string): number {
-  const priority = Number(raw);
-  if (!Number.isInteger(priority)) {
-    throw new Error(`invalid priority "${raw}" — expected an integer`);
-  }
-  return priority;
 }
 
 function parsePositiveInt(raw: string, flagName: string): number {
@@ -155,15 +147,13 @@ function parseGenerateFields(opts: GenerateFieldOptions): ParsedGenerateFields {
 
 /**
  * Fast, friendly, pre-network-round-trip check for `create`: a "skip"
- * policy must supply none of --priority, --media-type, or any generate
- * flag; a "generate" policy must supply --media-type, then exactly that
- * media type's own fields (plus --jpeg-quality) and none of the other
- * type's (--priority is still optional -- omitted, it's auto-assigned
- * like storage_policy's own `nextPriority`). The repository re-validates
- * the same invariant regardless (its own CHECK constraint enforces it at
- * the SQL level too) -- this only exists to fail before
- * `setupMutationContext`'s password/KDF/network work for an obviously-
- * wrong combination of flags.
+ * policy must supply none of --media-type or any generate flag; a
+ * "generate" policy must supply --media-type, then exactly that media
+ * type's own fields (plus --jpeg-quality) and none of the other type's.
+ * The repository re-validates the same invariant regardless (its own
+ * CHECK constraint enforces it at the SQL level too) -- this only exists
+ * to fail before `setupMutationContext`'s password/KDF/network work for
+ * an obviously-wrong combination of flags.
  */
 function assertGenerateFlagsConsistentForCreate(
   action: ThumbnailPolicyAction,
@@ -179,11 +169,7 @@ function assertGenerateFlagsConsistentForCreate(
     const present = allGenerateFlagNames
       .filter(([, key]) => opts[key] !== undefined)
       .map(([flag]) => flag);
-    const allPresent = [
-      ...(opts.priority !== undefined ? ["--priority"] : []),
-      ...(opts.mediaType !== undefined ? ["--media-type"] : []),
-      ...present,
-    ];
+    const allPresent = [...(opts.mediaType !== undefined ? ["--media-type"] : []), ...present];
     if (allPresent.length > 0) {
       throw new Error(`a "skip" policy can't set ${allPresent.join(", ")}`);
     }
@@ -256,13 +242,6 @@ async function runList(opts: RootOption): Promise<ThumbnailPolicyRow[]> {
   }
 }
 
-/** Appends after every existing 'generate' policy (lowest precedence), computed fresh inside the mutation callback -- see storage_policy.ts's identical `nextPriority`. */
-function nextPriority(repo: ThumbnailPoliciesRepository): number {
-  const existing = repo.listGenerateByPriority();
-  if (existing.length === 0) return 0;
-  return Math.max(...existing.map((r) => r.priority ?? 0)) + 1;
-}
-
 /**
  * Builds the real `ThumbnailPolicyCreateInput` union value from
  * independently-parsed pieces. The `!` assertions on `generateFields`'
@@ -271,38 +250,37 @@ function nextPriority(repo: ThumbnailPoliciesRepository): number {
  * every field this branch needs is guaranteed present.
  */
 function buildCreateInput(
+  name: string,
   glob: string,
   action: ThumbnailPolicyAction,
   mimeTypes: string[],
   generateFields: ParsedGenerateFields,
   opts: CreateOptions,
-  repo: ThumbnailPoliciesRepository,
 ): ThumbnailPolicyCreateInput {
   if (action === "skip") {
-    return { glob, action: "skip", mimeTypes };
+    return { name, glob, action: "skip", mimeTypes };
   }
 
-  const priority = opts.priority !== undefined ? parsePriority(opts.priority) : nextPriority(repo);
   const mediaType = parseMediaType(opts.mediaType!);
 
   if (mediaType === "image") {
     return {
+      name,
       glob,
       action: "generate",
       mediaType: "image",
       mimeTypes,
-      priority,
       imageWidth: generateFields.imageWidth!,
       imageHeight: generateFields.imageHeight!,
       jpegQuality: generateFields.jpegQuality!,
     };
   }
   return {
+    name,
     glob,
     action: "generate",
     mediaType: "video",
     mimeTypes,
-    priority,
     tileRowCount: generateFields.tileRowCount!,
     tileColumnCount: generateFields.tileColumnCount!,
     tileSize: generateFields.tileSize!,
@@ -324,7 +302,7 @@ async function runCreate(
   const { root, masterKey, s3 } = await setupMutationContext(opts);
   const { versionStamp, result: id } = await mutateStateDb(root, masterKey, s3, logger, (db) => {
     const repo = new ThumbnailPoliciesRepository(db);
-    const input = buildCreateInput(glob, action, mimeTypes, generateFields, opts, repo);
+    const input = buildCreateInput(opts.name, glob, action, mimeTypes, generateFields, opts);
     return repo.create(input);
   });
   return { id, action, versionStamp };
@@ -339,10 +317,10 @@ async function runEdit(
   const { root, masterKey, s3 } = await setupMutationContext(opts);
   const { versionStamp } = await mutateStateDb(root, masterKey, s3, logger, (db) => {
     const changes: ThumbnailPolicyUpdate = {};
+    if (opts.name !== undefined) changes.name = opts.name;
     if (opts.glob !== undefined) changes.glob = opts.glob;
     if (opts.action !== undefined) changes.action = parseAction(opts.action);
     if (opts.mimeTypes !== undefined) changes.mimeTypes = parseMimeTypes(opts.mimeTypes);
-    if (opts.priority !== undefined) changes.priority = parsePriority(opts.priority);
     if (opts.mediaType !== undefined) changes.mediaType = parseMediaType(opts.mediaType);
     Object.assign(changes, parseGenerateFields(opts));
     if (!new ThumbnailPoliciesRepository(db).update(id, changes)) {
@@ -393,7 +371,7 @@ export function registerThumbnailPolicyCommand(program: Command): void {
         } else {
           for (const r of rows) {
             process.stdout.write(
-              `${r.id}\t${r.glob}\t${r.action}\tpriority=${r.priority ?? "-"}\tmime=${r.mimeTypes.join(",")}\n`,
+              `${r.id}\t${r.name}\t${r.glob}\t${r.action}\tmime=${r.mimeTypes.join(",")}\n`,
             );
           }
         }
@@ -413,11 +391,11 @@ export function registerThumbnailPolicyCommand(program: Command): void {
       "--root <path>",
       "local directory whose vault to modify (defaults to the nearest ancestor directory with a .sync1/)",
     )
-    .requiredOption("--mime-types <csv>", 'comma-separated mime types, e.g. "image/jpeg,video/*"')
-    .option(
-      "--priority <n>",
-      "generate policies only; lower is checked first (default: appended last)",
+    .requiredOption(
+      "--name <name>",
+      "unique identifier, letters/digits/underscore only -- appears in generated thumbnails' filenames",
     )
+    .requiredOption("--mime-types <csv>", 'comma-separated mime types, e.g. "image/jpeg,video/*"')
     .option("--media-type <image|video>", "generate policies only; which field set applies")
     .option("--image-width <n>", "generate policies only, for image policies")
     .option("--image-height <n>", "generate policies only, for image policies")
@@ -444,13 +422,14 @@ export function registerThumbnailPolicyCommand(program: Command): void {
           emitJson({
             ok: true,
             id,
+            name: opts.name,
             glob,
             action: resolvedAction,
             version_stamp: versionStamp,
           });
         } else {
           process.stdout.write(
-            `thumbnail policy ${id} created (version ${versionStamp}): ${glob} -> ${resolvedAction}\n`,
+            `thumbnail policy ${id} (${opts.name}) created (version ${versionStamp}): ${glob} -> ${resolvedAction}\n`,
           );
         }
       } catch (err) {
@@ -468,10 +447,10 @@ export function registerThumbnailPolicyCommand(program: Command): void {
       "--root <path>",
       "local directory whose vault to modify (defaults to the nearest ancestor directory with a .sync1/)",
     )
+    .option("--name <name>", "new unique identifier, letters/digits/underscore only")
     .option("--glob <glob>", "new glob pattern")
     .option("--action <action>", "new action: skip or generate")
     .option("--mime-types <csv>", "new comma-separated mime types")
-    .option("--priority <n>", "new priority (generate policies only)")
     .option("--media-type <image|video>", "new media type (generate policies only)")
     .option("--image-width <n>", "new image width (generate/image policies only)")
     .option("--image-height <n>", "new image height (generate/image policies only)")

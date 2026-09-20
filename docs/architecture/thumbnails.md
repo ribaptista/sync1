@@ -13,12 +13,28 @@ tracked file, so a user can browse _content_, not just names, without ever mater
 `thumbnail_policy` (table `thumbnail_policies` in `state.db`, global and versioned like `storage_policy`
 and `ignore_policies`) pairs a glob with a mime-type filter and a `skip`/`generate` disposition. Unlike
 `storage_policy`, there is **no mandatory default row** — a path matching no policy glob at all is simply
-not a thumbnail candidate, the overwhelmingly common case for most of a tree. Resolution, in order:
+not a thumbnail candidate, the overwhelmingly common case for most of a tree. Unlike `storage_policy`,
+there is also **no priority** — every matching `generate` row produces its own thumbnail, not just the
+"best" one. Resolution, in order:
 
 1. Any matching `skip` row wins outright — monotonic OR, no priority needed among skips, exactly like
-   `ignore_policies` (see [ignore-and-storage-policies.md](ignore-and-storage-policies.md)).
-2. Otherwise, the lowest-`priority` matching `generate` row wins (same tie-break as `storage_policy`).
-3. No match at all → not a candidate; nothing tallied, nothing probed.
+   `ignore_policies` (see [ignore-and-storage-policies.md](ignore-and-storage-policies.md)) — and
+   suppresses generation from _every_ matching `generate` row, not just the "closest" one.
+2. Otherwise, **every** matching `generate` row generates its own thumbnail (`resolvePolicies` in
+   `src/fs/thumbnail.ts`), each one distinguished in the resulting filename by its policy's own `name`
+   (see "Naming convention" below) — two overlapping policies for the same file are not a conflict to
+   resolve, they're two independently wanted previews.
+3. No match at all (neither `skip` nor `generate`) → not a candidate; nothing tallied, nothing probed.
+
+Every policy has a `name` — a required, globally-unique identifier (letters, digits, and underscores
+only; enforced by both a `CHECK` constraint and a `UNIQUE` index) — which exists specifically so more
+than one `generate` policy can match the same file without their outputs colliding on disk: it's what
+makes the params segment of two different policies' thumbnails for the same original two different
+filenames. A policy _rename_ is therefore indistinguishable, on disk, from deleting the old policy and
+creating a new one under a new name — the next reconciliation produces exactly one deletion (the old
+name's now-unclaimed file) and one regeneration (the new name's fresh one), which is the correct and
+only way to react to a rename it has no other way to detect (see "Naming convention" below for how the
+name is recovered from an existing filename without needing to parse out any of the other fields).
 
 "Matching" requires **both** the glob and the mime-type filter to match — a `skip`/`generate` row's
 `mime_types` column (e.g. `["image/jpeg", "video/*"]`, the second segment may be a literal `*` wildcard)
@@ -42,9 +58,9 @@ field like `policy.tileSize` directly), so a `generate`+`video` row is staticall
 `tileSize` and statically guaranteed _not_ to have `imageWidth` — no `!` non-null assertions needed
 anywhere generation code narrows on it. Every `mimeTypes` entry's own type segment (`image`/`video`,
 never wildcarded) is validated to match a `generate` row's `mediaType`, which is what makes a
-`resolvePolicy`-selected policy's `mediaType` _provably_ agree with whatever a file actually probed as
-(`resolvePolicy` only ever returns a policy whose `mimeTypes` matched the file's real, sniffed mime type),
-not just usually-true by convention.
+`resolvePolicies`-selected policy's `mediaType` _provably_ agree with whatever a file actually probed as
+(`resolvePolicies` only ever returns policies whose `mimeTypes` matched the file's real, sniffed mime
+type), not just usually-true by convention.
 
 ## Walk-scoping via `literalPrefixOf`
 
@@ -63,27 +79,38 @@ much of the tree needs visiting.
 A thumbnail/mosaic lives in a `_thumbnail/` subdirectory of the same directory as its original, named
 `<original-filename-with-extension>.<params-segment>.<hash-hex>.<thumb-ext>`:
 
-- `photos/sunset.jpg` → `photos/_thumbnail/sunset.jpg.p1-iw320-ih240-q80.<hash>.jpg`
-- `videos/clip.mp4` → `videos/_thumbnail/clip.mp4.p1-tr4-tc4-ts90-q80.<hash>.jpg`
+- `photos/sunset.jpg` → `photos/_thumbnail/sunset.jpg.p1-thumb-iw320-ih240-q80.<hash>.jpg`
+- `videos/clip.mp4` → `videos/_thumbnail/clip.mp4.p1-mosaic-tr4-tc4-ts90-q80.<hash>.jpg`
 
-`<params-segment>` encodes the policy's raw _configured_ generation parameters — never a per-file
-computed/derived size — as short literal abbreviated fields: `p1-iw<imageWidth>-ih<imageHeight>-
-q<jpegQuality>` for an image policy, `p1-tr<tileRowCount>-tc<tileColumnCount>-ts<tileSize>-
-q<jpegQuality>` for a video policy. The `p1` prefix is a format version, not a real per-policy field —
-it exists so a future incompatible change to this segment's own shape can be told apart from today's
-instead of silently misparsed. This is why a policy config change (jpeg quality, image box, tile size)
-now correctly triggers regeneration even when the original file's own content hash hasn't changed at
-all: before this segment existed, a filename was keyed only on content hash, so an edited policy left
-every existing thumbnail looking falsely up to date forever, with no separate staleness-detection
-mechanism needed to catch it — the existing orphan-reconciliation logic (see "One shared scan, three
-modes" below) already treats a filename mismatch as "not up to date," for free.
+(assuming policies named `thumb` and `mosaic` respectively — see below.)
+
+`<params-segment>` encodes the policy's own `name` followed by its raw _configured_ generation
+parameters — never a per-file computed/derived size — as short literal abbreviated fields:
+`p1-<name>-iw<imageWidth>-ih<imageHeight>-q<jpegQuality>` for an image policy,
+`p1-<name>-tr<tileRowCount>-tc<tileColumnCount>-ts<tileSize>-q<jpegQuality>` for a video policy. The `p1`
+prefix is a format version, not a real per-policy field — it exists so a future incompatible change to
+this segment's own shape can be told apart from today's instead of silently misparsed.
+
+The name is _why_ more than one matching `generate` policy for the same original never collides on disk
+— two different policies, whatever their own fields, always produce two different segments as long as
+their names differ (which the table's own `UNIQUE` constraint guarantees). It also doubles as the
+identity reconciliation itself keys on: when deciding whether an existing file is _this_ policy's own
+previous output (safe to delete-and-regenerate) versus some other policy's output or a genuine orphan,
+`parseThumbnailEntry` extracts just the name token (`paramsSegment.split("-")[1]`, since the segment's
+shape is always `p1-<name>-<field><num>...` by construction — no need to parse the rest) and compares
+that, not the whole segment string, against the currently-resolved policy's own name. Matching by name
+alone (not the full segment) is what lets an ordinary config edit — jpeg quality, image box, tile size —
+still read as a regeneration of the _same_ thumbnail rather than a new one, while a full-segment
+comparison is still what "up to date" itself means (see "One shared scan, three modes" below): a config
+edit changes the segment, so the old file no longer satisfies the stricter up-to-date check even though
+it's still recognized as this policy's own prior output.
 
 A literal encoding was a deliberate choice over hashing the parameters together: worked the actual byte
-budget rather than guessing — worst case (`p1-tr9999-tc9999-ts65535-q100`, 29 bytes) still leaves well
-over a hundred spare bytes of the 255-byte-per-path-component limit even after the content hash (64 hex
-chars) and extension, so length was never close to binding. A hash-of-params scheme would only reclaim
-~13 of those spare bytes, while costing the thing this naming scheme is _for_: a human being able to
-`ls _thumbnail/` and read off exactly what config produced a file, no database cross-reference needed.
+budget rather than guessing — worst case (`p1-somepolicyname-tr9999-tc9999-ts65535-q100`) still leaves
+plenty of the 255-byte-per-path-component limit spare even after the content hash (64 hex chars) and
+extension, so length was never close to binding. A human being able to `ls _thumbnail/` and read off
+exactly which policy, and what config, produced a file — no database cross-reference needed — is worth
+far more than the handful of bytes a hash-of-params scheme would reclaim.
 
 For an image, `<thumb-ext>` is normally the original's own extension, verbatim (`.jpg` stays `.jpg`,
 `.png` stays `.png`) — except for a source mime type ImageMagick can read but not write at all (currently
@@ -167,18 +194,25 @@ discriminated union at the type level, so a stub decision is structurally imposs
 generation code path.
 
 Once the walk (and its dispatched classification jobs) fully settles, every candidate is reconciled
-against the collected existing-thumbnail map into:
+against the collected existing-thumbnail map. A "both"/real candidate reconciles **once per matching
+`generate` policy**, independently — an original matching two policies is decided twice, against the
+same `existing` list, each decision keyed by that one policy's own name (see "Naming convention" above):
 
-- **up to date** — an existing thumbnail's embedded hash _and_ params segment both match the original's
-  current `cache.db` hash and its resolved policy's current configuration.
-- **to generate** — no existing thumbnail at all (and the original is a real file, not a stub).
-- **to regenerate** — an existing thumbnail's embedded hash or params segment is stale (and, again, a
-  real file, not a stub — for a stub this is `stale_stub_previews` instead, see "Stubbed originals").
-- **to delete** — a `skip`-matched original still has an existing thumbnail, _or_ an existing thumbnail's
-  original no longer matches any policy at all, _or_ its original was deleted/renamed, _or_ it simply fell
-  outside this run's own `--glob` (a narrower `--glob` than usual will flag out-of-scope-but-visited
-  thumbnails as orphans — a deliberate, documented consequence of scoping by directory, not a bug), _or_
-  it's a genuine leftover duplicate alongside a stub's preserved or up-to-date match.
+- **up to date** — an existing thumbnail's embedded hash _and_ whole params segment both match this
+  policy's current configuration.
+- **to generate** — no existing file names this policy at all (and the original is a real file, not a
+  stub).
+- **to regenerate** — an existing file names this same policy (by name) but its embedded hash or the
+  rest of its params segment is stale (and, again, a real file, not a stub — for a stub this is
+  `stale_stub_previews` instead, see "Stubbed originals").
+- **to delete** — after every matching policy has claimed its own up-to-date or stale match, anything
+  left over in `existing` is unclaimed: a `skip`-matched original's entire existing set (every matching
+  `generate` row is suppressed at once, so nothing is ever claimed for a skip-matched original), _or_ an
+  existing thumbnail naming a policy that no longer matches this original at all (deleted, renamed, or
+  its glob/mime-type edited away), _or_ its original was deleted/renamed, _or_ it simply fell outside
+  this run's own `--glob` (a narrower `--glob` than usual will flag out-of-scope-but-visited thumbnails
+  as orphans — a deliberate, documented consequence of scoping by directory, not a bug), _or_ it's a
+  genuine leftover duplicate alongside a stub's preserved or up-to-date match.
 - **stubbed original / stubbed preserved / stale stub previews** — see "Stubbed originals" above; a stub
   is never a to-generate/to-regenerate candidate.
 

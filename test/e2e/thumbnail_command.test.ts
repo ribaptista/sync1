@@ -70,6 +70,8 @@ describe("thumbnail command", () => {
         "generate",
         "--root",
         root,
+        "--name",
+        "img",
         "--mime-types",
         "image/jpeg",
         "--media-type",
@@ -103,7 +105,7 @@ describe("thumbnail command", () => {
 
     const thumbnailFiles = fs.readdirSync(path.join(root, "_thumbnail"));
     expect(thumbnailFiles).toHaveLength(1);
-    expect(thumbnailFiles[0]).toMatch(/^photo\.jpg\.p1-iw16-ih16-q80\.[0-9a-f]+\.jpg$/);
+    expect(thumbnailFiles[0]).toMatch(/^photo\.jpg\.p1-img-iw16-ih16-q80\.[0-9a-f]+\.jpg$/);
 
     const cleanup1 = await runCli(["thumbnail", "cleanup", "--root", root, "--json"]);
     expect(cleanup1.exitCode).toBe(0);
@@ -150,6 +152,8 @@ describe("thumbnail command", () => {
         "generate",
         "--root",
         root,
+        "--name",
+        "img",
         "--mime-types",
         "image/jpeg",
         "--media-type",

@@ -711,22 +711,22 @@ describe("StoragePoliciesRepository (state.db)", () => {
 });
 
 const IMAGE_GENERATE_INPUT = {
+  name: "img_thumb",
   glob: "**/*.jpg",
   action: "generate" as const,
   mediaType: "image" as const,
   mimeTypes: ["image/jpeg"],
-  priority: 0,
   imageWidth: 320,
   imageHeight: 240,
   jpegQuality: 80,
 };
 
 const VIDEO_GENERATE_INPUT = {
+  name: "vid_thumb",
   glob: "**/*.mp4",
   action: "generate" as const,
   mediaType: "video" as const,
   mimeTypes: ["video/mp4"],
-  priority: 0,
   tileRowCount: 4,
   tileColumnCount: 4,
   tileSize: 90,
@@ -734,6 +734,7 @@ const VIDEO_GENERATE_INPUT = {
 };
 
 const SKIP_INPUT = {
+  name: "skip_private",
   glob: "private/**",
   action: "skip" as const,
   mimeTypes: ["image/*", "video/*"],
@@ -761,10 +762,10 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     // video keys to list.
     expect(repo.get(generateId)).toEqual({
       id: generateId,
+      name: "img_thumb",
       glob: "**/*.jpg",
       action: "generate",
       mediaType: "image",
-      priority: 0,
       mimeTypes: ["image/jpeg"],
       imageWidth: 320,
       imageHeight: 240,
@@ -774,15 +775,15 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
 
     expect(repo.get(skipId)).toEqual({
       id: skipId,
+      name: "skip_private",
       glob: "private/**",
       action: "skip",
-      priority: null,
       mimeTypes: ["image/*", "video/*"],
       createdAt: expect.any(String) as string,
     });
 
-    expect(repo.update(generateId, { jpegQuality: 60, priority: 5 })).toBe(true);
-    expect(repo.get(generateId)).toMatchObject({ jpegQuality: 60, priority: 5 });
+    expect(repo.update(generateId, { jpegQuality: 60 })).toBe(true);
+    expect(repo.get(generateId)).toMatchObject({ jpegQuality: 60 });
     expect(repo.update(999, { jpegQuality: 60 })).toBe(false);
 
     expect(repo.delete(skipId)).toBe(true);
@@ -797,10 +798,10 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     const id = repo.create(VIDEO_GENERATE_INPUT);
     expect(repo.get(id)).toEqual({
       id,
+      name: "vid_thumb",
       glob: "**/*.mp4",
       action: "generate",
       mediaType: "video",
-      priority: 0,
       mimeTypes: ["video/mp4"],
       tileRowCount: 4,
       tileColumnCount: 4,
@@ -817,39 +818,52 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(repo.get(id)?.mimeTypes).toEqual(["video/*", "image/png", "image/jpeg"]);
   });
 
-  it("listGenerateByPriority orders by priority across both media types, listSkip returns only skip rows", () => {
+  it("rejects a duplicate name", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    const lowId = repo.create({ ...IMAGE_GENERATE_INPUT, glob: "a/*", priority: 5 });
-    const highId = repo.create({ ...VIDEO_GENERATE_INPUT, glob: "b/*", priority: 1 });
+    repo.create(SKIP_INPUT);
+    expect(() => repo.create({ ...SKIP_INPUT, glob: "other/**" })).toThrow(/UNIQUE constraint/);
+  });
+
+  it("rejects a name that isn't alphanumeric-plus-underscore, or is empty", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    expect(() => repo.create({ ...SKIP_INPUT, name: "has-a-dash" })).toThrow(/invalid policy name/);
+    expect(() => repo.create({ ...SKIP_INPUT, name: "" })).toThrow(/invalid policy name/);
+  });
+
+  it("listGenerate returns every 'generate' row regardless of media type, listSkip returns only skip rows", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const imageId = repo.create({ ...IMAGE_GENERATE_INPUT, name: "a", glob: "a/*" });
+    const videoId = repo.create({ ...VIDEO_GENERATE_INPUT, name: "b", glob: "b/*" });
     const skipId = repo.create(SKIP_INPUT);
 
-    expect(repo.listGenerateByPriority().map((r) => r.id)).toEqual([highId, lowId]);
+    expect(
+      repo
+        .listGenerate()
+        .map((r) => r.id)
+        .sort(),
+    ).toEqual([imageId, videoId].sort());
     expect(repo.listSkip().map((r) => r.id)).toEqual([skipId]);
   });
 
-  it("rejects a 'skip' policy that sets a priority or any generate field", () => {
+  it("rejects a 'skip' policy that sets a generate field", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    // Neither combination type-checks as a real ThumbnailPolicyCreateInput
-    // any more (the skip variant structurally has no such fields) -- the
-    // cast exercises the same runtime guard a non-TS caller could still
-    // trip, matching this repository's existing "friendly error ahead of
-    // the DB's own CHECK" philosophy.
-    expect(() =>
-      repo.create({ ...SKIP_INPUT, priority: 1 } as unknown as ThumbnailPolicyCreateInput),
-    ).toThrow(/priority/);
+    // Doesn't type-check as a real ThumbnailPolicyCreateInput any more
+    // (the skip variant structurally has no such field) -- the cast
+    // exercises the same runtime guard a non-TS caller could still trip,
+    // matching this repository's existing "friendly error ahead of the
+    // DB's own CHECK" philosophy.
     expect(() =>
       repo.create({ ...SKIP_INPUT, jpegQuality: 80 } as unknown as ThumbnailPolicyCreateInput),
     ).toThrow(/jpegQuality/);
   });
 
-  it("rejects a 'generate' policy missing a priority or any of its own type's fields", () => {
+  it("rejects a 'generate' policy missing any of its own type's fields", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    const { priority: _priority, ...withoutPriority } = IMAGE_GENERATE_INPUT;
-    expect(() => repo.create(withoutPriority)).toThrow(/priority/);
-
     const { jpegQuality: _jpegQuality, ...withoutQuality } = IMAGE_GENERATE_INPUT;
     expect(() => repo.create(withoutQuality as unknown as ThumbnailPolicyCreateInput)).toThrow(
       /jpegQuality/,
@@ -924,9 +938,9 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(repo.update(generateId, { action: "skip" })).toBe(true);
     expect(repo.get(generateId)).toEqual({
       id: generateId,
+      name: "img_thumb",
       glob: "**/*.jpg",
       action: "skip",
-      priority: null,
       mimeTypes: ["image/jpeg"],
       createdAt: expect.any(String) as string,
     });
@@ -935,14 +949,13 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     // Switching skip -> generate without supplying the newly-required fields
     // in the same call fails -- nothing carries over from the skip row's
     // (all-null) generate fields.
-    expect(() =>
-      repo.update(skipId, { action: "generate", mediaType: "image", priority: 0 }),
-    ).toThrow(/imageWidth/);
+    expect(() => repo.update(skipId, { action: "generate", mediaType: "image" })).toThrow(
+      /imageWidth/,
+    );
     expect(
       repo.update(skipId, {
         action: "generate",
         mediaType: "image",
-        priority: 0,
         mimeTypes: ["image/jpeg"], // must be resupplied -- the skip row's own mix of image/video types no longer matches 'image'
         imageWidth: 100,
         imageHeight: 100,
@@ -952,20 +965,19 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(repo.get(skipId)).toMatchObject({
       action: "generate",
       mediaType: "image",
-      priority: 0,
       imageWidth: 100,
     });
   });
 
-  it("update() switching image<->video drops the losing type's fields but carries jpegQuality and priority", () => {
+  it("update() switching image<->video drops the losing type's fields but carries jpegQuality", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
     const id = repo.create({
+      name: "swap",
       glob: "**/*.jpg",
       action: "generate",
       mediaType: "image",
       mimeTypes: ["image/jpeg"],
-      priority: 2,
       imageWidth: 320,
       imageHeight: 240,
       jpegQuality: 85,
@@ -978,8 +990,8 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     );
 
     // image -> video: imageWidth/imageHeight are dropped (not part of the
-    // video shape at all); jpegQuality (85) and priority (2) both carry
-    // over untouched, since neither is overridden here.
+    // video shape at all); jpegQuality (85) carries over untouched, since
+    // it's never overridden here.
     expect(
       repo.update(id, {
         mediaType: "video",
@@ -991,10 +1003,10 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     ).toBe(true);
     expect(repo.get(id)).toEqual({
       id,
+      name: "swap",
       glob: "**/*.jpg",
       action: "generate",
       mediaType: "video",
-      priority: 2,
       mimeTypes: ["video/mp4"],
       tileRowCount: 3,
       tileColumnCount: 5,
@@ -1004,8 +1016,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     });
 
     // video -> image, in the same call overriding jpegQuality this time --
-    // the override wins over the carry, tile fields are dropped, priority
-    // still carries since it was never touched.
+    // the override wins over the carry, tile fields are dropped.
     expect(
       repo.update(id, {
         mediaType: "image",
@@ -1017,10 +1028,10 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     ).toBe(true);
     expect(repo.get(id)).toEqual({
       id,
+      name: "swap",
       glob: "**/*.jpg",
       action: "generate",
       mediaType: "image",
-      priority: 2,
       mimeTypes: ["image/png"],
       imageWidth: 50,
       imageHeight: 60,

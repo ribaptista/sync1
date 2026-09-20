@@ -70,10 +70,10 @@ function writeStub(relativePath: string, hash: string): void {
 }
 
 const GENERATE_JPEG = {
+  name: "img",
   action: "generate",
   mediaType: "image",
   mimeTypes: ["image/jpeg"],
-  priority: 0,
   imageWidth: 320,
   imageHeight: 240,
   jpegQuality: 80,
@@ -84,17 +84,17 @@ function createGeneratePolicy(glob: string, overrides: Partial<typeof GENERATE_J
 }
 
 // Matches expectedParamsSegment's own encoding for GENERATE_JPEG's default
-// fields (imageWidth 320, imageHeight 240, jpegQuality 80) and for the
-// video policy created directly in the mosaic test below (tileRowCount 3,
-// tileColumnCount 3, tileSize 48, jpegQuality 80) -- every thumbnail
-// filename asserted against in this file now carries one of these two
-// segments, since parseThumbnailEntry requires a shape-valid params
-// segment to recognize a thumbnail file at all.
-const IMAGE_PARAMS = "p1-iw320-ih240-q80";
-const VIDEO_PARAMS = "p1-tr3-tc3-ts48-q80";
+// name+fields ("img"; imageWidth 320, imageHeight 240, jpegQuality 80) and
+// for the video policy created directly in the mosaic test below ("vid";
+// tileRowCount 3, tileColumnCount 3, tileSize 48, jpegQuality 80) -- every
+// thumbnail filename asserted against in this file now carries one of
+// these two segments, since parseThumbnailEntry requires a shape-valid
+// params segment to recognize a thumbnail file at all.
+const IMAGE_PARAMS = "p1-img-iw320-ih240-q80";
+const VIDEO_PARAMS = "p1-vid-tr3-tc3-ts48-q80";
 
-function createSkipPolicy(glob: string, mimeTypes = ["image/jpeg"]): number {
-  return policiesRepo.create({ glob, action: "skip", mimeTypes });
+function createSkipPolicy(glob: string, mimeTypes = ["image/jpeg"], name = "skip"): number {
+  return policiesRepo.create({ name, glob, action: "skip", mimeTypes });
 }
 
 function fakeProber(entries: Record<string, ProbedMedia>): MediaProber {
@@ -271,7 +271,7 @@ describe("scanThumbnails", () => {
       fs.existsSync(path.join(root, `_thumbnail/photo.jpg.${IMAGE_PARAMS}.samehash.jpg`)),
     ).toBe(false);
     expect(
-      fs.existsSync(path.join(root, "_thumbnail/photo.jpg.p1-iw200-ih240-q80.samehash.jpg")),
+      fs.existsSync(path.join(root, "_thumbnail/photo.jpg.p1-img-iw200-ih240-q80.samehash.jpg")),
     ).toBe(true);
   });
 
@@ -316,8 +316,8 @@ describe("scanThumbnails", () => {
     ).toBe(false);
   });
 
-  it("skip beats generate even when the generate policy has the lowest priority", async () => {
-    createGeneratePolicy("secret.jpg", { priority: 0 });
+  it("skip beats generate even when a generate policy also matches", async () => {
+    createGeneratePolicy("secret.jpg");
     createSkipPolicy("secret.jpg");
     writeFile("secret.jpg");
     seedCache("secret.jpg", "abc");
@@ -330,19 +330,70 @@ describe("scanThumbnails", () => {
     expect(generator.imageCalls).toHaveLength(0);
   });
 
-  it("breaks a tie between two matching generate policies via priority (lower wins)", async () => {
-    createGeneratePolicy("*.jpg", { priority: 5, imageWidth: 999, imageHeight: 999 });
-    createGeneratePolicy("*.jpg", { priority: 1, imageWidth: 100, imageHeight: 100 });
-    writeFile("tie.jpg");
-    seedCache("tie.jpg", "abc");
+  it("every matching 'generate' policy produces its own thumbnail -- no priority, no single winner", async () => {
+    createGeneratePolicy("*.jpg", { name: "big", imageWidth: 999, imageHeight: 999 });
+    createGeneratePolicy("*.jpg", { name: "small", imageWidth: 100, imageHeight: 100 });
+    writeFile("both.jpg");
+    seedCache("both.jpg", "abc");
 
-    const prober = fakeProber({ "tie.jpg": JPEG_IMAGE });
+    const prober = fakeProber({ "both.jpg": JPEG_IMAGE });
     const generator = fakeGenerator();
-    await run("ensure", undefined, prober, generator);
+    const stats = await run("ensure", undefined, prober, generator);
 
-    expect(generator.imageCalls).toHaveLength(1);
-    // JPEG_IMAGE is 800x600 (4:3) -- contain-fit into a 100x100 box yields 100x75, not 100x100.
-    expect(generator.imageCalls[0]).toMatchObject({ width: 100, height: 75 });
+    expect(stats).toMatchObject({ toGenerate: 2, toRegenerate: 0, upToDate: 0, toDelete: 0 });
+    expect(generator.imageCalls).toHaveLength(2);
+    const byWidth = new Map(generator.imageCalls.map((c) => [c.width, c]));
+    // JPEG_IMAGE is 800x600 (4:3) -- contain-fit into each policy's own box.
+    expect(byWidth.get(999)).toMatchObject({
+      height: 749,
+      destPath: path.join(root, "_thumbnail/both.jpg.p1-big-iw999-ih999-q80.abc.jpg"),
+    });
+    expect(byWidth.get(100)).toMatchObject({
+      height: 75,
+      destPath: path.join(root, "_thumbnail/both.jpg.p1-small-iw100-ih100-q80.abc.jpg"),
+    });
+
+    // A second run finds both up to date, and deletes neither -- each
+    // policy's own output is claimed by that same policy, not treated as
+    // an extra/orphan of the other.
+    const second = await run("state", undefined, fakeProber({ "both.jpg": JPEG_IMAGE }), generator);
+    expect(second).toMatchObject({ upToDate: 2, toGenerate: 0, toDelete: 0 });
+  });
+
+  it("deleting one of two matching policies regenerates nothing and orphans only that policy's own thumbnail", async () => {
+    createGeneratePolicy("*.jpg"); // default name "img", matching IMAGE_PARAMS below
+    const dropId = createGeneratePolicy("*.jpg", {
+      name: "drop",
+      imageWidth: 100,
+      imageHeight: 100,
+    });
+    writeFile("both.jpg");
+    seedCache("both.jpg", "abc");
+
+    await run("ensure", undefined, fakeProber({ "both.jpg": JPEG_IMAGE }), fakeGenerator());
+    policiesRepo.delete(dropId);
+
+    const stats = await run(
+      "state",
+      undefined,
+      fakeProber({ "both.jpg": JPEG_IMAGE }),
+      fakeGenerator(),
+    );
+    expect(stats).toMatchObject({ upToDate: 1, toGenerate: 0, toRegenerate: 0, toDelete: 1 });
+
+    const cleanup = await run(
+      "cleanup",
+      undefined,
+      fakeProber({ "both.jpg": JPEG_IMAGE }),
+      fakeGenerator(),
+    );
+    expect(cleanup).toMatchObject({ toDelete: 1 });
+    expect(fs.existsSync(path.join(root, `_thumbnail/both.jpg.${IMAGE_PARAMS}.abc.jpg`))).toBe(
+      true,
+    ); // "keep" survives
+    expect(
+      fs.existsSync(path.join(root, "_thumbnail/both.jpg.p1-drop-iw100-ih100-q80.abc.jpg")),
+    ).toBe(false); // "drop"'s own output is swept
   });
 
   it("reports missingCacheEntry without blocking the rest of the run", async () => {
@@ -651,11 +702,11 @@ describe("scanThumbnails", () => {
 
   it("generates a video mosaic via generateVideoMosaic, sized from the matching policy's tile settings", async () => {
     policiesRepo.create({
+      name: "vid",
       glob: "*.mp4",
       action: "generate",
       mediaType: "video",
       mimeTypes: ["video/*"],
-      priority: 0,
       tileRowCount: 3,
       tileColumnCount: 3,
       tileSize: 48,
