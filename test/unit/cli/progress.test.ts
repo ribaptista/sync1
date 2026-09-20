@@ -40,16 +40,43 @@ const multibarCreateMock = vi.fn((..._createArgs: unknown[]) => {
 const multibarStopMock = vi.fn();
 const multibarRemoveMock = vi.fn();
 
-vi.mock("cli-progress", () => ({
-  MultiBar: vi.fn().mockImplementation(() => ({
-    create: multibarCreateMock,
-    stop: multibarStopMock,
-    remove: multibarRemoveMock,
-  })),
-  Presets: { shades_classic: {} },
-}));
+// formatEtaTime's own default-formatter delegation path (see progress.ts)
+// calls through Format.TimeFormat -- mocked here as a spy rather than
+// pulled in via importOriginal, which doesn't reliably re-expose a nested
+// property of a single CJS `module.exports = {...}` object literal through
+// Vitest's own module graph. A spy is also the cleaner test regardless: it
+// isolates formatEtaTime's own branch-selection logic from cli-progress's
+// internal formatting, which isn't this codebase's code to re-verify here.
+const formatTimeMock = vi.fn((t: number) => `real-formatted(${t})`);
 
-const { shouldShowProgress, createLoggerForRun, fitPath, reporterFor } =
+vi.mock("cli-progress", () => {
+  const mod = {
+    MultiBar: vi.fn().mockImplementation(() => ({
+      create: multibarCreateMock,
+      stop: multibarStopMock,
+      remove: multibarRemoveMock,
+    })),
+    Presets: { shades_classic: {} },
+    // Indirected through a plain arrow rather than the mock reference
+    // itself: vi.mock's factory runs before formatTimeMock's own `const`
+    // has executed (mock factories are hoisted above the rest of the
+    // module), so a direct reference here would hit its temporal dead
+    // zone. A wrapper defers the read until it's actually called, by
+    // which point module init has long since finished -- the same reason
+    // MultiBar's own mock above reaches for multibarCreateMock/etc. only
+    // from inside a nested callback, never directly in this object literal.
+    Format: { TimeFormat: (...args: Parameters<typeof formatTimeMock>) => formatTimeMock(...args) },
+  };
+  // Both named AND default: progress.ts now destructures off the default
+  // export (see its own comment on why), but this test file's own `import
+  // { MultiBar } from "cli-progress"` below still needs a matching named
+  // key -- the SAME object, `mod`, backs both, so `vi.mocked(MultiBar)
+  // .mockImplementation(...)` in this file's beforeEach still reaches the
+  // exact function progress.ts actually calls.
+  return { ...mod, default: mod };
+});
+
+const { shouldShowProgress, createLoggerForRun, fitPath, formatEtaTime, reporterFor } =
   await import("../../../src/cli/progress.js");
 
 describe("shouldShowProgress", () => {
@@ -554,6 +581,41 @@ describe("startProgressSession", () => {
     session.setOverallTotal(20, { final: true }); // nonsense -- would render past 100%
 
     expect(barSetTotalMock).toHaveBeenLastCalledWith(80);
+  });
+});
+
+describe("formatEtaTime", () => {
+  // Minimal fake -- the real default formatter (Format.TimeFormat, used
+  // here via importOriginal) only reads autopaddingChar off options, and
+  // every other field on cli-progress's Options is itself optional.
+  const options = {} as Parameters<typeof formatEtaTime>[1];
+
+  it("renders the 'INF' sentinel as --, not the literal string NFs", () => {
+    // cli-progress's own ETA class really does store the string 'INF' here
+    // (a divide-by-Infinity), despite formatTime's declared `t: number` --
+    // see the doc comment on formatEtaTime itself.
+    expect(formatEtaTime("INF" as unknown as number, options, 5)).toBe("--");
+  });
+
+  it("renders the 'NULL' sentinel as --, not the literal string LLs", () => {
+    expect(formatEtaTime("NULL" as unknown as number, options, 5)).toBe("--");
+  });
+
+  it("renders Infinity and NaN as --, as a defensive catch-all beyond the two known sentinels", () => {
+    expect(formatEtaTime(Infinity, options, 5)).toBe("--");
+    expect(formatEtaTime(-Infinity, options, 5)).toBe("--");
+    expect(formatEtaTime(NaN, options, 5)).toBe("--");
+  });
+
+  it("delegates any ordinary finite number to Format.TimeFormat, passing its args through unchanged", () => {
+    formatTimeMock.mockClear();
+    expect(formatEtaTime(45, options, 5)).toBe("real-formatted(45)");
+    expect(formatTimeMock).toHaveBeenLastCalledWith(45, options, 5);
+
+    // 0 is finite too -- must not be mistaken for one of the non-finite/
+    // sentinel cases the branch above short-circuits on.
+    expect(formatEtaTime(0, options, 5)).toBe("real-formatted(0)");
+    expect(formatTimeMock).toHaveBeenLastCalledWith(0, options, 5);
   });
 });
 

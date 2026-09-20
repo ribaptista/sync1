@@ -165,8 +165,13 @@ measures:
   video vs. ten 1KB text files). File counts ride along purely as custom payload tokens, cosmetic only:
 
   ```
-  ${label} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- ETA {eta_formatted} {activity}
+  ${label} |{bar}| {sizeDone}/{sizeTotal}, {filesDone}/{filesTotal} files -- ETA {eta_formatted} {activity}
   ```
+
+  Bytes lead, ahead of the file count, because they're what the bar and the ETA are actually computed
+  from — the byte pair is the bar's own legend and belongs next to it. With files first, an empty bar
+  used to read as a contradiction ("54529/54529 files, 0 B/0 B" looks simultaneously done and
+  unstarted); with bytes first, "0 B/0 B" beside an empty bar reads as exactly what it is.
 
   `{eta_formatted}` (and `{duration_formatted}`) are `cli-progress`'s own built-in tokens — the bar
   computes ETA automatically from real `total`/`current` values fed to it. An earlier iteration of this
@@ -185,19 +190,18 @@ measures:
   without needing work, and every in-flight hash's `SharedArrayBuffer` byte counter polled on its own
   100ms timer (`src/concurrency/hash-runner.ts`) — with N threads hashing concurrently, up to N more
   calls roughly every 100ms. That could shrink the buffer's captured window to single-digit
-  milliseconds, and a rate computed over a window that small is noise: a sliver with near-zero movement
-  sends the estimate toward infinity (displayed, thanks to a formatter that assumes a number, as the
-  literal mangled string `"NFs"`), and a sliver containing a burst of files finishing at once sends it
-  the other way, so `remaining/rate` rounds to `0` — `"ETA 0s"` while a run is nowhere near done.
-  Raising `etaBufferLength` doesn't fix this: the failure is driven by call _rate_, not burst size, so
-  no fixed buffer resists an arbitrary thread count, and a big enough buffer to help would also blur
-  the one place accuracy matters most — the run's final stretch, once only large files remain and the
-  true rate genuinely drops. Instead, `MultiBarBytesProgressSession` still updates its own bookkeeping
-  on every call (cheap), but throttles the push into the bar itself to once per 100ms — matched to
-  `cli-progress`'s own redraw rate, so nothing visible slows down — with three deliberate exceptions:
-  the very first flush (so the bar isn't blank and a cold-start activity label lands instantly), any
-  update carrying a new `activity` (rare by construction, so bypassing costs nothing), and `stop()`
-  (which forces one last flush before `MultiBar.stop()` re-renders each bar's current value, so a run
+  milliseconds, and a rate computed over a window that small is noise: a sliver containing a burst of
+  files finishing at once sends the estimate toward zero, so `remaining/rate` rounds to `0` —
+  `"ETA 0s"` while a run is nowhere near done. Raising `etaBufferLength` doesn't fix this: the failure
+  is driven by call _rate_, not burst size, so no fixed buffer resists an arbitrary thread count, and a
+  big enough buffer to help would also blur the one place accuracy matters most — the run's final
+  stretch, once only large files remain and the true rate genuinely drops. Instead,
+  `MultiBarBytesProgressSession` still updates its own bookkeeping on every call (cheap), but throttles
+  the push into the bar itself to once per 100ms — matched to `cli-progress`'s own redraw rate, so
+  nothing visible slows down — with three deliberate exceptions: the very first flush (so the bar isn't
+  blank and a cold-start activity label lands instantly), any update carrying a new `activity` (rare by
+  construction, so bypassing costs nothing), and `stop()` (which forces one last flush before
+  `MultiBar.stop()` re-renders each bar's current value, so a run
   never ends on a stale throttled snapshot).
 
   `{activity}` is what replaced it: a single trailing label naming the file currently being worked on,
@@ -211,6 +215,20 @@ measures:
   terminal would otherwise clip the head. The verbs are supplied by each producer, never enumerated in
   `src/cli/progress.ts` — the bar renders whatever word it is handed and knows nothing about hashing or
   S3, which is also what lets each of `sync`'s three phase bars carry its own verb.
+
+  A second, unrelated ETA failure used to show up regardless of the throttle above: the literal string
+  `"NFs"` (or, on a rarer path, `"LLs"`), rendered instead of any duration at all. Not a flooding
+  symptom — a genuine bug in `cli-progress`. When the ETA rate is structurally zero (nothing has moved
+  yet, or two updates land in the same millisecond), `ETA.calculate`
+  (`node_modules/cli-progress/lib/eta.js`) stores the _string_ sentinel `'INF'` (an `Infinity`
+  division) or `'NULL'` (a `NaN` one) rather than a number — despite the library's own types declaring
+  `formatTime`'s input as `number`. `formatTime`'s `t > 3600` / `t > 60` / `t > 10` comparisons are all
+  `false` against a string, so it falls through to `autopadding(t) + 's'` — string concatenation, not
+  formatting — which renders as `'INF'.slice(-2) + 's'` = `"NFs"`, or `'NULL'.slice(-2) + 's'` =
+  `"LLs"`. `src/cli/progress.ts`'s `formatEtaTime` wraps `cli-progress`'s own default formatter
+  (`Format.TimeFormat`), rendering both sentinels — and any other non-finite value, as a defensive
+  catch-all — as `--` instead, and is passed as `formatTime` at both `MultiBar` construction sites so
+  it applies to every bar, not just the one whose format string renders `{eta_formatted}` today.
 
 Both session types share the same **provisional-until-final** convention for totals and the same
 null-object pattern (a no-op session when bars shouldn't show, so a command's own logic never branches

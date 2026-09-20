@@ -1,6 +1,23 @@
 import fs from "node:fs";
 import pino from "pino";
-import { MultiBar, Presets, type SingleBar } from "cli-progress";
+// Default import, not named -- `Format` is a nested object literal inside
+// cli-progress's single `module.exports = {...}` (node_modules/
+// cli-progress/cli-progress.js), and cjs-module-lexer (which both Node's
+// own ESM/CJS interop and Vite/Vitest's module graph use to detect named
+// exports from a CommonJS package) only recognizes a property whose value
+// is a plain identifier -- MultiBar/Presets/Bar/SingleBar qualify, Format
+// doesn't. `import { Format } from "cli-progress"` compiles and typechecks
+// (the .d.ts declares it as a named export) but throws at runtime with
+// "does not provide an export named 'Format'" -- confirmed directly
+// against a real `node --input-type=module` run, not assumed from the
+// types. The default export is the same object either way, so
+// destructuring off it sidesteps the detection gap entirely.
+import cliProgress, { type SingleBar, type MultiBar } from "cli-progress";
+// `MultiBar` above is a type-only import (a plain identifier, so
+// cjs-module-lexer detects it fine as a value too -- but destructuring the
+// default export instead, uniformly with Format, keeps one clear rule:
+// every runtime binding from this module comes off `cliProgress` itself.
+const { MultiBar: MultiBarCtor, Presets, Format } = cliProgress;
 import prettyBytes from "pretty-bytes";
 import { createLogger, type Logger } from "../logger.js";
 import type { OnProgress, ProgressUpdate } from "../progress-types.js";
@@ -45,6 +62,36 @@ class NullProgressSession implements ProgressSession {
   stop(): void {}
 }
 
+/**
+ * cli-progress's own `formatTime` has a real bug, not merely an
+ * unfortunate default. When the ETA rate is structurally zero --
+ * nothing has moved yet, or two updates land in the same millisecond --
+ * `ETA.calculate` (node_modules/cli-progress/lib/eta.js) stores the
+ * *string* sentinel `'INF'` (an `Infinity` division) or `'NULL'` (a `NaN`
+ * one) rather than a number. `formatTime`'s own `t > 3600` / `t > 60` /
+ * `t > 10` comparisons are all `false` against a string, so it falls
+ * through to `autopadding(t) + 's'` -- string concatenation, not
+ * formatting -- which renders as the literal `NFs` (from `'INF'`.slice(-2))
+ * or `LLs` (from `'NULL'`.slice(-2)). The types cli-progress ships (`t:
+ * number`) don't admit this at all; it's a genuine runtime/type mismatch
+ * in the library, not something a `number`-typed override can be told
+ * about, hence the runtime `typeof` check below despite the declared type.
+ *
+ * Renders both sentinels, and any other non-finite value, as `--`
+ * instead; delegates to the real default formatter for every genuine
+ * number, so an ordinary ETA still formats exactly as before.
+ */
+export function formatEtaTime(
+  t: number,
+  options: Parameters<typeof Format.TimeFormat>[1],
+  roundToMultipleOf: number,
+): string {
+  // `typeof t === "string"` looks impossible against the declared `number`
+  // type -- it's not, at runtime. See the doc comment above.
+  if (typeof t === "string" || !Number.isFinite(t)) return "--";
+  return Format.TimeFormat(t, options, roundToMultipleOf);
+}
+
 class MultiBarProgressSession implements ProgressSession {
   private readonly multibar: MultiBar;
   private readonly overall: SingleBar;
@@ -55,10 +102,14 @@ class MultiBarProgressSession implements ProgressSession {
   private totalsFinal = false;
 
   constructor(overallLabel: string, overallUnit: string) {
-    this.multibar = new MultiBar(
+    this.multibar = new MultiBarCtor(
       {
         clearOnComplete: false,
         hideCursor: true,
+        // See formatEtaTime above -- this format string doesn't render
+        // {eta_formatted} today, but set globally rather than per-bar so
+        // it's never a trap for a future format string that does.
+        formatTime: formatEtaTime,
         // `{totalLabel}`, not cli-progress's built-in `{total}`: the total
         // needs a "~" prefix while it's still provisional, and only a
         // custom payload token can carry one.
@@ -243,11 +294,14 @@ class MultiBarByteBar implements BytesProgressTarget {
   // regardless of how often we call `.update()` (multi-bar.js), so pushing
   // state in faster than that buys nothing on screen while still feeding
   // that 10-sample buffer far faster than a representative rate needs --
-  // which is exactly what produced a nonsense ETA (`NFs`, or `0s` with tens
-  // of GB still left): dozens of file-discovery/-resolution events plus
-  // every in-flight hash's 100ms byte-counter poll (see hash-runner.ts) can
-  // otherwise flood all 10 samples within a handful of milliseconds, so the
-  // "recent rate" computed over that sliver is essentially noise.
+  // which is exactly what produced a premature "0s" with tens of GB still
+  // left: dozens of file-discovery/-resolution events plus every in-flight
+  // hash's 100ms byte-counter poll (see hash-runner.ts) can otherwise flood
+  // all 10 samples within a handful of milliseconds, so the "recent rate"
+  // computed over that sliver is essentially noise. A separate, structural
+  // bug -- not fixed by this throttle, since the rate is genuinely zero
+  // rather than merely noisy -- produced the literal string `NFs`; see
+  // `formatEtaTime` above.
   private static readonly FLUSH_INTERVAL_MS = 100;
   // `null`, not `0`, so "never flushed yet" can't be confused with "flushed
   // at Date.now() === 0" (a frozen/fake clock in a test, say).
@@ -263,7 +317,16 @@ class MultiBarByteBar implements BytesProgressTarget {
       // `{filesTotal}`/`{sizeTotal}` carry their own: cli-progress
       // computes `{eta_formatted}` internally, so the marker has to sit
       // beside it rather than inside it.
-      format: `${label} |{bar}| {filesDone}/{filesTotal} files, {sizeDone}/{sizeTotal} -- {etaPrefix}ETA {eta_formatted} {activity}`,
+      //
+      // Bytes come first, ahead of the file count: the bar's fill and its
+      // ETA are both computed from bytes alone (nothing else drives
+      // `.update()`'s value), so the byte pair is the bar's own legend and
+      // belongs adjacent to it. With files first, an empty bar read as a
+      // contradiction -- "54529/54529 files, 0 B/0 B" looks like it's
+      // simultaneously done and not started. With bytes first, "0 B/0 B"
+      // beside an empty bar reads as exactly what it is: nothing needed
+      // transferring. Same payload keys, same values, just reordered.
+      format: `${label} |{bar}| {sizeDone}/{sizeTotal}, {filesDone}/{filesTotal} files -- {etaPrefix}ETA {eta_formatted} {activity}`,
     });
     this.flush(true);
   }
@@ -376,8 +439,10 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
   private ownBar: MultiBarByteBar | undefined;
 
   constructor(private readonly overallLabel: string) {
-    this.multibar = new MultiBar(
-      { clearOnComplete: false, hideCursor: true },
+    this.multibar = new MultiBarCtor(
+      // formatTime: formatEtaTime -- see its own doc comment above. This is
+      // the session whose format string actually renders {eta_formatted}.
+      { clearOnComplete: false, hideCursor: true, formatTime: formatEtaTime },
       Presets.shades_classic,
     );
   }
