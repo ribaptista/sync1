@@ -334,49 +334,104 @@ export async function applyLocalChangesToCandidate(
         // the single-PUT path, so it would buy accuracy for large files by
         // giving up on small ones entirely.
         const key = objectKey(hash);
-        // The retriable unit is the whole read-encrypt-PUT, not just the
-        // PUT: a Readable that has already errored can't be replayed, so
-        // each attempt opens a fresh one. The DB upserts below stay outside
-        // it -- a retry re-sends bytes, it doesn't re-run bookkeeping.
-        //
-        // A retried attempt re-reads from byte zero, so `onRetry` hands the
-        // abandoned partial back via fileTracker.retrying(): the bar rewinds
-        // to the last state actually committed to S3, which is exactly what
-        // the next attempt has to re-earn. Leaving it in place would have
-        // the new attempt's advance() calls pile onto bytes that no longer
-        // exist anywhere.
-        // Set by the upload below; declared out here so the DB write that
-        // follows can record it.
+
+        // Only the transfer itself -- withS3Retry's whole read-encrypt-PUT
+        // -- is treated as a recoverable, leave-it-dirty-and-move-on
+        // failure. Deliberately its own inner try/catch, not folded into
+        // one big catch around this whole job: a failure in the DB writes
+        // below (objectsRepo/entriesRepo) is a fundamentally different,
+        // more serious problem -- evidence the candidate DB itself is
+        // broken, not that one file's content didn't make it to S3 -- and
+        // must not be silently swallowed the same way. Left to propagate
+        // out of this whole dispatched job uncaught, it's exactly what the
+        // stream pool's own error capture exists to catch properly.
         let ciphertextChecksum: string | undefined;
-        await withS3Retry(
-          async () => {
-            const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
-              fileTracker.advance(n),
-            );
-            const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
-            ciphertextChecksum = await putObjectStream(
-              s3.client,
-              s3.bucket,
-              remoteKey(s3.location, key),
-              encryptedStream,
-              encryptedSize(size, context.length),
-            );
-          },
-          {
-            onRetry: (notice) => {
-              fileTracker.retrying(notice);
-              logger.warn(
-                {
-                  path: row.path,
-                  attempt: notice.attempt,
-                  delayMs: notice.delayMs,
-                  err: notice.error instanceof Error ? notice.error.message : String(notice.error),
-                },
-                "transient S3 failure while uploading -- retrying",
+        let uploadSucceeded = false;
+        try {
+          // The retriable unit is the whole read-encrypt-PUT, not just the
+          // PUT: a Readable that has already errored can't be replayed, so
+          // each attempt opens a fresh one. The DB upserts below stay
+          // outside it -- a retry re-sends bytes, it doesn't re-run
+          // bookkeeping.
+          //
+          // A retried attempt re-reads from byte zero, so `onRetry` hands
+          // the abandoned partial back via fileTracker.retrying(): the bar
+          // rewinds to the last state actually committed to S3, which is
+          // exactly what the next attempt has to re-earn. Leaving it in
+          // place would have the new attempt's advance() calls pile onto
+          // bytes that no longer exist anywhere.
+          await withS3Retry(
+            async () => {
+              const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
+                fileTracker.advance(n),
+              );
+              const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
+              ciphertextChecksum = await putObjectStream(
+                s3.client,
+                s3.bucket,
+                remoteKey(s3.location, key),
+                encryptedStream,
+                encryptedSize(size, context.length),
               );
             },
-          },
-        );
+            {
+              onRetry: (notice) => {
+                fileTracker.retrying(notice);
+                logger.warn(
+                  {
+                    path: row.path,
+                    attempt: notice.attempt,
+                    delayMs: notice.delayMs,
+                    err:
+                      notice.error instanceof Error ? notice.error.message : String(notice.error),
+                  },
+                  "transient S3 failure while uploading -- retrying",
+                );
+              },
+            },
+          );
+          uploadSucceeded = true;
+        } catch (err) {
+          // Deliberately NOT reported as applied: handledPaths/
+          // appliedCount/entriesRepo are never touched below when this
+          // flag stays false, so every row riding on this job -- the
+          // dispatcher and every dedup attach alike -- stays dirty in
+          // cache.db, exactly as if this run had never touched it.
+          // abort() (not finish()) is what keeps the bar honest: this
+          // file's bytes never actually reached S3, so they must not be
+          // counted as transferred.
+          //
+          // Also removed from inFlightByHash here, not just on success:
+          // the main loop can race ahead of this job settling (it awaits
+          // waitForRoom between rows), so a later row sharing this hash
+          // could otherwise attach to a job that has already failed and
+          // will never revisit job.sourceRows again -- silently losing
+          // that row instead of starting a fresh upload attempt for it.
+          fileTracker.abort();
+          inFlightByHash.delete(hash);
+          // Swallowed here, deliberately: every row riding on this job
+          // stays dirty (see above) and the run continues, rather than
+          // the whole process dying on an unhandled rejection the way an
+          // uncaught failure would -- letting a bulk sync lose every
+          // OTHER file's progress over one bad one would be a worse
+          // outcome than a clean per-file failure. Surfacing this
+          // properly to the command's own exit code/output (today it's
+          // silent beyond this log line) is the next fix, not this one --
+          // this catch exists to make that fix safe to add, by
+          // guaranteeing a swallowed failure can never be mistaken for a
+          // success.
+          logger.warn(
+            {
+              paths: job.sourceRows.map((r) => r.path),
+              hash,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            "upload failed -- row(s) left dirty, will retry on the next sync",
+          );
+        }
+
+        if (!uploadSucceeded) return;
+
         objectsRepo.upsert({
           hash,
           s3_key: key,
@@ -389,12 +444,9 @@ export async function applyLocalChangesToCandidate(
         // can have grown since dispatch, above) -- is only now genuinely
         // applied: handledPaths/appliedCount are recorded here, at the
         // point of actual success, not back when the row was merely
-        // decided. A row that never gets here (the catch block below)
-        // stays out of both, so it stays dirty in cache.db instead of
-        // being wrongly reconciled to 'unchanged'. sourceRows[0] is
-        // always the row that dispatched this job -- its own content
-        // upload, not a dedup hit -- everything after it attached to a
-        // job someone else already started.
+        // decided. sourceRows[0] is always the row that dispatched this
+        // job -- its own content upload, not a dedup hit -- everything
+        // after it attached to a job someone else already started.
         for (let i = 0; i < job.sourceRows.length; i++) {
           const sourceRow = job.sourceRows[i]!;
           if (i > 0) dedupedObjects++;
@@ -408,47 +460,12 @@ export async function applyLocalChangesToCandidate(
           });
         }
         inFlightByHash.delete(hash);
-        // Success only, per FileTracker's own contract -- abort() below is
+        // Success only, per FileTracker's own contract -- abort() above is
         // the failure counterpart, and the two are mutually exclusive.
         fileTracker.finish();
         logger.debug(
           { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
           "completed",
-        );
-      } catch (err) {
-        // Deliberately NOT reported as applied: handledPaths/appliedCount/
-        // entriesRepo were never touched above for any row riding on this
-        // job, so every one of them -- the dispatcher and every dedup
-        // attach alike -- stays dirty in cache.db, exactly as if this run
-        // had never touched it. abort() (not finish()) is what keeps the
-        // bar honest: this file's bytes never actually reached S3, so
-        // they must not be counted as transferred.
-        //
-        // Also removed from inFlightByHash on failure, not just success:
-        // the main loop can race ahead of this job settling (it awaits
-        // waitForRoom between rows), so a later row sharing this hash
-        // could otherwise attach to a job that has already failed and
-        // will never revisit job.sourceRows again -- silently losing that
-        // row instead of starting a fresh upload attempt for it.
-        fileTracker.abort();
-        inFlightByHash.delete(hash);
-        // Swallowed here, deliberately: every row riding on this job stays
-        // dirty (see above) and the run continues, rather than the whole
-        // process dying on an unhandled rejection the way an uncaught
-        // failure would have without this catch -- letting a bulk sync
-        // lose every OTHER file's progress over one bad one would be a
-        // worse outcome than a clean per-file failure. Surfacing this
-        // properly to the command's own exit code/output (today it's
-        // silent beyond this log line) is the next fix, not this one --
-        // this catch exists to make that fix safe to add, by guaranteeing
-        // a swallowed failure can never be mistaken for a success.
-        logger.warn(
-          {
-            paths: job.sourceRows.map((r) => r.path),
-            hash,
-            err: err instanceof Error ? err.message : String(err),
-          },
-          "upload failed -- row(s) left dirty, will retry on the next sync",
         );
       } finally {
         // Unconditional regardless of outcome, matching filesDone's own
