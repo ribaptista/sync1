@@ -19,6 +19,7 @@ import { reconcileCacheAfterCommit } from "./reconcile-cache.js";
 import { generateVersionStamp } from "../vault/version-stamp.js";
 import { encryptBuffer, decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { getObject, putObject, putObjectCas, CasConflictError } from "../s3/client.js";
+import { withS3Retry, type RetryNotice } from "../s3/retry.js";
 import {
   remoteKey,
   stateSnapshotKey,
@@ -72,6 +73,25 @@ export class RemoteDivergedError extends Error {
     );
     this.name = "RemoteDivergedError";
   }
+}
+
+/**
+ * `onRetry` for the S3 calls that bracket a run rather than move a file's
+ * bytes. Unlike the transfer paths, these have no `FileTracker` and no bar
+ * of their own to write into, so the log is the only place a retry can
+ * surface -- and `createLoggerForRun` sends it to fd 3, clear of the bars.
+ */
+function retryLogger(logger: Logger, what: string): (notice: RetryNotice) => void {
+  return (notice) => {
+    logger.warn(
+      {
+        attempt: notice.attempt,
+        delayMs: notice.delayMs,
+        err: notice.error instanceof Error ? notice.error.message : String(notice.error),
+      },
+      `transient S3 failure ${what} -- retrying`,
+    );
+  };
 }
 
 /** Yields every row from `rows` unchanged, while also recording its path into `sink` as a side effect. */
@@ -210,7 +230,15 @@ export async function performSync(
     const dirtyCount = cacheRepo.countDirty();
 
     const currentKey = remoteKey(s3.location, CURRENT_POINTER_KEY);
-    const current = await getObject(s3.client, s3.bucket, currentKey);
+    // Retried like the transfers are: these metadata requests are small but
+    // they bracket the expensive part of a run, and losing a completed
+    // 700 GB upload to a blip on the /current fetch is the worst version of
+    // the bug this whole item exists to fix. Safe to retry unconditionally
+    // because every one of them is idempotent -- two pure reads, and a PUT
+    // of identical bytes to a key derived from this run's own version stamp.
+    const current = await withS3Retry(() => getObject(s3.client, s3.bucket, currentKey), {
+      onRetry: retryLogger(logger, "fetching the /current pointer"),
+    });
     if (!current) throw new CorruptionError("vault has no /current pointer (corrupt vault?)");
     const remoteVersionStamp = current.body.toString("utf8");
     const remoteHasMoved = remoteVersionStamp !== lastSyncedVersion;
@@ -234,10 +262,14 @@ export async function performSync(
     let remoteFreshPath = localStateDbPath(root);
     let remoteFreshIsTemp = false;
     if (remoteHasMoved) {
-      const snapshot = await getObject(
-        s3.client,
-        s3.bucket,
-        remoteKey(s3.location, stateSnapshotKey(remoteVersionStamp)),
+      const snapshot = await withS3Retry(
+        () =>
+          getObject(
+            s3.client,
+            s3.bucket,
+            remoteKey(s3.location, stateSnapshotKey(remoteVersionStamp)),
+          ),
+        { onRetry: retryLogger(logger, "fetching the remote state.db snapshot") },
       );
       if (!snapshot) {
         throw new CorruptionError(
@@ -362,11 +394,15 @@ export async function performSync(
       const encryptedStateDb = encryptBuffer(candidateBytes, masterKey, stateContext);
 
       logger.debug({ versionStamp }, "uploading candidate state.db snapshot");
-      await putObject(
-        s3.client,
-        s3.bucket,
-        remoteKey(s3.location, stateSnapshotKey(versionStamp)),
-        encryptedStateDb,
+      await withS3Retry(
+        () =>
+          putObject(
+            s3.client,
+            s3.bucket,
+            remoteKey(s3.location, stateSnapshotKey(versionStamp)),
+            encryptedStateDb,
+          ),
+        { onRetry: retryLogger(logger, "uploading the state.db snapshot") },
       );
 
       logger.debug({ versionStamp, ifMatch: current.etag }, "attempting CAS commit of /current");

@@ -69,13 +69,38 @@ export interface FileTracker {
    * a delta, not a running total). Clamped so this file's own partial
    * contribution never exceeds the `size` given to `startFile`: a source
    * that over-reports would otherwise push `bytesDone` past `bytesTotal`,
-   * and `finish()` would then have to *decrease* it to correct course --
-   * breaking the monotonicity the bar's rendering depends on (`bytesDone`
-   * is the one counter nothing is ever allowed to walk back; see the
-   * observed-vs-estimated split above).
+   * which is the invariant that actually matters here.
    * A no-op once `finish()` has been called.
    */
   advance(deltaBytes: number): void;
+  /**
+   * This file's transfer failed transiently and is about to be retried from
+   * the beginning: **discards the partial bytes it had accumulated** and
+   * emits a label saying so.
+   *
+   * Discarding is the honest accounting. `bytesDone` is
+   * `completedBytes + Σ in-flight partials`, so dropping this file's
+   * partial rewinds the bar to the last state actually committed to disk or
+   * to S3 -- which is exactly what a restarted transfer has to re-earn. The
+   * alternative, leaving the partial in place, would have the next
+   * attempt's `advance` calls pile on top of bytes that no longer exist
+   * anywhere, and only the clamp in `advance` would stop the file
+   * over-claiming. `bytesDone` is otherwise non-decreasing; this is the one
+   * deliberate exception, and it moves for a real reason.
+   *
+   * Carries `attempt` *and* `elapsedMs` because retries have no attempt
+   * limit (`src/s3/retry.ts`): a label that only said "retrying" would look
+   * identical after one minute and after one hour, which is how an
+   * indefinite retry becomes indistinguishable from a hang.
+   *
+   * The label is composed here even though this module is otherwise
+   * vocabulary-free (see `ActivityVerbs`): "retrying" is not a domain word
+   * the way `hashing`/`uploading` are -- every producer's retry says the
+   * same thing -- so there is nothing for a producer to name.
+   *
+   * A no-op once `finish()` has been called.
+   */
+  retrying(notice: { attempt: number; delayMs: number; elapsedMs: number }): void;
   /**
    * Moves this file's contribution from in-flight partial to completed --
    * always the full `size`, regardless of how much `advance` actually
@@ -167,6 +192,19 @@ export interface ProgressTracker {
  * reporting (or is running under `--json`/`--no-progress`, where nothing
  * renders) doesn't need to build a no-op function just to hand one in.
  */
+/**
+ * Coarse, single-unit duration for a progress label -- `4s`, `21m`, `2h05m`.
+ * Rounded up so a sub-second wait reads as `1s` rather than `0s`, which
+ * would look like nothing is happening.
+ */
+function formatDuration(ms: number): string {
+  const seconds = Math.max(1, Math.ceil(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
 export function createProgressTracker(
   onProgress: OnProgress | undefined,
   verbs: ActivityVerbs,
@@ -247,6 +285,19 @@ export function createProgressTracker(
           partial += clamped;
           inFlightBytes += clamped;
           emit();
+        },
+        retrying(notice) {
+          if (finished) return;
+          // Hand back every byte this attempt had claimed. `partial` is
+          // this file's own share of inFlightBytes, so the two move
+          // together and bytesDone lands exactly where it stood before the
+          // attempt began.
+          inFlightBytes -= partial;
+          partial = 0;
+          emit({
+            verb: `retrying in ${formatDuration(notice.delayMs)} (attempt ${notice.attempt}, failing for ${formatDuration(notice.elapsedMs)})`,
+            path,
+          });
         },
         finish() {
           if (finished) return;

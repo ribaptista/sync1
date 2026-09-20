@@ -7,6 +7,7 @@ import type { Logger } from "../logger.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { getObjectStream, headObject, restoreObject } from "../s3/client.js";
+import { withS3Retry } from "../s3/retry.js";
 import { classifyArchiveStatus } from "../s3/archive-status.js";
 import { CryptoAuthError } from "../crypto/chunked-codec.js";
 import { remoteKey, type RemoteLocation } from "../vault/paths.js";
@@ -195,35 +196,63 @@ export async function materializeGlob(
           void streamPool.add(async () => {
             const fileTracker = progress.startFile(row.path, objectRow.size);
             try {
-              const encrypted = await getObjectStream(s3.client, s3.bucket, key);
-              if (!encrypted) {
-                throw new CorruptionError(`object ${hash} for "${row.path}" is missing in S3`);
-              }
+              // Same retriable unit as apply-remote-changes' download: the
+              // GET plus the decrypt-to-file, re-issued from scratch each
+              // attempt because a half-consumed body can't be resumed.
+              await withS3Retry(
+                async () => {
+                  const encrypted = await getObjectStream(s3.client, s3.bucket, key);
+                  if (!encrypted) {
+                    throw new CorruptionError(`object ${hash} for "${row.path}" is missing in S3`);
+                  }
 
-              fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-              const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
-              let computedHash: string;
-              try {
-                computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath, (n) =>
-                  fileTracker.advance(n),
-                );
-              } catch (err) {
-                if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
-                if (err instanceof CryptoAuthError) {
-                  throw new CorruptionError(
-                    `object ${hash} for "${row.path}" failed decryption/authentication`,
-                  );
-                }
-                throw err;
-              }
-              if (computedHash !== hash) {
-                fs.rmSync(tmpPath);
-                throw new CorruptionError(
-                  `object ${hash} for "${row.path}" does not match its recorded hash`,
-                );
-              }
+                  fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+                  const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+                  let computedHash: string;
+                  try {
+                    computedHash = await decryptStreamToFile(
+                      encrypted.body,
+                      masterKey,
+                      tmpPath,
+                      (n) => fileTracker.advance(n),
+                    );
+                  } catch (err) {
+                    if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
+                    if (err instanceof CryptoAuthError) {
+                      throw new CorruptionError(
+                        `object ${hash} for "${row.path}" failed decryption/authentication`,
+                      );
+                    }
+                    throw err;
+                  }
+                  if (computedHash !== hash) {
+                    fs.rmSync(tmpPath);
+                    throw new CorruptionError(
+                      `object ${hash} for "${row.path}" does not match its recorded hash`,
+                    );
+                  }
 
-              fs.renameSync(tmpPath, absolutePath); // materialize first...
+                  fs.renameSync(tmpPath, absolutePath);
+                },
+                {
+                  onRetry: (notice) => {
+                    fileTracker.retrying(notice);
+                    logger.warn(
+                      {
+                        path: row.path,
+                        attempt: notice.attempt,
+                        delayMs: notice.delayMs,
+                        err:
+                          notice.error instanceof Error
+                            ? notice.error.message
+                            : String(notice.error),
+                      },
+                      "transient S3 failure while downloading -- retrying",
+                    );
+                  },
+                },
+              );
+              // materialize first...
               fs.rmSync(stubAbsolutePath); // ...only then delete the stub
 
               cacheRepo.upsert({ ...row, mtime: Math.round(fs.statSync(absolutePath).mtimeMs) });

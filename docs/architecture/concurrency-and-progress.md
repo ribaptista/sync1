@@ -259,8 +259,43 @@ pipeline — `countingReadable` around the plaintext read for uploads, an `onByt
 worker thread for hashing (see `createHashRunner`). All three are denominated in **plaintext** bytes so
 they sum to exactly the size the tracker was opened with; ciphertext byte counts run larger and would
 overrun the declared total. A file's partial contribution is clamped to its own size and `finish()` is
-idempotent and called from a `finally`, which together keep `bytesDone` monotonic — the one counter
-nothing is ever allowed to walk back, since it's what the bar's fill is drawn from.
+idempotent and called from a `finally`, which together keep `bytesDone` non-decreasing.
+
+There is exactly one deliberate exception, and it earns it: `FileTracker.retrying()`. When a transfer
+fails transiently and is about to restart from byte zero (see **Retrying transient S3 failures**
+below), it hands that file's accumulated partial back, so `bytesDone` rewinds to what is actually
+committed — which is precisely what the next attempt has to re-earn. Leaving the partial in place
+would have the retry's `advance` calls pile onto bytes that no longer exist anywhere, with only the
+clamp stopping the file over-claiming. The invariant that actually matters is
+`bytesDone <= bytesTotal`, and a rewind can't violate it.
+
+## Retrying transient S3 failures
+
+Every S3 request that moves real work goes through `withS3Retry` (`src/s3/retry.ts`): jittered
+exponential backoff, capped at `MAX_DELAY_MS`, **with no attempt limit**. For a backup tool that is
+the right default — an upload that dies six hours in because the uplink blipped is worse than one
+that waits out the outage — but it shifts weight onto three things:
+
+- **The delay cap is load-bearing**, not a nicety: with no ceiling on attempts it is the only thing
+  bounding the wait.
+- **Ctrl+C is the escape hatch.** `handleTerminationSignal` force-releases the lock and exits
+  immediately, so a user who decides an outage isn't ending can always stop.
+- **Visibility is the only signal.** An indefinite retry loop looks identical at minute one and
+  minute sixty, so the progress label carries both the attempt count and the elapsed time —
+  `retrying in 30s (attempt 47, failing for 21m)` — and every retry logs the underlying error to
+  fd 3, clear of the bars.
+
+What is _not_ retried matters as much: anything outside the transient classification throws on its
+first occurrence, including `CasConflictError` (which has its own retry loops with their own
+semantics) and `CorruptionError` (a truncated download that hashes wrong must never be mistaken for
+a flaky link). `ECONNREFUSED` is deliberately absent from the transient list while `ENOTFOUND` is on
+it — "resolved but nothing listening" is usually a wrong endpoint, while a DNS failure is the classic
+dropped-link symptom.
+
+The retriable unit is always the whole request _including_ building its body: a `Readable` that has
+already errored cannot be replayed, so an upload opens a fresh read stream on each attempt and a
+download re-issues its GET and writes to a fresh temp path. DB writes and progress bookkeeping stay
+outside the retried closure — a retry re-sends bytes, it does not re-run bookkeeping.
 
 ## Enumeration vs. execution
 

@@ -11,17 +11,24 @@ import { VersionsRepository } from "../../../src/db/repositories/versions-reposi
 import { hashBufferHex } from "../../../src/crypto/hash.js";
 import type { ProgressUpdate } from "../../../src/progress-types.js";
 
+// Drains the body stream, same as a real S3 client would -- otherwise the
+// encrypt pipeline never finishes flowing, and the source file read can race
+// past a test's own cleanup. Reinstated in every beforeEach below, because
+// mockClear() forgets recorded calls but keeps whatever implementation a
+// previous test installed (the retry test installs a failing one).
+async function drainBody(
+  _client: unknown,
+  _bucket: unknown,
+  _key: unknown,
+  body: AsyncIterable<unknown>,
+): Promise<void> {
+  for await (const _chunk of body) {
+    // draining is the point
+  }
+}
+
 vi.mock("../../../src/s3/client.js", () => ({
-  // Drains the body stream, same as a real S3 client would -- otherwise the
-  // encrypt pipeline never finishes flowing, and the source file read can
-  // race past this test's own cleanup.
-  putObjectStream: vi.fn(
-    async (_client: unknown, _bucket: unknown, _key: unknown, body: AsyncIterable<unknown>) => {
-      for await (const _chunk of body) {
-        // draining is the point
-      }
-    },
-  ),
+  putObjectStream: vi.fn(),
 }));
 
 const { applyLocalChangesToCandidate } = await import("../../../src/sync/apply-local-changes.js");
@@ -275,7 +282,8 @@ describe("applyLocalChangesToCandidate: same-batch dedup and collision (Pass 2)"
 
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-test-"));
-    putObjectStreamMock.mockClear();
+    putObjectStreamMock.mockReset();
+    putObjectStreamMock.mockImplementation(drainBody);
   });
 
   afterEach(() => {
@@ -398,7 +406,8 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
 
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-progress-test-"));
-    putObjectStreamMock.mockClear();
+    putObjectStreamMock.mockReset();
+    putObjectStreamMock.mockImplementation(drainBody);
   });
 
   afterEach(() => {
@@ -573,6 +582,79 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     // yet resolved, because rowDiscovered() and rowResolved() are always
     // two separate calls (see progress-types.ts's createProgressTracker).
     expect(updates.some((u) => u.filesTotal > u.filesDone)).toBe(true);
+
+    candidateDb.close();
+  });
+
+  it("retries a transient upload failure, rewinding the bar rather than double-counting", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "a".repeat(400);
+    touch("a.txt", content);
+
+    // Fails the first attempt with a socket reset after the body has been
+    // partly read, then succeeds. The partial read is what makes the rewind
+    // observable: without it the first attempt would contribute nothing.
+    let attempts = 0;
+    putObjectStreamMock.mockImplementation(
+      async (_client: unknown, _bucket: unknown, _key: unknown, body: AsyncIterable<unknown>) => {
+        attempts++;
+        if (attempts === 1) {
+          for await (const _chunk of body) break; // consume one chunk, then die
+          throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+        }
+        for await (const _chunk of body) {
+          // draining is the point
+        }
+      },
+    );
+
+    const updates: ProgressUpdate[] = [];
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [
+        {
+          path: "a.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash: hashBufferHex(Buffer.from(content)),
+          size: content.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+      ],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      (u) => updates.push({ ...u }),
+    );
+
+    // The run completed rather than dying on the reset -- the whole point.
+    expect(attempts).toBe(2);
+    expect(result.uploadedObjects).toBe(1);
+    expect(result.conflicts).toEqual([]);
+
+    // The retry announced itself on the bar, naming the attempt so an
+    // unlimited retry can't be mistaken for a hang.
+    const retryUpdate = updates.find((u) => u.activity?.verb.startsWith("retrying"));
+    expect(retryUpdate?.activity?.path).toBe("a.txt");
+    expect(retryUpdate?.activity?.verb).toMatch(/^retrying in \d+s \(attempt 1, failing for \d/);
+    // ...and it rewound to what was actually committed, which at that point
+    // was nothing at all.
+    expect(retryUpdate?.bytesDone).toBe(0);
+
+    // No double counting: the file lands on exactly its own size despite
+    // having been read twice.
+    expect(updates.at(-1)).toMatchObject({
+      bytesDone: content.length,
+      bytesTotal: content.length,
+      filesDone: 1,
+      filesTotal: 1,
+    });
 
     candidateDb.close();
   });

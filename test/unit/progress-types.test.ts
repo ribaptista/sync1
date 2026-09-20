@@ -282,6 +282,65 @@ describe("createProgressTracker", () => {
     expect(updates.at(-1)).toMatchObject({ filesTotal: 8, bytesTotal: 800, totalsFinal: true });
   });
 
+  it("retrying() hands back the abandoned partial, rewinding bytesDone to what is actually committed", () => {
+    const updates: { bytesDone: number; activity?: { verb: string; path: string } | undefined }[] =
+      [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["uploading", "uploaded"]);
+
+    tracker.expectBytes(100);
+    tracker.expectBytes(100);
+    const done = tracker.startFile("done.bin", 100);
+    done.advance(100);
+    done.finish(); // 100 committed
+
+    const flaky = tracker.startFile("flaky.bin", 100);
+    flaky.advance(60);
+    expect(updates.at(-1)!.bytesDone).toBe(160);
+
+    flaky.retrying({ attempt: 1, delayMs: 4000, elapsedMs: 0 });
+
+    // Back to exactly the 100 that really landed -- not 160, which counted
+    // bytes the aborted attempt threw away.
+    expect(updates.at(-1)!.bytesDone).toBe(100);
+    expect(updates.at(-1)!.activity).toEqual({
+      verb: "retrying in 4s (attempt 1, failing for 1s)",
+      path: "flaky.bin",
+    });
+
+    // The next attempt re-earns them from zero and still lands on exactly
+    // the declared size, with no double counting.
+    flaky.advance(100);
+    flaky.finish();
+    expect(updates.at(-1)!.bytesDone).toBe(200);
+  });
+
+  it("retrying() formats long outages in minutes and hours, so a stuck run can't look fresh", () => {
+    const updates: { activity?: { verb: string; path: string } | undefined }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["uploading", "uploaded"]);
+
+    const file = tracker.startFile("a.bin", 10);
+    file.retrying({ attempt: 47, delayMs: 30_000, elapsedMs: 21 * 60 * 1000 });
+    expect(updates.at(-1)!.activity?.verb).toBe("retrying in 30s (attempt 47, failing for 21m)");
+
+    file.retrying({ attempt: 400, delayMs: 30_000, elapsedMs: 125 * 60 * 1000 });
+    expect(updates.at(-1)!.activity?.verb).toBe("retrying in 30s (attempt 400, failing for 2h05m)");
+  });
+
+  it("retrying() is a no-op once the file has finished", () => {
+    const updates: { bytesDone: number }[] = [];
+    const tracker = createProgressTracker((u) => updates.push(u), ["uploading", "uploaded"]);
+
+    tracker.expectBytes(100);
+    const file = tracker.startFile("a.bin", 100);
+    file.advance(40);
+    file.finish();
+    const afterFinish = updates.length;
+
+    file.retrying({ attempt: 1, delayMs: 1000, elapsedMs: 0 });
+    expect(updates).toHaveLength(afterFinish);
+    expect(updates.at(-1)!.bytesDone).toBe(100);
+  });
+
   it("settle() keeps the observed total when the estimate under-counted", () => {
     const updates: { filesTotal: number; bytesTotal: number }[] = [];
     const tracker = createProgressTracker((u) => updates.push(u), ["hashing", "hashed"]);

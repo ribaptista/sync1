@@ -10,6 +10,7 @@ import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
 import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
 import { putObjectStream } from "../s3/client.js";
+import { withS3Retry } from "../s3/retry.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
@@ -320,17 +321,46 @@ export async function applyLocalChangesToCandidate(
         // encrypted bytes (wrong units again) and doesn't exist at all on
         // the single-PUT path, so it would buy accuracy for large files by
         // giving up on small ones entirely.
-        const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
-          fileTracker.advance(n),
-        );
-        const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
         const key = objectKey(hash);
-        await putObjectStream(
-          s3.client,
-          s3.bucket,
-          remoteKey(s3.location, key),
-          encryptedStream,
-          encryptedSize(size, context.length),
+        // The retriable unit is the whole read-encrypt-PUT, not just the
+        // PUT: a Readable that has already errored can't be replayed, so
+        // each attempt opens a fresh one. The DB upserts below stay outside
+        // it -- a retry re-sends bytes, it doesn't re-run bookkeeping.
+        //
+        // A retried attempt re-reads from byte zero, so `onRetry` hands the
+        // abandoned partial back via fileTracker.retrying(): the bar rewinds
+        // to the last state actually committed to S3, which is exactly what
+        // the next attempt has to re-earn. Leaving it in place would have
+        // the new attempt's advance() calls pile onto bytes that no longer
+        // exist anywhere.
+        await withS3Retry(
+          async () => {
+            const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
+              fileTracker.advance(n),
+            );
+            const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
+            await putObjectStream(
+              s3.client,
+              s3.bucket,
+              remoteKey(s3.location, key),
+              encryptedStream,
+              encryptedSize(size, context.length),
+            );
+          },
+          {
+            onRetry: (notice) => {
+              fileTracker.retrying(notice);
+              logger.warn(
+                {
+                  path: row.path,
+                  attempt: notice.attempt,
+                  delayMs: notice.delayMs,
+                  err: notice.error instanceof Error ? notice.error.message : String(notice.error),
+                },
+                "transient S3 failure while uploading -- retrying",
+              );
+            },
+          },
         );
         objectsRepo.upsert({ hash, s3_key: key, size });
         uploadedObjects++;

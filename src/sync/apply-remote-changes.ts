@@ -12,6 +12,7 @@ import { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-rep
 import { matchesAnyGlob } from "../fs/glob-match.js";
 import { CryptoAuthError } from "../crypto/chunked-codec.js";
 import { getObjectStream } from "../s3/client.js";
+import { withS3Retry } from "../s3/retry.js";
 import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
@@ -311,41 +312,66 @@ async function applyRemoteContentChange(
   void streamPool.add(async () => {
     const fileTracker = progress.startFile(entry.path, objectRow.size);
     try {
-      const encrypted = await getObjectStream(
-        s3.client,
-        s3.bucket,
-        remoteKey(s3.location, objectRow.s3_key),
-      );
-      if (!encrypted) {
-        throw new CorruptionError(
-          `object ${hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
-        );
-      }
-
-      fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-      const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
-      let computedHash: string;
-      try {
-        computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath, (n) =>
-          fileTracker.advance(n),
-        );
-      } catch (err) {
-        if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
-        if (err instanceof CryptoAuthError) {
-          throw new CorruptionError(
-            `object ${hash} for "${entry.path}" failed decryption/authentication`,
+      // GET and decrypt-to-file together are the retriable unit: a socket
+      // can drop mid-body, which surfaces inside decryptStreamToFile rather
+      // than at the GET, and a half-consumed response stream can't be
+      // resumed. Each attempt therefore re-issues the GET and writes to its
+      // own fresh temp path. CorruptionError is not transient and so ends
+      // the loop immediately -- a truncated download that happens to hash
+      // wrong must not be mistaken for a flaky link.
+      await withS3Retry(
+        async () => {
+          const encrypted = await getObjectStream(
+            s3.client,
+            s3.bucket,
+            remoteKey(s3.location, objectRow.s3_key),
           );
-        }
-        throw err;
-      }
-      if (computedHash !== hash) {
-        fs.rmSync(tmpPath);
-        throw new CorruptionError(
-          `object ${hash} for "${entry.path}" does not match its recorded hash`,
-        );
-      }
+          if (!encrypted) {
+            throw new CorruptionError(
+              `object ${hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
+            );
+          }
 
-      fs.renameSync(tmpPath, absolutePath);
+          fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+          const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+          let computedHash: string;
+          try {
+            computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath, (n) =>
+              fileTracker.advance(n),
+            );
+          } catch (err) {
+            if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
+            if (err instanceof CryptoAuthError) {
+              throw new CorruptionError(
+                `object ${hash} for "${entry.path}" failed decryption/authentication`,
+              );
+            }
+            throw err;
+          }
+          if (computedHash !== hash) {
+            fs.rmSync(tmpPath);
+            throw new CorruptionError(
+              `object ${hash} for "${entry.path}" does not match its recorded hash`,
+            );
+          }
+
+          fs.renameSync(tmpPath, absolutePath);
+        },
+        {
+          onRetry: (notice) => {
+            fileTracker.retrying(notice);
+            logger.warn(
+              {
+                path: entry.path,
+                attempt: notice.attempt,
+                delayMs: notice.delayMs,
+                err: notice.error instanceof Error ? notice.error.message : String(notice.error),
+              },
+              "transient S3 failure while downloading -- retrying",
+            );
+          },
+        },
+      );
 
       cacheRepo.upsert({
         path: entry.path,
