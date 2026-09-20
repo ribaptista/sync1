@@ -49,6 +49,63 @@ export async function waitForRoom(pool: PQueue, limit: number): Promise<void> {
 }
 
 /**
+ * The other half of the discipline `waitForRoom` provides on the
+ * dispatch side: a `PQueue`'s own `onIdle()` resolves once every task has
+ * *settled*, success or failure alike -- it never rejects, so a caller
+ * that discards `pool.add(task)`'s own returned promise (`void
+ * pool.add(...)`, the pattern every dispatch loop in this codebase uses,
+ * since the loop itself must not block on one task to move to the next)
+ * has no way to observe a task that threw. The result is a genuinely
+ * unhandled promise rejection -- Node's default is to crash the process
+ * outright, bypassing the command's own try/catch, `emitError`, and lock
+ * release.
+ *
+ * Mirrors `BoundedTaskTracker`'s own catch/store-first/finally shape
+ * above, adapted for a pool that already has its own `onIdle()`/
+ * `onSizeLessThan()` (so there's no need to reimplement the queue itself,
+ * just the missing error channel): call `createPoolErrorBox()` once per
+ * pool a caller dispatches through, `dispatchTracked(pool, box, task)`
+ * instead of `void pool.add(task)`, and `throwIfPoolErrored(box)` right
+ * after that pool's own `onIdle()` -- which throws the *first* captured
+ * error, if any, the same way `BoundedTaskTracker.onIdle()` does.
+ */
+export interface PoolErrorBox {
+  hasError: boolean;
+  error: unknown;
+}
+
+export function createPoolErrorBox(): PoolErrorBox {
+  return { hasError: false, error: undefined };
+}
+
+/**
+ * Dispatches `task` through `pool`, same as `void pool.add(task)`, except
+ * a rejection is captured into `box` instead of becoming unhandled.
+ * Captures only the *first* error a pool sees -- once one is recorded,
+ * later ones are logged nowhere and simply discarded, matching
+ * `BoundedTaskTracker`'s own choice: the first failure is what explains
+ * why the run is ending, and a pool draining out under an already-doomed
+ * run can throw several in quick succession that would only be noise.
+ */
+export function dispatchTracked(
+  pool: PQueue,
+  box: PoolErrorBox,
+  task: () => Promise<unknown>,
+): void {
+  void pool.add(task).catch((err: unknown) => {
+    if (!box.hasError) {
+      box.hasError = true;
+      box.error = err;
+    }
+  });
+}
+
+/** Call after the pool's own `onIdle()` resolves. Throws the first error `dispatchTracked` captured, if any. */
+export function throwIfPoolErrored(box: PoolErrorBox): void {
+  if (box.hasError) throw box.error;
+}
+
+/**
  * Same backpressure discipline as `waitForRoom`, for a pool with no
  * `onSizeLessThan`-style primitive of its own (the piscina hash pool, in
  * particular): tracks dispatched-but-not-yet-settled tasks in a bounded set,

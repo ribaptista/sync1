@@ -52,10 +52,28 @@ The restructuring applied to `update_cache`, `sanity_check`, `sync`'s two passes
    pushing a mismatch, or (in `sanity_check`/`materialize`) dispatching a _follow-on_ job to a second
    pool.
 4. **Join before returning**: every dispatched job is drained (`onIdle()`, or an equivalent bounded
-   tracker's drain) before the function returns its counts — this is also where a job's error actually
-   surfaces, not at the point it was dispatched. A producer that dispatches jobs faster than they
-   settle continuing on to more work is normal; a function returning success before its own dispatched
-   work has actually finished or failed is not.
+   tracker's drain) before the function returns its counts. A producer that dispatches jobs faster than
+   they settle continuing on to more work is normal; a function returning success before its own
+   dispatched work has actually finished or failed is not.
+
+   Whether a dispatched job's error actually _surfaces_ there, though, depends on how it was
+   dispatched, and this used to overclaim uniformity that didn't exist. `BoundedTaskTracker` (used for
+   the hash pool) has always gotten this right — it catches a task's rejection itself, stores the
+   first one, and `onIdle()` re-throws it. A raw `PQueue`, driven the natural way (`void
+pool.add(task)`, since the producer loop must not block on one task to dispatch the next), does
+   _not_: `PQueue.onIdle()` resolves once every task has _settled_, success or failure alike, and never
+   rejects — so a task's rejection had nowhere to go but an **unhandled promise rejection**, which
+   crashes the whole process outright, bypassing the command's own try/catch, `emitError`, and lock
+   release. `apply-local-changes.ts`'s and `apply-remote-changes.ts`'s stream pools now close this gap
+   the same way `BoundedTaskTracker` always has, via `dispatchTracked`/`throwIfPoolErrored`
+   (`src/concurrency/pools.ts`) — a thin wrapper that captures a `PQueue` task's rejection into a
+   shared box instead of discarding it, checked right after that pool's own `onIdle()`. `src/cli.ts`
+   also installs a `process.on("unhandledRejection")` backstop that force-releases the lock and exits
+   cleanly, so a _future_ path reintroducing the raw `void pool.add(...)` pattern fails safely rather
+   than silently reverting to a crash — but it is a last resort, not a substitute for wiring a pool
+   through `dispatchTracked` in the first place: several other `void pool.add(...)` sites in this
+   codebase (`materialize.ts`, `sanity-check.ts`, `converge-storage-policies.ts`, `gc.ts`,
+   `thumbnail.ts`) still have this exact gap, unfixed.
 
 Where one job's completion enqueues a _second_ pool's job (`sanity_check`'s hash → S3 check,
 `materialize`'s HEAD → download), **join order matters**: the first pool must be drained before the

@@ -19,7 +19,7 @@ import { registerThumbnailCommand } from "./commands/thumbnail.js";
 import { registerStatusCommand } from "./commands/status.js";
 import { registerConvergeCommand } from "./commands/converge.js";
 import { acquireLock, forceReleaseActiveLockSync, type LockHandle } from "./vault/lock.js";
-import { emitError, exitCodeForError } from "./cli/output.js";
+import { emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "./cli/output.js";
 
 const program = new Command();
 
@@ -58,6 +58,43 @@ function handleTerminationSignal(signal: "SIGINT" | "SIGTERM"): void {
 }
 process.on("SIGINT", () => handleTerminationSignal("SIGINT"));
 process.on("SIGTERM", () => handleTerminationSignal("SIGTERM"));
+
+// A defensive backstop, not the primary fix -- every dispatch loop in this
+// codebase should already route its pool's task failures through
+// dispatchTracked/throwIfPoolErrored (src/concurrency/pools.ts) rather than
+// discarding `void pool.add(...)`'s own promise, which is what used to let
+// a single failed task crash the whole process with a raw, uncaught stack
+// trace: bypassing the failing command's own try/catch, `emitError`, and
+// lock release entirely (see the `program.parseAsync(...).catch(...)`
+// handler at the bottom of this file, which only ever sees an error that
+// actually propagates through commander's own action-invocation chain --
+// a detached, fire-and-forgotten task's rejection is never part of that
+// chain at all). This exists so a *future* path that reintroduces that
+// pattern fails cleanly here instead of silently reverting to a crash.
+process.on("unhandledRejection", (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  const json = (program.opts() as { json?: boolean }).json ?? false;
+  // fs.writeSync (not emitError's process.stdout/stderr.write), same
+  // reasoning as handleTerminationSignal above: a pipe/socket write is
+  // documented as *asynchronous* on POSIX, so the process.exit() right
+  // below could otherwise race ahead of it and drop this message entirely.
+  if (json) {
+    fs.writeSync(
+      1,
+      `${JSON.stringify({ ok: false, error: message })}
+`,
+    );
+  } else {
+    fs.writeSync(
+      2,
+      `
+sync1: unhandled internal error -- ${message}
+`,
+    );
+  }
+  forceReleaseActiveLockSync();
+  process.exit(exitCodeForError(reason) ?? EXIT_GENERIC_ERROR);
+});
 
 program
   .name("sync1")

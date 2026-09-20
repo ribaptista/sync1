@@ -17,8 +17,14 @@ vi.mock("piscina", () => ({
   }),
 }));
 
-const { createConcurrencyPools, waitForRoom, BoundedTaskTracker } =
-  await import("../../../src/concurrency/pools.js");
+const {
+  createConcurrencyPools,
+  waitForRoom,
+  BoundedTaskTracker,
+  createPoolErrorBox,
+  dispatchTracked,
+  throwIfPoolErrored,
+} = await import("../../../src/concurrency/pools.js");
 
 describe("createConcurrencyPools", () => {
   it("defaults s3, stream, and thumbnail concurrency, and hash maxThreads, when no options given", () => {
@@ -116,5 +122,46 @@ describe("BoundedTaskTracker", () => {
     const tracker = new BoundedTaskTracker(4);
     await tracker.dispatch(() => Promise.reject(new Error("hash failed: ENOENT")));
     await expect(tracker.onIdle()).rejects.toThrow("hash failed: ENOENT");
+  });
+});
+
+describe("dispatchTracked / throwIfPoolErrored", () => {
+  it("is a silent no-op after a task that resolves -- throwIfPoolErrored throws nothing", async () => {
+    const pool = new PQueue({ concurrency: 4 });
+    const box = createPoolErrorBox();
+    dispatchTracked(pool, box, () => Promise.resolve("fine"));
+    await pool.onIdle();
+    expect(() => throwIfPoolErrored(box)).not.toThrow();
+  });
+
+  it("captures a rejection instead of letting it become unhandled, and throwIfPoolErrored re-throws it after onIdle()", async () => {
+    const pool = new PQueue({ concurrency: 4 });
+    const box = createPoolErrorBox();
+    dispatchTracked(pool, box, () => Promise.reject(new Error("db write failed")));
+    // The whole point: pool.onIdle() itself resolves regardless -- it never
+    // rejects on a task's own failure -- so nothing here observes the
+    // rejection except dispatchTracked's own catch. Without that catch,
+    // this would be a genuine unhandled promise rejection.
+    await expect(pool.onIdle()).resolves.toBeUndefined();
+    expect(() => throwIfPoolErrored(box)).toThrow("db write failed");
+  });
+
+  it("captures only the first of several rejections sharing one box", async () => {
+    const pool = new PQueue({ concurrency: 4 });
+    const box = createPoolErrorBox();
+    dispatchTracked(pool, box, () => Promise.reject(new Error("first")));
+    dispatchTracked(pool, box, () => Promise.reject(new Error("second")));
+    await pool.onIdle();
+    expect(() => throwIfPoolErrored(box)).toThrow("first");
+  });
+
+  it("shares one box across every dispatch on the same pool, as intended for a whole run's own error channel", async () => {
+    const pool = new PQueue({ concurrency: 4 });
+    const box = createPoolErrorBox();
+    dispatchTracked(pool, box, () => Promise.resolve());
+    dispatchTracked(pool, box, () => Promise.reject(new Error("later task failed")));
+    dispatchTracked(pool, box, () => Promise.resolve());
+    await pool.onIdle();
+    expect(() => throwIfPoolErrored(box)).toThrow("later task failed");
   });
 });

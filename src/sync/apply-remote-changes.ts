@@ -17,7 +17,13 @@ import { remoteKey, type RemoteLocation } from "../vault/paths.js";
 import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "../fs/decrypt-to-file.js";
-import { waitForRoom } from "../concurrency/pools.js";
+import {
+  waitForRoom,
+  createPoolErrorBox,
+  dispatchTracked,
+  throwIfPoolErrored,
+  type PoolErrorBox,
+} from "../concurrency/pools.js";
 import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
 
 /**
@@ -110,6 +116,12 @@ export async function applyRemoteChangesToLocal(
   // applyRemoteContentChange's own download-completion point for a path
   // whose remote content actually needs downloading.
   const progress = createProgressTracker(onProgress, ["downloading", "downloaded"]);
+  // See dispatchTracked's own doc comment (src/concurrency/pools.ts):
+  // streamPool.onIdle() alone can't tell this function a dispatched
+  // download threw, since a rejection just discarded by `void
+  // streamPool.add(...)` becomes an unhandled one -- this is what turns
+  // that into a real, catchable error instead.
+  const streamPoolErrors = createPoolErrorBox();
 
   {
     const cacheIter = cacheRepo.iterateAllSortedByPath();
@@ -155,6 +167,7 @@ export async function applyRemoteChangesToLocal(
             logger,
             streamPool,
             streamQueueLimit,
+            streamPoolErrors,
             progress,
           );
           result.created++;
@@ -205,6 +218,7 @@ export async function applyRemoteChangesToLocal(
             logger,
             streamPool,
             streamQueueLimit,
+            streamPoolErrors,
             progress,
           );
           result.modified++;
@@ -217,6 +231,7 @@ export async function applyRemoteChangesToLocal(
     }
 
     await streamPool.onIdle();
+    throwIfPoolErrored(streamPoolErrors);
 
     return result;
   }
@@ -253,6 +268,7 @@ async function applyRemoteContentChange(
   logger: Logger,
   streamPool: PQueue,
   streamQueueLimit: number,
+  streamPoolErrors: PoolErrorBox,
   progress: ProgressTracker,
 ): Promise<void> {
   const absolutePath = path.join(root, entry.path);
@@ -309,69 +325,86 @@ async function applyRemoteContentChange(
   const hash = entry.hash;
   progress.expectBytes(objectRow.size);
   await waitForRoom(streamPool, streamQueueLimit);
-  void streamPool.add(async () => {
+  dispatchTracked(streamPool, streamPoolErrors, async () => {
     const fileTracker = progress.startFile(entry.path, objectRow.size);
     try {
-      // GET and decrypt-to-file together are the retriable unit: a socket
-      // can drop mid-body, which surfaces inside decryptStreamToFile rather
-      // than at the GET, and a half-consumed response stream can't be
-      // resumed. Each attempt therefore re-issues the GET and writes to its
-      // own fresh temp path. CorruptionError is not transient and so ends
-      // the loop immediately -- a truncated download that happens to hash
-      // wrong must not be mistaken for a flaky link.
-      await withS3Retry(
-        async () => {
-          const encrypted = await getObjectStream(
-            s3.client,
-            s3.bucket,
-            remoteKey(s3.location, objectRow.s3_key),
-          );
-          if (!encrypted) {
-            throw new CorruptionError(
-              `object ${hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
+      try {
+        // GET and decrypt-to-file together are the retriable unit: a socket
+        // can drop mid-body, which surfaces inside decryptStreamToFile rather
+        // than at the GET, and a half-consumed response stream can't be
+        // resumed. Each attempt therefore re-issues the GET and writes to its
+        // own fresh temp path. CorruptionError is not transient and so ends
+        // the loop immediately -- a truncated download that happens to hash
+        // wrong must not be mistaken for a flaky link.
+        await withS3Retry(
+          async () => {
+            const encrypted = await getObjectStream(
+              s3.client,
+              s3.bucket,
+              remoteKey(s3.location, objectRow.s3_key),
             );
-          }
-
-          fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-          const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
-          let computedHash: string;
-          try {
-            computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath, (n) =>
-              fileTracker.advance(n),
-            );
-          } catch (err) {
-            if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
-            if (err instanceof CryptoAuthError) {
+            if (!encrypted) {
               throw new CorruptionError(
-                `object ${hash} for "${entry.path}" failed decryption/authentication`,
+                `object ${hash} for "${entry.path}" is missing in S3 (corrupt vault?)`,
               );
             }
-            throw err;
-          }
-          if (computedHash !== hash) {
-            fs.rmSync(tmpPath);
-            throw new CorruptionError(
-              `object ${hash} for "${entry.path}" does not match its recorded hash`,
-            );
-          }
 
-          fs.renameSync(tmpPath, absolutePath);
-        },
-        {
-          onRetry: (notice) => {
-            fileTracker.retrying(notice);
-            logger.warn(
-              {
-                path: entry.path,
-                attempt: notice.attempt,
-                delayMs: notice.delayMs,
-                err: notice.error instanceof Error ? notice.error.message : String(notice.error),
-              },
-              "transient S3 failure while downloading -- retrying",
-            );
+            fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+            const tmpPath = `${absolutePath}.sync1-tmp-${randomBytes(4).toString("hex")}`;
+            let computedHash: string;
+            try {
+              computedHash = await decryptStreamToFile(encrypted.body, masterKey, tmpPath, (n) =>
+                fileTracker.advance(n),
+              );
+            } catch (err) {
+              if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath);
+              if (err instanceof CryptoAuthError) {
+                throw new CorruptionError(
+                  `object ${hash} for "${entry.path}" failed decryption/authentication`,
+                );
+              }
+              throw err;
+            }
+            if (computedHash !== hash) {
+              fs.rmSync(tmpPath);
+              throw new CorruptionError(
+                `object ${hash} for "${entry.path}" does not match its recorded hash`,
+              );
+            }
+
+            fs.renameSync(tmpPath, absolutePath);
           },
-        },
-      );
+          {
+            onRetry: (notice) => {
+              fileTracker.retrying(notice);
+              logger.warn(
+                {
+                  path: entry.path,
+                  attempt: notice.attempt,
+                  delayMs: notice.delayMs,
+                  err: notice.error instanceof Error ? notice.error.message : String(notice.error),
+                },
+                "transient S3 failure while downloading -- retrying",
+              );
+            },
+          },
+        );
+      } catch (err) {
+        // Unlike a failed upload (src/sync/apply-local-changes.ts), this is
+        // NOT swallowed: a path whose remote content never actually reached
+        // disk locally must not be silently treated as resolved, and today
+        // nothing downstream of this function is prepared to leave a
+        // "download failed, try again next sync" gap the way cache.db's
+        // dirty rows let uploads do. So this still ends the whole run --
+        // rethrown below, captured by dispatchTracked, and surfaced
+        // cleanly by throwIfPoolErrored after this pool's own onIdle()
+        // instead of becoming an unhandled rejection. abort() (not
+        // finish()) is still what keeps the bar honest either way: this
+        // file's bytes never actually landed, so they must not be counted
+        // as transferred just because the run happens to be ending.
+        fileTracker.abort();
+        throw err;
+      }
 
       cacheRepo.upsert({
         path: entry.path,
@@ -383,15 +416,14 @@ async function applyRemoteContentChange(
         parent_state_version: entry.state_version,
       });
       logger.debug({ path: entry.path, hash }, "materialized remote file create/modify");
+      // Success only, per FileTracker's own contract -- abort() above is
+      // the failure counterpart, and the two are mutually exclusive.
+      fileTracker.finish();
       logger.debug(
         { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
         "completed",
       );
     } finally {
-      // Unconditional, per FileTracker's own contract -- see
-      // update-cache.ts's dispatchHash for why this matters even on the
-      // error paths above.
-      fileTracker.finish();
       progress.rowResolved();
     }
   });

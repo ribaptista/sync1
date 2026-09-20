@@ -15,7 +15,12 @@ import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
 import { countingReadable } from "../fs/counting-stream.js";
-import { waitForRoom } from "../concurrency/pools.js";
+import {
+  waitForRoom,
+  createPoolErrorBox,
+  dispatchTracked,
+  throwIfPoolErrored,
+} from "../concurrency/pools.js";
 import { createProgressTracker, type OnProgress } from "../progress-types.js";
 
 /**
@@ -148,6 +153,11 @@ export async function applyLocalChangesToCandidate(
   // attach, which rides along on the same in-flight upload rather than
   // getting one of its own (see the Pass 2 dispatch below).
   const progress = createProgressTracker(onProgress, ["uploading", "uploaded"]);
+  // See dispatchTracked's own doc comment: streamPool.onIdle() alone can't
+  // tell this function a dispatched job threw, since a rejection just
+  // discarded by `void streamPool.add(...)` becomes an unhandled one --
+  // this is what turns that into a real, catchable error instead.
+  const streamPoolErrors = createPoolErrorBox();
   if (estimatedTotals) progress.setEstimatedTotals(estimatedTotals);
 
   const iter = dirtyRows[Symbol.iterator]();
@@ -315,7 +325,7 @@ export async function applyLocalChangesToCandidate(
     progress.expectBytes(size);
 
     await waitForRoom(streamPool, streamQueueLimit);
-    void streamPool.add(async () => {
+    dispatchTracked(streamPool, streamPoolErrors, async () => {
       const absolutePath = path.join(root, row.path);
       const fileTracker = progress.startFile(row.path, size);
       try {
@@ -485,6 +495,7 @@ export async function applyLocalChangesToCandidate(
   }
 
   await streamPool.onIdle();
+  throwIfPoolErrored(streamPoolErrors);
   // Drops the estimate back onto what actually happened: a row that turned
   // out to conflict was counted as bytes up front (conflict detection needs
   // the candidate's entries table, which the offline count deliberately

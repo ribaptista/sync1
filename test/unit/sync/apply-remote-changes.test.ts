@@ -112,3 +112,76 @@ describe("applyRemoteChangesToLocal: parent_state_version bookkeeping", () => {
     cacheDb.close();
   });
 });
+
+describe("applyRemoteChangesToLocal: download failure", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-remote-changes-failure-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("propagates a download failure cleanly instead of an unhandled rejection, and never marks the row materialized", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v1", new Date().toISOString());
+    new ObjectsRepository(candidateDb).upsert({ hash: HASH, s3_key: `objects/${HASH}`, size: 100 });
+    new EntriesRepository(candidateDb).upsert({
+      path: "photo.jpg",
+      type: "file",
+      hash: HASH,
+      state_version: "v1",
+    });
+
+    const cacheDb = openCacheDb(":memory:");
+    const cacheRepo = new CacheEntriesRepository(cacheDb);
+    // A cache row already exists, with a DIFFERENT hash -- this is what
+    // makes the merge-join see "modified" (both sides present, hashes
+    // differ) rather than brand-new. A brand-new path always defaults to
+    // a stub and never reaches the download branch at all, so it isn't a
+    // usable shape for this test.
+    const staleHash = "b".repeat(64);
+    cacheRepo.upsert({
+      path: "photo.jpg",
+      type: "file",
+      mtime: 1,
+      hash: staleHash,
+      size: 5,
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+
+    const streamPool = new PQueue({ concurrency: 4 });
+    // unusedS3.client has no real send() method -- calling it throws
+    // immediately (a plain TypeError, unclassified, so withS3Retry treats
+    // it as non-transient rather than retrying it away), which is all
+    // this test needs: any failure propagating cleanly out of
+    // applyRemoteChangesToLocal, rather than becoming an unhandled
+    // rejection or being silently swallowed the way a failed *upload* now
+    // deliberately is (see apply-local-changes.ts) -- downloads keep
+    // today's stricter behavior of ending the whole run.
+    await expect(
+      applyRemoteChangesToLocal(
+        candidateDb,
+        root,
+        Buffer.alloc(32),
+        cacheRepo,
+        new Set<string>(),
+        unusedS3,
+        silentLogger,
+        streamPool,
+        8,
+      ),
+    ).rejects.toThrow();
+
+    // The row was never touched: still whatever cache.db already had
+    // before this run, not overwritten with content that never actually
+    // arrived.
+    expect(cacheRepo.get("photo.jpg")?.hash).toBe(staleHash);
+
+    candidateDb.close();
+    cacheDb.close();
+  });
+});
