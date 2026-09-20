@@ -32,10 +32,12 @@ async function drainBody(
 
 vi.mock("../../../src/s3/client.js", () => ({
   putObjectStream: vi.fn(),
+  headObject: vi.fn(),
 }));
 
 const { applyLocalChangesToCandidate } = await import("../../../src/sync/apply-local-changes.js");
-const { putObjectStream } = await import("../../../src/s3/client.js");
+const { putObjectStream, headObject } = await import("../../../src/s3/client.js");
+const headObjectMock = vi.mocked(headObject);
 const putObjectStreamMock = vi.mocked(putObjectStream);
 
 const silentLogger = {
@@ -980,6 +982,213 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
       filesTotal: 1,
       totalsFinal: true,
     });
+
+    candidateDb.close();
+  });
+});
+
+describe("applyLocalChangesToCandidate: verifyRemote", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-verify-remote-test-"));
+    putObjectStreamMock.mockReset();
+    putObjectStreamMock.mockImplementation(drainBody);
+    headObjectMock.mockReset();
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function touch(relPath: string, content: string): void {
+    fs.writeFileSync(path.join(root, relPath), content);
+  }
+
+  it("never calls headObject when verifyRemote is left off (the default, ordinary-run shape)", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "new content, not verify-remote";
+    touch("a.txt", content);
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [
+        {
+          path: "a.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash: hashBufferHex(Buffer.from(content)),
+          size: content.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+      ],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      undefined,
+      undefined,
+      // verifyRemote omitted -- defaults to false
+    );
+
+    expect(headObjectMock).not.toHaveBeenCalled();
+    expect(result.uploadedObjects).toBe(1);
+    expect(putObjectStreamMock).toHaveBeenCalledTimes(1);
+
+    candidateDb.close();
+  });
+
+  it("skips the upload and records the row when verifyRemote's HEAD check finds the object already on S3", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "already uploaded by a prior aborted run";
+    const hash = hashBufferHex(Buffer.from(content));
+    touch("recovered.txt", content);
+    headObjectMock.mockResolvedValue({ etag: '"deadbeef"' });
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [
+        {
+          path: "recovered.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash,
+          size: content.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+      ],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      undefined,
+      undefined,
+      true, // verifyRemote
+    );
+
+    expect(headObjectMock).toHaveBeenCalledTimes(1);
+    // The whole point: no real upload happened, but the row is still fully
+    // applied -- exactly as if a dedup hit had resolved it.
+    expect(putObjectStreamMock).not.toHaveBeenCalled();
+    expect(result.uploadedObjects).toBe(0);
+    expect(result.dedupedObjects).toBe(1);
+    expect(result.appliedCount).toBe(1);
+    expect(result.handledPaths.get("recovered.txt")).toBe("v1");
+
+    const entriesRepo = new EntriesRepository(candidateDb);
+    expect(entriesRepo.get("recovered.txt")?.hash).toBe(hash);
+    // Unlike the objectsRepo.has(hash) dedup branch, this candidate had no
+    // objects row for this hash at all before -- verifyRemote has to write
+    // one itself, or a same-batch dedup attach couldn't find it either.
+    const objectsRepo = new ObjectsRepository(candidateDb);
+    expect(objectsRepo.get(hash)).toMatchObject({ hash, size: content.length });
+
+    candidateDb.close();
+  });
+
+  it("falls through to a real upload when verifyRemote's HEAD check finds nothing", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "genuinely new content";
+    touch("new.txt", content);
+    headObjectMock.mockResolvedValue(null);
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [
+        {
+          path: "new.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash: hashBufferHex(Buffer.from(content)),
+          size: content.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+      ],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      undefined,
+      undefined,
+      true, // verifyRemote
+    );
+
+    expect(headObjectMock).toHaveBeenCalledTimes(1);
+    expect(putObjectStreamMock).toHaveBeenCalledTimes(1);
+    expect(result.uploadedObjects).toBe(1);
+    expect(result.dedupedObjects).toBe(0);
+
+    candidateDb.close();
+  });
+
+  it("HEAD-checks a hash only once per batch -- a same-batch dedup attach reuses the row the first check already wrote", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "shared, already-recovered content";
+    const hash = hashBufferHex(Buffer.from(content));
+    touch("a.txt", content);
+    touch("b.txt", content);
+    headObjectMock.mockResolvedValue({ etag: '"deadbeef"' });
+
+    const dirtyRows = [
+      {
+        path: "a.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+      {
+        path: "b.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      undefined,
+      undefined,
+      true, // verifyRemote
+    );
+
+    // b.txt's own objectsRepo.has(hash) check finds what a.txt's HEAD
+    // check already wrote -- a second HEAD for the same hash in the same
+    // batch would just be wasted work.
+    expect(headObjectMock).toHaveBeenCalledTimes(1);
+    expect(putObjectStreamMock).not.toHaveBeenCalled();
+    expect(result.dedupedObjects).toBe(2);
+    expect(result.handledPaths.get("a.txt")).toBe("v1");
+    expect(result.handledPaths.get("b.txt")).toBe("v1");
 
     candidateDb.close();
   });

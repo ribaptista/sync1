@@ -9,7 +9,7 @@ import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
 import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
-import { putObjectStream } from "../s3/client.js";
+import { putObjectStream, headObject } from "../s3/client.js";
 import { withS3Retry } from "../s3/retry.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
@@ -124,6 +124,20 @@ export async function applyLocalChangesToCandidate(
    * under-counted. See `enumerateUploadWork` in commit.ts.
    */
   estimatedTotals?: { files: number; bytes: number },
+  /**
+   * Forces a HEAD check against S3 for any content not already known to
+   * the candidate before dispatching a real upload for it -- content-
+   * addressed keys plus convergent encryption make this a sound existence
+   * check: present means a prior run (most likely one aborted mid-upload,
+   * before its own candidate could be promoted) already put the exact same
+   * bytes there, so this run can just record the row instead of paying for
+   * the PUT again. `false` by default: a HEAD per upload is a real cost on
+   * a many-small-files sync, not worth paying on an ordinary clean run.
+   * See `performSync` (commit.ts) for how this gets decided --
+   * `--verify-remote`, or a durable marker left by exactly the kind of
+   * aborted run this exists to recover from.
+   */
+  verifyRemote = false,
 ): Promise<ApplyLocalChangesResult> {
   const objectsRepo = new ObjectsRepository(candidateDb);
   const entriesRepo = new EntriesRepository(candidateDb);
@@ -308,6 +322,43 @@ export async function applyLocalChangesToCandidate(
       entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
       progress.rowResolved();
       continue;
+    }
+
+    // verifyRemote only: not known to *this* candidate, but a prior run's
+    // upload could still have reached S3 before it got aborted -- object
+    // records only ever live in whatever candidate DB that run was using,
+    // discarded along with everything else it never got to promote. A HEAD
+    // is a sound existence check here specifically because the key is
+    // content-addressed and encryption is convergent: present can only
+    // mean this exact plaintext, encrypted the exact same way, already
+    // made it. Awaited inline, not dispatched -- this only ever runs
+    // during the slow, recovery-mode path, so trading some parallelism for
+    // a simpler decide-then-dispatch shape is the right call here.
+    if (verifyRemote) {
+      const existingKey = objectKey(hash);
+      const head = await headObject(s3.client, s3.bucket, remoteKey(s3.location, existingKey));
+      if (head) {
+        dedupedObjects++;
+        handledPaths.set(row.path, versionStamp);
+        appliedCount++;
+        logger.debug(
+          { path: row.path, hash },
+          "content already present in S3 from a prior aborted run -- skipping re-upload (verify-remote)",
+        );
+        // Unlike the objectsRepo.has(hash) branch above, this candidate
+        // never had an objects row for this hash at all -- has to be
+        // written now, not just the entries row, or a later dedup-attach
+        // in this same batch couldn't find it either.
+        objectsRepo.upsert({
+          hash,
+          s3_key: existingKey,
+          size: row.size!,
+          ciphertext_checksum: null,
+        });
+        entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
+        progress.rowResolved();
+        continue;
+      }
     }
 
     const job: InFlightUpload = { sourceRows: [{ path: row.path, type: row.type }] };

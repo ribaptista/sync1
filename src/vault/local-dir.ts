@@ -27,3 +27,15 @@ export function localRemoteConfigPath(root: string): string {
 export function localLockPath(root: string): string {
   return path.join(sync1Dir(root), "lock");
 }
+
+/**
+ * Present exactly while a `sync` run's upload phase (and everything after
+ * it, through to the candidate being promoted) might have left objects on
+ * S3 that no local state knows about yet -- written just before that
+ * window opens, cleared once it closes cleanly. See `performSync`
+ * (`src/sync/commit.ts`) and the `--verify-remote` flag it reads this to
+ * force on.
+ */
+export function localUploadInProgressMarkerPath(root: string): string {
+  return path.join(sync1Dir(root), "upload-in-progress");
+}

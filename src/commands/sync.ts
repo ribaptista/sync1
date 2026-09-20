@@ -24,6 +24,7 @@ import {
 
 interface SyncOptions extends OptionValues {
   root?: string;
+  verifyRemote?: boolean;
 }
 
 interface GlobalOptions extends GlobalConcurrencyOptions {
@@ -39,6 +40,10 @@ export function registerSyncCommand(program: Command): void {
     .option(
       "--root <path>",
       "local directory to sync (defaults to the nearest ancestor directory with a .sync1/)",
+    )
+    .option(
+      "--verify-remote",
+      "HEAD-check S3 before every upload, even without a prior aborted run's marker present -- slower, but confirms nothing is silently missing",
     )
     .action(async (opts: SyncOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -147,6 +152,7 @@ async function runSync(
       logger,
       pools,
       (label) => reporterFor(progress.startPhase(label)),
+      opts.verifyRemote ?? false,
     );
   } finally {
     progress.stop();

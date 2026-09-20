@@ -27,7 +27,12 @@ import {
   CURRENT_POINTER_KEY,
   type RemoteLocation,
 } from "../vault/paths.js";
-import { localCacheDbPath, localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
+import {
+  localCacheDbPath,
+  localStateDbPath,
+  lastSyncedVersionPath,
+  localUploadInProgressMarkerPath,
+} from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
 import { renameWithRetry, copyFileWithRetry } from "../fs/safe-fs.js";
 import type { OnProgress } from "../progress-types.js";
@@ -170,9 +175,21 @@ export async function performSync(
    * phases get three bars rather than one stitched total.
    */
   onPhase?: (label: string) => OnProgress | undefined,
+  /** `--verify-remote`: forces the HEAD-before-upload check on even when no marker from a prior aborted run is present. See the marker handling just below. */
+  forceVerifyRemote = false,
 ): Promise<SyncResult> {
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
+
+  // A run whose own upload phase (or anything after it, through the
+  // candidate actually being promoted) gets aborted leaves objects on S3
+  // that no local state knows about -- the candidate DB that would have
+  // recorded them is discarded along with everything else. The marker's
+  // presence *right now*, before this run touches it, is exactly that
+  // signal: some earlier run wrote it and never got back here to clear it.
+  // Checked before this run writes its own copy, below, or it could only
+  // ever see itself.
+  const verifyRemote = forceVerifyRemote || fs.existsSync(localUploadInProgressMarkerPath(root));
 
   // performSync runs three phases fully sequentially (performUpdateCache,
   // then applyLocalChangesToCandidate, then applyRemoteChangesToLocal),
@@ -313,6 +330,14 @@ export async function performSync(
           cacheRepo.iterateDirty(),
           new ObjectsRepository(candidateDb),
         );
+        // Written for the *next* run's benefit, not this one: if this
+        // process dies anywhere between here and the candidate actually
+        // being promoted, the next run finds this file still present and
+        // knows to verify before re-uploading. Cleared only on this run's
+        // own clean exit (both the "nothing to commit" and the successful-
+        // commit paths below) -- deliberately not in a finally, since an
+        // abort or a thrown error is exactly what this exists to survive.
+        fs.writeFileSync(localUploadInProgressMarkerPath(root), new Date().toISOString());
         localResult = await applyLocalChangesToCandidate(
           candidateDb,
           tapPaths(cacheRepo.iterateDirty(), excludePaths),
@@ -325,6 +350,7 @@ export async function performSync(
           pools.stream.concurrency * 2,
           phaseProgress("uploading"),
           uploadTotals,
+          verifyRemote,
         );
 
         // A version is only worth committing if something *actually*
@@ -358,6 +384,13 @@ export async function performSync(
         // just adopt the remote version as the new local baseline if it
         // moved, and still reconcile any no-op-resolved rows to
         // 'unchanged' -- they're resolved even though nothing was uploaded.
+        //
+        // Marker cleared here too: willCommit false means appliedCount was
+        // never above 0, and per apply-local-changes.ts's own contract a
+        // row is only ever counted applied once its upload has genuinely
+        // succeeded -- so nothing from this run's own upload phase is
+        // pending on S3 that local state doesn't already know about.
+        fs.rmSync(localUploadInProgressMarkerPath(root), { force: true });
         if (remoteHasMoved) {
           await copyFileWithRetry(remoteFreshPath, localStateDbPath(root));
           fs.writeFileSync(lastSyncedVersionPath(root), remoteVersionStamp, "utf8");
@@ -422,6 +455,10 @@ export async function performSync(
       // cache.db, safe to retry.
       await renameWithRetry(candidatePath, localStateDbPath(root));
       fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
+      // Only now: state.db itself now reflects every object this run
+      // uploaded, so there's nothing left for a future run to need
+      // verify-remote protection against.
+      fs.rmSync(localUploadInProgressMarkerPath(root), { force: true });
       reconcileCacheAfterCommit(
         cacheRepo,
         filterByPath(cacheRepo.iterateDirty(), localResult.handledPaths),
