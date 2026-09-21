@@ -15,7 +15,12 @@ import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { StoragePoliciesRepository } from "../db/repositories/storage-policies-repository.js";
 import { CorruptionError } from "../errors.js";
-import { waitForRoom } from "../concurrency/pools.js";
+import {
+  waitForRoom,
+  createPoolErrorBox,
+  dispatchTracked,
+  throwIfPoolErrored,
+} from "../concurrency/pools.js";
 import { openStateDbReadOnly } from "../db/connection.js";
 
 // Not exposed as flags -- a reasonable default balance of cost/latency for
@@ -86,6 +91,12 @@ export async function convergeStoragePolicies(
     finalized: 0,
   };
   const conflicts: ConvergeConflict[] = [];
+  // See dispatchTracked's own doc comment (src/concurrency/pools.ts):
+  // s3Pool.onIdle() alone can't tell this function a dispatched job threw,
+  // since a rejection just discarded by `void s3Pool.add(...)` becomes an
+  // unhandled one -- this is what turns that into a real, catchable error
+  // instead.
+  const s3PoolErrors = createPoolErrorBox();
 
   try {
     const entriesRepo = new EntriesRepository(db);
@@ -125,7 +136,7 @@ export async function convergeStoragePolicies(
       const key = remoteKey(s3.location, objectRow.s3_key);
 
       await waitForRoom(s3Pool, s3QueueLimit);
-      void s3Pool.add(async () => {
+      dispatchTracked(s3Pool, s3PoolErrors, async () => {
         const head = await headObject(s3.client, s3.bucket, key);
         if (!head) {
           throw new CorruptionError(`object ${hash} is missing in S3 at "${key}" (corrupt vault?)`);
@@ -175,6 +186,7 @@ export async function convergeStoragePolicies(
     }
 
     await s3Pool.onIdle();
+    throwIfPoolErrored(s3PoolErrors);
   } finally {
     db.close();
   }

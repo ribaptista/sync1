@@ -4,7 +4,12 @@ import type PQueue from "p-queue";
 import type { Logger } from "../logger.js";
 import { walk } from "./walker.js";
 import { matchesAnyGlob, literalPrefixOf } from "./glob-match.js";
-import { waitForRoom } from "../concurrency/pools.js";
+import {
+  waitForRoom,
+  createPoolErrorBox,
+  dispatchTracked,
+  throwIfPoolErrored,
+} from "../concurrency/pools.js";
 import { enumerateThumbnailScan } from "./thumbnail-enumerate.js";
 import type { EnumerationControl } from "./update-cache-enumerate.js";
 import type { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
@@ -597,6 +602,16 @@ export async function scanThumbnails(
 
   const existingThumbnails = new Map<string, ExistingThumbnailFile[]>();
   const decisions: ProvisionalDecision[] = [];
+  // See dispatchTracked's own doc comment (src/concurrency/pools.ts): the
+  // classification pool's own onIdle() alone can't tell this function a
+  // dispatched job threw (in particular, a MediaToolMissingError -- see
+  // this function's own doc comment on why that must abort the whole run),
+  // since a rejection just discarded by `void pool.add(...)` becomes an
+  // unhandled one -- this is what turns that into a real, catchable error
+  // instead. A second, separate box covers the generation phase below --
+  // they read more clearly kept apart, and this one's own check fires
+  // before generation ever starts anyway.
+  const classifyPoolErrors = createPoolErrorBox();
 
   // Started, deliberately not awaited: it counts the same entries this
   // walk is about to visit, concurrently, so the denominator is known
@@ -637,7 +652,7 @@ export async function scanThumbnails(
       }
 
       await waitForRoom(pool, poolQueueLimit);
-      void pool.add(async () => {
+      dispatchTracked(pool, classifyPoolErrors, async () => {
         const decision = await classifyProbed(relativePath, root, cacheRepo, policies, prober);
         if (decision) decisions.push(decision);
         logger.debug({ pool: "thumbnail", inFlight: pool.pending, queued: pool.size }, "completed");
@@ -646,6 +661,7 @@ export async function scanThumbnails(
     }
 
     await pool.onIdle();
+    throwIfPoolErrored(classifyPoolErrors);
   } finally {
     // The walk is done (or has thrown), so whatever the counting pass has
     // left to count is now worthless -- cut it short, join it so it can't
@@ -778,9 +794,15 @@ export async function scanThumbnails(
     // Published before the first dispatch, and never revised: this is the
     // whole generation phase's denominator, not a running discovery count.
     onGenerationProgress?.(generationJobs.length, completedGeneration);
+    // A second, separate box from classifyPoolErrors above -- a
+    // ThumbnailGenerationError is deliberately swallowed below (tallied
+    // under stats.errors, non-fatal), but anything else (in particular
+    // MediaToolMissingError) is rethrown and must still abort the run
+    // cleanly rather than becoming an unhandled rejection.
+    const generatePoolErrors = createPoolErrorBox();
     for (const job of generationJobs) {
       await waitForRoom(pool, poolQueueLimit);
-      void pool.add(async () => {
+      dispatchTracked(pool, generatePoolErrors, async () => {
         try {
           await generateForDecision(
             root,
@@ -806,6 +828,7 @@ export async function scanThumbnails(
       });
     }
     await pool.onIdle();
+    throwIfPoolErrored(generatePoolErrors);
   }
 
   for (const [originalPath, thumbs] of existingThumbnails) {

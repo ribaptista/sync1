@@ -14,7 +14,12 @@ import { stubPathFor } from "./stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "./decrypt-to-file.js";
 import { inTreeTempPath } from "./temp-path.js";
-import { waitForRoom } from "../concurrency/pools.js";
+import {
+  waitForRoom,
+  createPoolErrorBox,
+  dispatchTracked,
+  throwIfPoolErrored,
+} from "../concurrency/pools.js";
 import { createProgressTracker, type OnProgress } from "../progress-types.js";
 
 export interface MaterializeStats {
@@ -124,6 +129,14 @@ export async function materializeGlob(
   // (not a stub, a dangling stub, a cold object) and is deferred into the
   // download's own completion for a stub that is immediately retrievable.
   const progress = createProgressTracker(onProgress, ["downloading", "downloaded"]);
+  // See dispatchTracked's own doc comment (src/concurrency/pools.ts): each
+  // pool's own onIdle() alone can't tell this function a dispatched job
+  // threw, since a rejection just discarded by `void pool.add(...)` becomes
+  // an unhandled one -- these are what turn that into a real, catchable
+  // error instead. Two boxes, one per pool, since either can fail
+  // independently.
+  const s3PoolErrors = createPoolErrorBox();
+  const streamPoolErrors = createPoolErrorBox();
 
   // Offline, and therefore available before the first HEAD goes out --
   // the denominator is correct from the start of the run rather than
@@ -180,7 +193,7 @@ export async function materializeGlob(
       progress.expectBytes(objectRow.size);
 
       await waitForRoom(s3Pool, s3QueueLimit);
-      void s3Pool.add(async () => {
+      dispatchTracked(s3Pool, s3PoolErrors, async () => {
         const head = await headObject(s3.client, s3.bucket, key);
         if (!head) {
           throw new CorruptionError(
@@ -193,7 +206,7 @@ export async function materializeGlob(
 
         if (status === "immediate" || status === "restore-ready") {
           await waitForRoom(streamPool, streamQueueLimit);
-          void streamPool.add(async () => {
+          dispatchTracked(streamPool, streamPoolErrors, async () => {
             const fileTracker = progress.startFile(row.path, objectRow.size);
             try {
               // Same retriable unit as apply-remote-changes' download: the
@@ -309,7 +322,9 @@ export async function materializeGlob(
     }
 
     await s3Pool.onIdle();
+    throwIfPoolErrored(s3PoolErrors);
     await streamPool.onIdle();
+    throwIfPoolErrored(streamPoolErrors);
   } finally {
     // Whatever the run actually observed is the truth now, however the
     // enumeration above guessed -- including on the error paths, where a

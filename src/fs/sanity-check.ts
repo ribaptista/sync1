@@ -7,7 +7,14 @@ import { matchesAnyGlob } from "./glob-match.js";
 import type { EntriesRepository, EntryRow } from "../db/repositories/entries-repository.js";
 import type { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
-import { BoundedTaskTracker, waitForRoom } from "../concurrency/pools.js";
+import {
+  BoundedTaskTracker,
+  waitForRoom,
+  createPoolErrorBox,
+  dispatchTracked,
+  throwIfPoolErrored,
+  type PoolErrorBox,
+} from "../concurrency/pools.js";
 import type { HashRunner } from "../concurrency/hash-runner.js";
 import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
 import { enumerateSanityCheckWork } from "./sanity-check-enumerate.js";
@@ -122,6 +129,15 @@ export async function performSanityCheck(
   const inScope = (p: string): boolean =>
     filterGlob === undefined || matchesAnyGlob(p, [filterGlob]).matched;
   const hashJobs = new BoundedTaskTracker(maxInFlightHashes);
+  // See dispatchTracked's own doc comment (src/concurrency/pools.ts):
+  // s3Pool.onIdle() alone can't tell this function a dispatched job threw,
+  // since a rejection just discarded by `void s3Pool.add(...)` becomes an
+  // unhandled one -- this is what turns that into a real, catchable error
+  // instead. Threaded through dispatchTrackedEntryCheck into
+  // dispatchS3Check, the two nested helpers that actually dispatch to
+  // `s3Pool`. `hashJobs` needs no equivalent here -- `BoundedTaskTracker`
+  // already tracks its own dispatched failures (see its own doc comment).
+  const s3PoolErrors = createPoolErrorBox();
 
   // filesDone/filesTotal track every row the merge-join consumes (mirroring
   // this scan's pre-existing "scanned" counter); bytesDone/bytesTotal track
@@ -212,6 +228,7 @@ export async function performSanityCheck(
             hashJobs,
             s3Pool,
             s3QueueLimit,
+            s3PoolErrors,
             progress,
           );
         } else {
@@ -229,6 +246,7 @@ export async function performSanityCheck(
     // hashJobs.onIdle() resolves -- only then is it safe to drain s3Pool too.
     await hashJobs.onIdle();
     await s3Pool.onIdle();
+    throwIfPoolErrored(s3PoolErrors);
 
     result.hashMismatch.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     result.missingInS3.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -249,6 +267,7 @@ async function dispatchTrackedEntryCheck(
   hashJobs: BoundedTaskTracker,
   s3Pool: PQueue,
   s3QueueLimit: number,
+  s3PoolErrors: PoolErrorBox,
   progress: ProgressTracker,
 ): Promise<void> {
   if (entry.type === "dir") {
@@ -282,6 +301,7 @@ async function dispatchTrackedEntryCheck(
         await dispatchS3Check(
           s3Pool,
           s3QueueLimit,
+          s3PoolErrors,
           entry.hash,
           entry.path,
           objectsRepo,
@@ -336,6 +356,7 @@ async function dispatchTrackedEntryCheck(
   await dispatchS3Check(
     s3Pool,
     s3QueueLimit,
+    s3PoolErrors,
     entry.hash,
     entry.path,
     objectsRepo,
@@ -354,6 +375,7 @@ async function dispatchTrackedEntryCheck(
 async function dispatchS3Check(
   s3Pool: PQueue,
   s3QueueLimit: number,
+  s3PoolErrors: PoolErrorBox,
   hash: string,
   entryPath: string,
   objectsRepo: ObjectsRepository,
@@ -368,7 +390,7 @@ async function dispatchS3Check(
   }
 
   await waitForRoom(s3Pool, s3QueueLimit);
-  void s3Pool.add(async () => {
+  dispatchTracked(s3Pool, s3PoolErrors, async () => {
     const exists = await objectExists(objectRow.s3_key);
     logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "completed");
     if (!exists) {

@@ -25,7 +25,12 @@ import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
 import { tempSiblingPath } from "../fs/temp-path.js";
 import { copyFileWithRetry } from "../fs/safe-fs.js";
-import { waitForRoom } from "../concurrency/pools.js";
+import {
+  waitForRoom,
+  createPoolErrorBox,
+  dispatchTracked,
+  throwIfPoolErrored,
+} from "../concurrency/pools.js";
 
 export interface GcResult {
   orphanCount: number;
@@ -186,9 +191,17 @@ export async function performGc(
         // itself derived from the dispatch count; wrong the moment the
         // denominator became the real total.
         let deleted = 0;
+        // Created fresh per CAS attempt (not hoisted above the loop) --
+        // each attempt is its own independent delete sweep, so a box from
+        // an earlier, since-abandoned attempt must never leak into this
+        // one. See dispatchTracked's own doc comment (src/concurrency/
+        // pools.ts): s3Pool.onIdle() alone can't tell this function a
+        // dispatched delete threw, since a rejection just discarded by
+        // `void s3Pool.add(...)` becomes an unhandled one.
+        const s3PoolErrors = createPoolErrorBox();
         for (const o of objectsRepo.iterateStagedOrphans()) {
           await waitForRoom(s3Pool, s3QueueLimit);
-          void s3Pool.add(async () => {
+          dispatchTracked(s3Pool, s3PoolErrors, async () => {
             await deleteObject(s3.client, s3.bucket, remoteKey(s3.location, o.s3_key));
             logger.debug(
               { pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size },
@@ -200,6 +213,20 @@ export async function performGc(
           logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "dispatched");
         }
         await s3Pool.onIdle();
+        // The CAS commit above already succeeded by this point -- the new
+        // version's `objects` table no longer lists these hashes at all,
+        // committed or not, per the two-phase design this function's own
+        // doc comment describes ("only now, after the CAS succeeded, is it
+        // safe to delete the actual object bytes"). A delete failure here
+        // was already a pre-existing leak risk before this box existed
+        // (an interrupted process at this exact point has the same
+        // effect); throwing here doesn't change that, but it does turn
+        // what used to be an unhandled-rejection crash into a clean,
+        // reported error -- and correctly skips promoting *this* process's
+        // own local state.db copy / last_synced_version to the new
+        // version, so at least this machine doesn't silently believe the
+        // sweep fully completed when it didn't.
+        throwIfPoolErrored(s3PoolErrors);
 
         await copyFileWithRetry(candidatePath, localStateDbPath(root));
         fs.writeFileSync(lastSyncedVersionPath(root), newVersionStamp, "utf8");
