@@ -719,6 +719,7 @@ const IMAGE_GENERATE_INPUT = {
   mimeTypes: ["image/jpeg"],
   imageWidth: 320,
   imageHeight: 240,
+  outputMime: "image/jpeg" as const,
   jpegQuality: 80,
 };
 
@@ -730,6 +731,7 @@ const IMAGE_SHORTER_SIDE_INPUT = {
   resizingStrategy: "resize_shorter_side" as const,
   mimeTypes: ["image/jpeg"],
   shorterSide: 150,
+  outputMime: "image/jpeg" as const,
   jpegQuality: 80,
 };
 
@@ -742,20 +744,24 @@ const VIDEO_GENERATE_INPUT = {
   mimeTypes: ["video/mp4"],
   tileRowCount: 4,
   tileColumnCount: 4,
-  tileSize: 90,
+  shorterSide: 90,
+  outputMime: "image/jpeg" as const,
   jpegQuality: 80,
 };
 
-const VIDEO_GIF_INPUT = {
-  name: "vid_gif",
+const VIDEO_PREVIEW_INPUT = {
+  name: "vid_preview",
   glob: "**/*.mp4",
   action: "generate" as const,
   mediaType: "video" as const,
-  outputType: "gif" as const,
+  outputType: "preview" as const,
   mimeTypes: ["video/mp4"],
-  tileSize: 64,
+  shorterSide: 64,
   frameCount: 8,
   frameDelayMs: 100,
+  outputMime: "image/gif" as const,
+  gifMaxColors: 256,
+  gifDither: "sierra2_4a" as const,
 };
 
 const SKIP_INPUT = {
@@ -781,10 +787,10 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
 
     expect(repo.list().map((r) => r.id)).toEqual([generateId, skipId]);
 
-    // A 'generate'/'image' row carries none of the video-only fields at
-    // all -- not even as explicit nulls -- so the expected object below
-    // has no tileRowCount/tileColumnCount/tileSize/imageWidth-adjacent
-    // video keys to list.
+    // A 'generate'/'image' row carries none of the video-only or other-
+    // encoding fields at all -- not even as explicit nulls -- so the
+    // expected object below has no tileRowCount/tileColumnCount/
+    // pngCompressionLevel-adjacent keys to list.
     expect(repo.get(generateId)).toEqual({
       id: generateId,
       name: "img_thumb",
@@ -795,6 +801,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       mimeTypes: ["image/jpeg"],
       imageWidth: 320,
       imageHeight: 240,
+      outputMime: "image/jpeg",
       jpegQuality: 80,
       createdAt: expect.any(String) as string,
     });
@@ -832,7 +839,8 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       mimeTypes: ["video/mp4"],
       tileRowCount: 4,
       tileColumnCount: 4,
-      tileSize: 90,
+      shorterSide: 90,
+      outputMime: "image/jpeg",
       jpegQuality: 80,
       createdAt: expect.any(String) as string,
     });
@@ -852,27 +860,31 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       resizingStrategy: "resize_shorter_side",
       mimeTypes: ["image/jpeg"],
       shorterSide: 150,
+      outputMime: "image/jpeg",
       jpegQuality: 80,
       createdAt: expect.any(String) as string,
     });
   });
 
-  it("creates, lists, and gets a video/gif row -- no jpegQuality, since a GIF is never JPEG", () => {
+  it("creates, lists, and gets a video/preview row -- no jpegQuality, since GIF output is never JPEG-encoded", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
 
-    const id = repo.create(VIDEO_GIF_INPUT);
+    const id = repo.create(VIDEO_PREVIEW_INPUT);
     expect(repo.get(id)).toEqual({
       id,
-      name: "vid_gif",
+      name: "vid_preview",
       glob: "**/*.mp4",
       action: "generate",
       mediaType: "video",
-      outputType: "gif",
+      outputType: "preview",
       mimeTypes: ["video/mp4"],
-      tileSize: 64,
+      shorterSide: 64,
       frameCount: 8,
       frameDelayMs: 100,
+      outputMime: "image/gif",
+      gifMaxColors: 256,
+      gifDither: "sierra2_4a",
       createdAt: expect.any(String) as string,
     });
   });
@@ -935,10 +947,10 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       /jpegQuality/,
     );
 
-    const { tileSize: _tileSize, ...videoWithoutTileSize } = VIDEO_GENERATE_INPUT;
+    const { shorterSide: _shorterSide, ...videoWithoutShorterSide } = VIDEO_GENERATE_INPUT;
     expect(() =>
-      repo.create(videoWithoutTileSize as unknown as ThumbnailPolicyCreateInput),
-    ).toThrow(/tileSize/);
+      repo.create(videoWithoutShorterSide as unknown as ThumbnailPolicyCreateInput),
+    ).toThrow(/shorterSide/);
   });
 
   it("rejects a 'generate' policy that sets fields from the other media type", () => {
@@ -1026,6 +1038,14 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
         mediaType: "image",
         resizingStrategy: "fit_to_box",
       }),
+    ).toThrow(/output mime/);
+    expect(() =>
+      repo.update(skipId, {
+        action: "generate",
+        mediaType: "image",
+        resizingStrategy: "fit_to_box",
+        outputMime: "image/jpeg",
+      }),
     ).toThrow(/imageWidth/);
     expect(
       repo.update(skipId, {
@@ -1035,6 +1055,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
         mimeTypes: ["image/jpeg"], // must be resupplied -- the skip row's own mix of image/video types no longer matches 'image'
         imageWidth: 100,
         imageHeight: 100,
+        outputMime: "image/jpeg",
         jpegQuality: 70,
       }),
     ).toBe(true);
@@ -1058,18 +1079,22 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       mimeTypes: ["image/jpeg"],
       imageWidth: 320,
       imageHeight: 240,
+      outputMime: "image/jpeg",
       jpegQuality: 85,
     });
 
     // Switching without supplying the new type's own fields fails --
-    // nothing about the video shape carries over from an image row.
+    // nothing about the video shape carries over from an image row (not
+    // even shorterSide -- 'fit_to_box' never had one).
     expect(() =>
       repo.update(id, { mediaType: "video", outputType: "mosaic", mimeTypes: ["video/mp4"] }),
     ).toThrow(/tileRowCount/);
 
     // image -> video: imageWidth/imageHeight/resizingStrategy are dropped
     // (not part of the video shape at all); jpegQuality (85) carries over
-    // untouched, since it's never overridden here and 'mosaic' shares it.
+    // untouched, since it's never overridden here, outputMime stays
+    // unchanged ('generate' -> 'generate' always carries it), and 'mosaic'
+    // shares 'image/jpeg'.
     expect(
       repo.update(id, {
         mediaType: "video",
@@ -1077,7 +1102,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
         mimeTypes: ["video/mp4"],
         tileRowCount: 3,
         tileColumnCount: 5,
-        tileSize: 64,
+        shorterSide: 64,
       }),
     ).toBe(true);
     expect(repo.get(id)).toEqual({
@@ -1090,13 +1115,15 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       mimeTypes: ["video/mp4"],
       tileRowCount: 3,
       tileColumnCount: 5,
-      tileSize: 64,
+      shorterSide: 64,
+      outputMime: "image/jpeg",
       jpegQuality: 85,
       createdAt: expect.any(String) as string,
     });
 
     // video -> image, in the same call overriding jpegQuality this time --
-    // the override wins over the carry, tile fields are dropped.
+    // the override wins over the carry, tile fields (and shorterSide,
+    // absent from 'fit_to_box') are dropped.
     expect(
       repo.update(id, {
         mediaType: "image",
@@ -1117,6 +1144,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       mimeTypes: ["image/png"],
       imageWidth: 50,
       imageHeight: 60,
+      outputMime: "image/jpeg",
       jpegQuality: 42,
       createdAt: expect.any(String) as string,
     });
@@ -1139,29 +1167,46 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       resizingStrategy: "resize_shorter_side",
       mimeTypes: ["image/jpeg"],
       shorterSide: 100,
+      outputMime: "image/jpeg",
       jpegQuality: 80, // carried -- both strategies share it
       createdAt: expect.any(String) as string,
     });
   });
 
-  it("update() switching outputType within 'video' carries tileSize but drops jpegQuality when switching to 'gif'", () => {
+  it("update() switching outputType within 'video' carries shorterSide, but requires an output mime legal for the new branch", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    const id = repo.create(VIDEO_GENERATE_INPUT); // mosaic, tileSize 90, jpegQuality 80
+    const id = repo.create(VIDEO_GENERATE_INPUT); // mosaic, shorterSide 90, outputMime image/jpeg
 
-    expect(() => repo.update(id, { outputType: "gif" })).toThrow(/frameCount/);
-    expect(repo.update(id, { outputType: "gif", frameCount: 6, frameDelayMs: 80 })).toBe(true);
+    // 'preview' never allows image/jpeg (see LEGAL_OUTPUT_MIMES) -- simply
+    // carrying the old outputMime forward (unchanged in this call) is
+    // illegal for the new branch, caught before the missing-fields check.
+    expect(() => repo.update(id, { outputType: "preview" })).toThrow(/output mime/);
+
+    expect(
+      repo.update(id, {
+        outputType: "preview",
+        outputMime: "image/gif",
+        frameCount: 6,
+        frameDelayMs: 80,
+        gifMaxColors: 128,
+        gifDither: "bayer",
+      }),
+    ).toBe(true);
     expect(repo.get(id)).toEqual({
       id,
       name: "vid_thumb",
       glob: "**/*.mp4",
       action: "generate",
       mediaType: "video",
-      outputType: "gif",
+      outputType: "preview",
       mimeTypes: ["video/mp4"],
-      tileSize: 90, // carried -- 'mosaic' and 'gif' share it
+      shorterSide: 90, // carried -- 'mosaic' and 'preview' share it
       frameCount: 6,
       frameDelayMs: 80,
+      outputMime: "image/gif",
+      gifMaxColors: 128,
+      gifDither: "bayer",
       createdAt: expect.any(String) as string,
     });
   });

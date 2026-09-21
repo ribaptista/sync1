@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Logger } from "../logger.js";
 import { MediaToolMissingError } from "./probe.js";
+import type { ThumbnailGifDither } from "../db/repositories/thumbnail-policies-repository.js";
 
 export interface Dimensions {
   width: number;
@@ -63,18 +64,15 @@ export function computeContainFitSize(source: Dimensions, box: Dimensions): Dime
  * scale is derived from whichever of `source`'s own dimensions is smaller,
  * and both axes are scaled by that same factor, so the long side falls out
  * of `source`'s own aspect ratio rather than being configured directly.
- * Shared by two call sites with different names for the same knob: a video
- * mosaic tile's `tileSize` (this file's `generateVideoMosaic`/
- * `generateVideoGif`) and an image policy's `resize_shorter_side`
- * `shorterSide` (`src/fs/thumbnail.ts`'s `generateForDecision`) -- both are
- * "fit the shorter side to a target, let the rest fall out of the source's
- * own aspect ratio," the same operation regardless of what produced the
- * source pixels. Deliberately has no orientation concept at all (no
- * portrait/landscape branch, unlike `computeContainFitSize` above) -- every
- * frame sampled from one video shares that video's aspect ratio, and an
- * image has only the one aspect ratio to begin with, so there's no
- * "declared box vs. source orientation" pairing left to get wrong,
- * structurally, not by convention.
+ * Shared by every non-`fit_to_box` sizing branch: an image's own
+ * `resize_shorter_side`, one mosaic tile, or one preview frame (all live in
+ * the policy's single `shorterSide` column -- see
+ * `docs/architecture/thumbnails.md`). Deliberately has no orientation
+ * concept at all (no portrait/landscape branch, unlike
+ * `computeContainFitSize` above) -- every frame sampled from one video
+ * shares that video's aspect ratio, and an image has only the one aspect
+ * ratio to begin with, so there's no "declared box vs. source orientation"
+ * pairing left to get wrong, structurally, not by convention.
  */
 export function computeShorterSideFitSize(source: Dimensions, shortSide: number): Dimensions {
   const scale = shortSide / Math.min(source.width, source.height);
@@ -157,35 +155,81 @@ async function runTool(
   }
 }
 
+/**
+ * How a generator's produced pixels are compressed -- shared shape across
+ * all three generators, one arm per `output_mime`. Not every arm is legal
+ * for every generator (a mosaic is never `image/gif`, a preview is only
+ * ever `image/gif`/`image/webp` -- see `thumbnail-policies-repository.ts`'s
+ * `LEGAL_OUTPUT_MIMES`), so each generator's own input type `Extract`s the
+ * arms it actually accepts rather than accepting the full union.
+ */
+export type ImageEncoding =
+  | { outputMime: "image/jpeg"; jpegQuality: number }
+  | { outputMime: "image/png"; pngCompressionLevel: number }
+  | { outputMime: "image/webp"; webpQuality: number; webpLossless: boolean }
+  | { outputMime: "image/gif"; gifMaxColors: number; gifDither: ThumbnailGifDither };
+
+export type MosaicEncoding = Extract<
+  ImageEncoding,
+  { outputMime: "image/jpeg" | "image/png" | "image/webp" }
+>;
+export type PreviewEncoding = Extract<ImageEncoding, { outputMime: "image/gif" | "image/webp" }>;
+
 export interface ThumbnailGenerator {
   generateImageThumbnail(input: GenerateImageThumbnailInput, logger: Logger): Promise<void>;
   generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logger): Promise<void>;
-  generateVideoGif(input: GenerateVideoGifInput, logger: Logger): Promise<void>;
+  generateVideoPreview(input: GenerateVideoPreviewInput, logger: Logger): Promise<void>;
 }
 
 export interface GenerateImageThumbnailInput {
   sourcePath: string;
-  /** Extension determines the output format (and whether `-quality` applies) -- must match the original's own extension, per the thumbnail-filename convention. */
+  /** Extension must match `encoding.outputMime` -- ImageMagick infers the write format from it. */
   destPath: string;
   width: number;
   height: number;
-  jpegQuality: number;
+  encoding: ImageEncoding;
 }
 
-const JPEG_EXTENSION = /\.jpe?g$/i;
+/** ImageMagick flags for one format's encoding knobs, verified against this build's (7.1.2) actual behavior. */
+function magickArgsForEncoding(encoding: ImageEncoding): string[] {
+  switch (encoding.outputMime) {
+    case "image/jpeg":
+      return ["-quality", String(encoding.jpegQuality)];
+    case "image/png":
+      return ["-define", `png:compression-level=${encoding.pngCompressionLevel}`];
+    case "image/webp":
+      return [
+        "-quality",
+        String(encoding.webpQuality),
+        "-define",
+        `webp:lossless=${encoding.webpLossless ? "true" : "false"}`,
+      ];
+    case "image/gif":
+      return [
+        "-colors",
+        String(encoding.gifMaxColors),
+        "-dither",
+        // ImageMagick's still-image path only has one error-diffusion mode
+        // ("FloydSteinberg") -- every dither value but "none" collapses to
+        // it here. Approximate for the still-image path; the video preview
+        // path (generateVideoPreview below) passes ffmpeg the full value.
+        encoding.gifDither === "none" ? "None" : "FloydSteinberg",
+      ];
+  }
+}
 
 /**
  * `-resize "<W>x<H>!"`: the trailing `!` forces ImageMagick to use exactly
  * these pixel dimensions rather than recomputing its own aspect-preserving
  * fit -- `width`/`height` are expected to already be the exact output of
- * `computeContainFitSize`, so re-deriving a fit here could disagree with it
- * by a rounding pixel and silently violate our own contract.
+ * `computeContainFitSize`/`computeShorterSideFitSize`, so re-deriving a fit
+ * here could disagree with it by a rounding pixel and silently violate our
+ * own contract.
  */
 async function generateImageThumbnail(
   input: GenerateImageThumbnailInput,
   logger: Logger,
 ): Promise<void> {
-  const isJpeg = JPEG_EXTENSION.test(input.destPath);
   await runTool(
     "convert",
     [
@@ -193,7 +237,7 @@ async function generateImageThumbnail(
       "-auto-orient",
       "-resize",
       `${input.width}x${input.height}!`,
-      ...(isJpeg ? ["-quality", String(input.jpegQuality)] : []),
+      ...magickArgsForEncoding(input.encoding),
       input.destPath,
     ],
     "convert",
@@ -203,7 +247,6 @@ async function generateImageThumbnail(
 
 export interface GenerateVideoMosaicInput {
   sourcePath: string;
-  /** Always a .jpg destination -- video mosaics are always JPEG regardless of the source container. */
   destPath: string;
   sourceWidth: number;
   sourceHeight: number;
@@ -211,13 +254,32 @@ export interface GenerateVideoMosaicInput {
   tileRowCount: number;
   tileColumnCount: number;
   /** One tile's shorter-side target in pixels -- see `computeShorterSideFitSize`; the longer side is derived, never configured independently. */
-  tileSize: number;
-  jpegQuality: number;
+  shorterSide: number;
+  encoding: MosaicEncoding;
 }
 
 /** Maps a 1-100 JPEG quality to ffmpeg's mjpeg `-q:v` scale (2 = best, 31 = worst -- inverted and much coarser than JPEG's own percent scale). */
 function mapJpegQualityToFfmpegQScale(jpegQuality: number): number {
   return Math.min(31, Math.max(2, Math.round(2 + ((100 - jpegQuality) * 29) / 100)));
+}
+
+/** ffmpeg output-codec flags for one mosaic encoding, verified against this build's actual behavior. */
+function ffmpegMosaicArgsForEncoding(encoding: MosaicEncoding): string[] {
+  switch (encoding.outputMime) {
+    case "image/jpeg":
+      return ["-q:v", String(mapJpegQualityToFfmpegQScale(encoding.jpegQuality))];
+    case "image/png":
+      return ["-compression_level", String(encoding.pngCompressionLevel)];
+    case "image/webp":
+      return [
+        "-c:v",
+        "libwebp",
+        "-quality",
+        String(encoding.webpQuality),
+        "-lossless",
+        encoding.webpLossless ? "1" : "0",
+      ];
+  }
 }
 
 /**
@@ -227,21 +289,22 @@ function mapJpegQualityToFfmpegQScale(jpegQuality: number): number {
  * `computeShorterSideFitSize`, computed once -- every frame sampled from this
  * one source shares its aspect ratio, so `frame` is constant across the
  * whole run, not recomputed per frame), then composites the grid via
- * ffmpeg's `xstack` filter into one JPEG. No `pad`: since every sampled
- * frame already lands on `frame`'s exact dimensions (same source, same
- * aspect ratio, same scale), there's no leftover space to letterbox --
- * unlike the fixed-box mosaic design this replaced, which needed `pad`
- * precisely because a declared tile box could disagree with the source's
- * own orientation. `-autorotate 1` is passed explicitly rather than relying
- * on ffmpeg's own default (on since ~4.4, unconfirmed as pinned anywhere in
- * this project) -- see `docs/architecture/thumbnails.md`. Temp per-frame
- * PNGs are written under a fresh temp dir, always removed in `finally`.
+ * ffmpeg's `xstack` filter into one still image, encoded per
+ * `ffmpegMosaicArgsForEncoding`. No `pad`: since every sampled frame already
+ * lands on `frame`'s exact dimensions (same source, same aspect ratio, same
+ * scale), there's no leftover space to letterbox -- unlike the fixed-box
+ * mosaic design this replaced, which needed `pad` precisely because a
+ * declared tile box could disagree with the source's own orientation.
+ * `-autorotate 1` is passed explicitly rather than relying on ffmpeg's own
+ * default (on since ~4.4, unconfirmed as pinned anywhere in this project) --
+ * see `docs/architecture/thumbnails.md`. Temp per-frame PNGs are written
+ * under a fresh temp dir, always removed in `finally`.
  */
 async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logger): Promise<void> {
   const tileCount = input.tileRowCount * input.tileColumnCount;
   const frame = computeShorterSideFitSize(
     { width: input.sourceWidth, height: input.sourceHeight },
-    input.tileSize,
+    input.shorterSide,
   );
 
   const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "sync1-mosaic-"));
@@ -298,8 +361,7 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logg
         "1",
         "-update",
         "1",
-        "-q:v",
-        String(mapJpegQualityToFfmpegQScale(input.jpegQuality)),
+        ...ffmpegMosaicArgsForEncoding(input.encoding),
         input.destPath,
       ],
       "ffmpeg (mosaic composite)",
@@ -310,18 +372,43 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logg
   }
 }
 
-export interface GenerateVideoGifInput {
+export interface GenerateVideoPreviewInput {
   sourcePath: string;
-  /** Always a .gif destination -- video GIFs are always GIF regardless of the source container. */
   destPath: string;
   sourceWidth: number;
   sourceHeight: number;
   durationSeconds: number;
   frameCount: number;
-  /** Per-frame display duration. Converted to an input framerate (`1000 / frameDelayMs`) -- ffmpeg's gif muxer derives each frame's stored delay from the stream's own framerate, there's no separate per-frame-delay flag to set directly. */
+  /**
+   * Per-frame display duration. Converted to an input framerate
+   * (`1000 / frameDelayMs`) -- neither muxer takes a per-frame duration
+   * flag directly. Fidelity differs by `encoding.outputMime`: GIF stores
+   * the delay in centiseconds (10ms floor granularity, and a stored value
+   * of 0-1cs is clamped to 100ms by most browsers), animated WebP stores
+   * milliseconds exactly -- see docs/cli/thumbnail_policy.md.
+   */
   frameDelayMs: number;
-  /** Each frame's shorter-side target in pixels -- see `computeShorterSideFitSize`. Reuses a mosaic policy's own `tileSize` field/flag name deliberately, rather than a GIF-specific one -- see docs/architecture/thumbnails.md. */
-  tileSize: number;
+  /** Each frame's shorter-side target in pixels -- see `computeShorterSideFitSize`. */
+  shorterSide: number;
+  encoding: PreviewEncoding;
+}
+
+/**
+ * ffmpeg's `paletteuse` filter takes the exact same dither names our own
+ * `ThumbnailGifDither` enum does (verified against this build), so the
+ * value passes straight through with no mapping -- except `bayer`, which
+ * additionally takes a `bayer_scale` sub-parameter ffmpeg has no default
+ * opinion on. There's no policy field for it (mirroring
+ * `reserve_transparent=0` below -- both are fixed rather than exposed), so
+ * a mid-range constant is hardcoded here.
+ */
+const BAYER_SCALE = 3;
+
+function paletteuseFilterFor(
+  encoding: Extract<PreviewEncoding, { outputMime: "image/gif" }>,
+): string {
+  const bayerScale = encoding.gifDither === "bayer" ? `:bayer_scale=${BAYER_SCALE}` : "";
+  return `paletteuse=dither=${encoding.gifDither}${bayerScale}`;
 }
 
 /**
@@ -330,28 +417,34 @@ export interface GenerateVideoGifInput {
  * (same timestamp formula, same per-frame `ffmpeg` invocation, same
  * `computeShorterSideFitSize` frame sizing), since stage 1 (getting N
  * correctly-scaled PNG frames onto disk) doesn't care what stage 2 does
- * with them. Stage 2 replaces `xstack`'s single-JPEG grid composite with
- * the standard two-pass high-quality animated-GIF pipeline: `palettegen`
- * builds one shared palette across every frame (a naive per-frame or
- * fixed palette produces visibly banded/dithered output), then
- * `paletteuse` re-encodes the frame sequence against that palette into
- * the final looping GIF (`-loop 0`). Both passes read the same on-disk
- * frame sequence via ffmpeg's image2 demuxer (`frame-%d.png`,
- * `-start_number 0` explicit rather than relying on its default) at the
- * same input framerate, derived from `frameDelayMs` -- there's no
- * separate "set this frame's delay" flag; the gif muxer stores each
- * frame's delay as however long the filtered stream says it should be on
- * screen. Temporary per-frame PNGs (and the intermediate palette) live
+ * with them. Stage 2 branches on `encoding.outputMime`:
+ *
+ * - `image/gif`: the standard two-pass high-quality animated-GIF pipeline.
+ *   `palettegen=max_colors=N:reserve_transparent=0` builds one shared
+ *   palette across every frame (`reserve_transparent=0` is hardcoded, not a
+ *   policy field -- our frames are always opaque, so the reserved slot is
+ *   pure waste); `paletteuse=dither=D` re-encodes the frame sequence
+ *   against that palette into the final looping GIF (`-loop 0`).
+ * - `image/webp`: a single pass, `-c:v libwebp_anim`, directly on the same
+ *   frame sequence -- animated WebP needs no separate palette step.
+ *
+ * Both passes read the same on-disk frame sequence via ffmpeg's image2
+ * demuxer (`frame-%d.png`, `-start_number 0` explicit rather than relying
+ * on its default) at the same input framerate, derived from `frameDelayMs`.
+ * Temporary per-frame PNGs (and, for GIF, the intermediate palette) live
  * under a fresh temp directory, always removed in a `finally`.
  */
-async function generateVideoGif(input: GenerateVideoGifInput, logger: Logger): Promise<void> {
+async function generateVideoPreview(
+  input: GenerateVideoPreviewInput,
+  logger: Logger,
+): Promise<void> {
   const frame = computeShorterSideFitSize(
     { width: input.sourceWidth, height: input.sourceHeight },
-    input.tileSize,
+    input.shorterSide,
   );
   const fps = 1000 / input.frameDelayMs;
 
-  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "sync1-gif-"));
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "sync1-preview-"));
   try {
     for (let i = 0; i < input.frameCount; i++) {
       const timestampSeconds = (input.durationSeconds * (i + 0.5)) / input.frameCount;
@@ -379,46 +472,73 @@ async function generateVideoGif(input: GenerateVideoGifInput, logger: Logger): P
     }
 
     const framePattern = path.join(tempDir, "frame-%d.png");
-    const palettePath = path.join(tempDir, "palette.png");
-    await runTool(
-      "ffmpeg",
-      [
-        "-y",
-        "-start_number",
-        "0",
-        "-framerate",
-        fps.toFixed(6),
-        "-i",
-        framePattern,
-        "-vf",
-        "palettegen",
-        palettePath,
-      ],
-      "ffmpeg (gif palette)",
-      logger,
-    );
 
-    await runTool(
-      "ffmpeg",
-      [
-        "-y",
-        "-start_number",
-        "0",
-        "-framerate",
-        fps.toFixed(6),
-        "-i",
-        framePattern,
-        "-i",
-        palettePath,
-        "-lavfi",
-        "paletteuse",
-        "-loop",
-        "0",
-        input.destPath,
-      ],
-      "ffmpeg (gif composite)",
-      logger,
-    );
+    if (input.encoding.outputMime === "image/gif") {
+      const palettePath = path.join(tempDir, "palette.png");
+      await runTool(
+        "ffmpeg",
+        [
+          "-y",
+          "-start_number",
+          "0",
+          "-framerate",
+          fps.toFixed(6),
+          "-i",
+          framePattern,
+          "-vf",
+          `palettegen=max_colors=${input.encoding.gifMaxColors}:reserve_transparent=0`,
+          palettePath,
+        ],
+        "ffmpeg (gif palette)",
+        logger,
+      );
+
+      await runTool(
+        "ffmpeg",
+        [
+          "-y",
+          "-start_number",
+          "0",
+          "-framerate",
+          fps.toFixed(6),
+          "-i",
+          framePattern,
+          "-i",
+          palettePath,
+          "-lavfi",
+          paletteuseFilterFor(input.encoding),
+          "-loop",
+          "0",
+          input.destPath,
+        ],
+        "ffmpeg (gif composite)",
+        logger,
+      );
+    } else {
+      await runTool(
+        "ffmpeg",
+        [
+          "-y",
+          "-start_number",
+          "0",
+          "-framerate",
+          fps.toFixed(6),
+          "-i",
+          framePattern,
+          "-c:v",
+          "libwebp_anim",
+          "-quality",
+          String(input.encoding.webpQuality),
+          "-lossless",
+          input.encoding.webpLossless ? "1" : "0",
+          "-loop",
+          "0",
+          input.destPath,
+        ],
+        "ffmpeg (webp composite)",
+        logger,
+      );
+    }
   } finally {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   }
@@ -427,5 +547,5 @@ async function generateVideoGif(input: GenerateVideoGifInput, logger: Logger): P
 export const realThumbnailGenerator: ThumbnailGenerator = {
   generateImageThumbnail,
   generateVideoMosaic,
-  generateVideoGif,
+  generateVideoPreview,
 };

@@ -10,12 +10,15 @@ import { localStateDbPath, localVaultJsonPath, localRemoteConfigPath } from "../
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import {
   ThumbnailPoliciesRepository,
-  GENERATE_BRANCH_FIELDS,
+  SIZING_FIELDS,
+  ENCODING_FIELDS,
   type ThumbnailPolicyRow,
   type ThumbnailPolicyAction,
   type ThumbnailPolicyMediaType,
   type ThumbnailResizingStrategy,
   type ThumbnailOutputType,
+  type ThumbnailOutputMime,
+  type ThumbnailGifDither,
   type ThumbnailPolicyCreateInput,
   type ThumbnailPolicyUpdate,
   type GenerateFieldName,
@@ -33,15 +36,20 @@ interface GenerateFieldOptions {
   mediaType?: string;
   resizingStrategy?: string;
   outputType?: string;
+  outputMime?: string;
   imageWidth?: string;
   imageHeight?: string;
   shorterSide?: string;
   tileRows?: string;
   tileColumns?: string;
-  tileSize?: string;
   frameCount?: string;
   frameDelayMs?: string;
   jpegQuality?: string;
+  pngCompressionLevel?: string;
+  webpQuality?: string;
+  webpLossless?: string;
+  gifMaxColors?: string;
+  gifDither?: string;
 }
 
 interface CreateOptions extends RootOption, GenerateFieldOptions {
@@ -99,10 +107,47 @@ function parseResizingStrategy(raw: string): ThumbnailResizingStrategy {
 }
 
 function parseOutputType(raw: string): ThumbnailOutputType {
-  if (raw !== "mosaic" && raw !== "gif") {
-    throw new Error(`invalid output type "${raw}" — expected "mosaic" or "gif"`);
+  if (raw !== "mosaic" && raw !== "preview") {
+    throw new Error(`invalid output type "${raw}" — expected "mosaic" or "preview"`);
   }
   return raw;
+}
+
+const OUTPUT_MIME_VALUES: readonly ThumbnailOutputMime[] = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+];
+
+function parseOutputMime(raw: string): ThumbnailOutputMime {
+  if (!(OUTPUT_MIME_VALUES as readonly string[]).includes(raw)) {
+    throw new Error(
+      `invalid --output-mime "${raw}" — expected one of ${OUTPUT_MIME_VALUES.join(", ")}`,
+    );
+  }
+  return raw as ThumbnailOutputMime;
+}
+
+const GIF_DITHER_VALUES: readonly ThumbnailGifDither[] = [
+  "none",
+  "bayer",
+  "heckbert",
+  "floyd_steinberg",
+  "sierra2",
+  "sierra2_4a",
+  "sierra3",
+  "burkes",
+  "atkinson",
+];
+
+function parseGifDither(raw: string): ThumbnailGifDither {
+  if (!(GIF_DITHER_VALUES as readonly string[]).includes(raw)) {
+    throw new Error(
+      `invalid --gif-dither "${raw}" — expected one of ${GIF_DITHER_VALUES.join(", ")}`,
+    );
+  }
+  return raw as ThumbnailGifDither;
 }
 
 function parsePositiveInt(raw: string, flagName: string): number {
@@ -113,12 +158,56 @@ function parsePositiveInt(raw: string, flagName: string): number {
   return n;
 }
 
+/** GIF's stored delay is centiseconds, and most browsers clamp a stored 0-1cs delay to 100ms -- below 20ms the requested delay is not what plays back, so this is rejected outright rather than silently rounded. See docs/cli/thumbnail_policy.md. */
+const MIN_FRAME_DELAY_MS = 20;
+
+function parseFrameDelayMs(raw: string): number {
+  const n = parsePositiveInt(raw, "--frame-delay-ms");
+  if (n < MIN_FRAME_DELAY_MS) {
+    throw new Error(
+      `invalid --frame-delay-ms "${raw}" — must be at least ${MIN_FRAME_DELAY_MS} (lower values make GIF playback unreliable)`,
+    );
+  }
+  return n;
+}
+
 function parseJpegQuality(raw: string): number {
   const q = Number(raw);
   if (!Number.isInteger(q) || q < 1 || q > 100) {
     throw new Error(`invalid --jpeg-quality "${raw}" — expected an integer 1-100`);
   }
   return q;
+}
+
+function parsePngCompressionLevel(raw: string): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 9) {
+    throw new Error(`invalid --png-compression-level "${raw}" — expected an integer 0-9`);
+  }
+  return n;
+}
+
+function parseWebpQuality(raw: string): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 100) {
+    throw new Error(`invalid --webp-quality "${raw}" — expected an integer 1-100`);
+  }
+  return n;
+}
+
+function parseWebpLossless(raw: string): boolean {
+  if (raw !== "true" && raw !== "false") {
+    throw new Error(`invalid --webp-lossless "${raw}" — expected "true" or "false"`);
+  }
+  return raw === "true";
+}
+
+function parseGifMaxColors(raw: string): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 2 || n > 256) {
+    throw new Error(`invalid --gif-max-colors "${raw}" — expected an integer 2-256`);
+  }
+  return n;
 }
 
 function parseMimeTypes(raw: string): string[] {
@@ -134,19 +223,23 @@ interface ParsedGenerateFields {
   shorterSide?: number;
   tileRowCount?: number;
   tileColumnCount?: number;
-  tileSize?: number;
   frameCount?: number;
   frameDelayMs?: number;
   jpegQuality?: number;
+  pngCompressionLevel?: number;
+  webpQuality?: number;
+  webpLossless?: boolean;
+  gifMaxColors?: number;
+  gifDither?: ThumbnailGifDither;
 }
 
 /**
  * The CLI's own flag name and raw-option-key for every field the
- * repository's `GENERATE_BRANCH_FIELDS` knows about -- the two field
- * names that differ from their repository name (`tileRows`/`tileColumns`
- * vs `tileRowCount`/`tileColumnCount`) are historical, kept for CLI
- * flag-naming ergonomics (`--tile-rows`, not `--tile-row-count`); every
- * other field's CLI option key already matches its repository name
+ * repository's `SIZING_FIELDS`/`ENCODING_FIELDS` know about -- the two
+ * field names that differ from their repository name (`tileRows`/
+ * `tileColumns` vs `tileRowCount`/`tileColumnCount`) are historical, kept
+ * for CLI flag-naming ergonomics (`--tile-rows`, not `--tile-row-count`);
+ * every other field's CLI option key already matches its repository name
  * one-for-one.
  */
 const FIELD_INFO: Record<
@@ -158,20 +251,39 @@ const FIELD_INFO: Record<
   shorterSide: { flag: "--shorter-side", optionKey: "shorterSide" },
   tileRowCount: { flag: "--tile-rows", optionKey: "tileRows" },
   tileColumnCount: { flag: "--tile-columns", optionKey: "tileColumns" },
-  tileSize: { flag: "--tile-size", optionKey: "tileSize" },
   frameCount: { flag: "--frame-count", optionKey: "frameCount" },
   frameDelayMs: { flag: "--frame-delay-ms", optionKey: "frameDelayMs" },
   jpegQuality: { flag: "--jpeg-quality", optionKey: "jpegQuality" },
+  pngCompressionLevel: { flag: "--png-compression-level", optionKey: "pngCompressionLevel" },
+  webpQuality: { flag: "--webp-quality", optionKey: "webpQuality" },
+  webpLossless: { flag: "--webp-lossless", optionKey: "webpLossless" },
+  gifMaxColors: { flag: "--gif-max-colors", optionKey: "gifMaxColors" },
+  gifDither: { flag: "--gif-dither", optionKey: "gifDither" },
 };
 
 const ALL_GENERATE_FIELD_NAMES = Object.keys(FIELD_INFO) as GenerateFieldName[];
 
-/** Fields that, by themselves, name exactly one branch -- used for the edit-only "don't mix branches" pre-check below. Deliberately excludes `tileSize`/`jpegQuality`, which are shared across more than one branch and so don't uniquely indicate one. */
+/**
+ * Encoding fields that have a CLI-layer default (see `ENCODING_DEFAULTS`
+ * below) and so aren't required on `create` even though they're part of
+ * their `output_mime`'s own field set. `jpegQuality` is deliberately the
+ * only encoding field with no default -- it was already a required flag
+ * before this policy gained a second discriminant, and there was no reason
+ * to change that.
+ */
+const REQUIRED_ENCODING_FIELDS: Record<ThumbnailOutputMime, GenerateFieldName[]> = {
+  "image/jpeg": ["jpegQuality"],
+  "image/png": [],
+  "image/webp": [],
+  "image/gif": [],
+};
+
+/** Fields that, by themselves, name exactly one sizing branch -- used for the edit-only "don't mix branches" pre-check below. Deliberately excludes `shorterSide` (shared by every branch but `fit_to_box`) and every encoding field (shared across sizing branches entirely), neither of which uniquely indicates one branch. */
 const BRANCH_ONLY_FIELDS: Record<GenerateBranchKey, GenerateFieldName[]> = {
   "image:fit_to_box": ["imageWidth", "imageHeight"],
-  "image:resize_shorter_side": ["shorterSide"],
+  "image:resize_shorter_side": [],
   "video:mosaic": ["tileRowCount", "tileColumnCount"],
-  "video:gif": ["frameCount", "frameDelayMs"],
+  "video:preview": ["frameCount", "frameDelayMs"],
 };
 
 function isPresent(opts: GenerateFieldOptions, name: GenerateFieldName): boolean {
@@ -191,26 +303,34 @@ function parseGenerateFields(opts: GenerateFieldOptions): ParsedGenerateFields {
     fields.tileRowCount = parsePositiveInt(opts.tileRows, "--tile-rows");
   if (opts.tileColumns !== undefined)
     fields.tileColumnCount = parsePositiveInt(opts.tileColumns, "--tile-columns");
-  if (opts.tileSize !== undefined) fields.tileSize = parsePositiveInt(opts.tileSize, "--tile-size");
   if (opts.frameCount !== undefined)
     fields.frameCount = parsePositiveInt(opts.frameCount, "--frame-count");
-  if (opts.frameDelayMs !== undefined)
-    fields.frameDelayMs = parsePositiveInt(opts.frameDelayMs, "--frame-delay-ms");
+  if (opts.frameDelayMs !== undefined) fields.frameDelayMs = parseFrameDelayMs(opts.frameDelayMs);
   if (opts.jpegQuality !== undefined) fields.jpegQuality = parseJpegQuality(opts.jpegQuality);
+  if (opts.pngCompressionLevel !== undefined)
+    fields.pngCompressionLevel = parsePngCompressionLevel(opts.pngCompressionLevel);
+  if (opts.webpQuality !== undefined) fields.webpQuality = parseWebpQuality(opts.webpQuality);
+  if (opts.webpLossless !== undefined) fields.webpLossless = parseWebpLossless(opts.webpLossless);
+  if (opts.gifMaxColors !== undefined) fields.gifMaxColors = parseGifMaxColors(opts.gifMaxColors);
+  if (opts.gifDither !== undefined) fields.gifDither = parseGifDither(opts.gifDither);
   return fields;
 }
 
 /**
  * Fast, friendly, pre-network-round-trip check for `create`: a "skip"
  * policy must supply none of --media-type/--resizing-strategy/--output-
- * type or any generate flag; a "generate" policy must supply
+ * type/--output-mime or any generate flag; a "generate" policy must supply
  * --media-type, then (for "image") --resizing-strategy or (for "video")
- * --output-type, then exactly that branch's own fields
- * (`GENERATE_BRANCH_FIELDS`) and none of the other branches'. The
- * repository re-validates the same invariant regardless (its own CHECK
- * constraint enforces it at the SQL level too) -- this only exists to
- * fail before `setupMutationContext`'s password/KDF/network work for an
- * obviously-wrong combination of flags.
+ * --output-type -- together the SIZING branch -- then --output-mime, then
+ * that branch's own required fields (`SIZING_FIELDS` for sizing,
+ * `REQUIRED_ENCODING_FIELDS` for encoding -- a defaultable encoding field
+ * is optional here, see `ENCODING_DEFAULTS`) and none of the other
+ * branches'/mimes' own fields. The repository re-validates the same
+ * invariant regardless (its own CHECK constraint enforces it at the SQL
+ * level too, including the sizing/encoding *legality* pairing this
+ * pre-check doesn't attempt) -- this only exists to fail before
+ * `setupMutationContext`'s password/KDF/network work for an obviously-wrong
+ * combination of flags.
  */
 function assertGenerateFlagsConsistentForCreate(
   action: ThumbnailPolicyAction,
@@ -224,6 +344,7 @@ function assertGenerateFlagsConsistentForCreate(
       ...(opts.mediaType !== undefined ? ["--media-type"] : []),
       ...(opts.resizingStrategy !== undefined ? ["--resizing-strategy"] : []),
       ...(opts.outputType !== undefined ? ["--output-type"] : []),
+      ...(opts.outputMime !== undefined ? ["--output-mime"] : []),
       ...present,
     ];
     if (allPresent.length > 0) {
@@ -237,7 +358,7 @@ function assertGenerateFlagsConsistentForCreate(
   }
   const mediaType = parseMediaType(opts.mediaType);
 
-  let branchKey: GenerateBranchKey;
+  let sizingKey: GenerateBranchKey;
   if (mediaType === "image") {
     if (opts.outputType !== undefined) {
       throw new Error('a "generate" "image" policy can\'t set --output-type');
@@ -245,7 +366,7 @@ function assertGenerateFlagsConsistentForCreate(
     if (opts.resizingStrategy === undefined) {
       throw new Error('a "generate" "image" policy needs --resizing-strategy');
     }
-    branchKey = `image:${parseResizingStrategy(opts.resizingStrategy)}`;
+    sizingKey = `image:${parseResizingStrategy(opts.resizingStrategy)}`;
   } else {
     if (opts.resizingStrategy !== undefined) {
       throw new Error('a "generate" "video" policy can\'t set --resizing-strategy');
@@ -253,12 +374,20 @@ function assertGenerateFlagsConsistentForCreate(
     if (opts.outputType === undefined) {
       throw new Error('a "generate" "video" policy needs --output-type');
     }
-    branchKey = `video:${parseOutputType(opts.outputType)}`;
+    sizingKey = `video:${parseOutputType(opts.outputType)}`;
   }
-  const branchLabel = branchKey.replace(":", "/");
+  const sizingLabel = sizingKey.replace(":", "/");
 
-  const ownFieldNames = GENERATE_BRANCH_FIELDS[branchKey];
-  const missing = ownFieldNames
+  if (opts.outputMime === undefined) {
+    throw new Error(`a "generate" "${sizingLabel}" policy needs --output-mime`);
+  }
+  const outputMime = parseOutputMime(opts.outputMime);
+  const branchLabel = `${sizingLabel}/${outputMime}`;
+
+  const ownFieldNames = [...SIZING_FIELDS[sizingKey], ...ENCODING_FIELDS[outputMime]];
+  const requiredFieldNames = [...SIZING_FIELDS[sizingKey], ...REQUIRED_ENCODING_FIELDS[outputMime]];
+
+  const missing = requiredFieldNames
     .filter((name) => !isPresent(opts, name))
     .map((name) => FIELD_INFO[name].flag);
   if (missing.length > 0) {
@@ -275,11 +404,11 @@ function assertGenerateFlagsConsistentForCreate(
 
 /**
  * Cheap, edit-only pre-check: a single `edit` call can't name more than
- * one branch's own exclusive fields at once (e.g. both --image-width and
- * --frame-count), and can't set both --resizing-strategy and
- * --output-type (one is image-only, the other video-only). Full branch-
- * aware validation -- what's *required* depends on the *existing* row,
- * which isn't available here without a network round trip -- stays in
+ * one sizing branch's own exclusive fields at once (e.g. both
+ * --image-width and --frame-count), and can't set both --resizing-strategy
+ * and --output-type (one is image-only, the other video-only). Full
+ * branch-aware validation -- what's *required* depends on the *existing*
+ * row, which isn't available here without a network round trip -- stays in
  * the repository's own `update()`, same as today.
  */
 function assertNoMixedBranchFlagsForEdit(opts: EditOptions): void {
@@ -326,25 +455,92 @@ async function runList(opts: RootOption): Promise<ThumbnailPolicyRow[]> {
   }
 }
 
-/** One-line summary of a row's media type, branch, and generation parameters -- "-" for a 'skip' row, which has none. Used by `list`'s plain-text (non-`--json`) output only; `--json` already returns every field structured. */
+/** One-line summary of a row's media type, sizing, and encoding parameters -- "-" for a 'skip' row, which has none. Used by `list`'s plain-text (non-`--json`) output only; `--json` already returns every field structured. */
 function generateSummary(row: ThumbnailPolicyRow): string {
   if (row.action === "skip") return "-";
-  if (row.mediaType === "image") {
-    return row.resizingStrategy === "fit_to_box"
-      ? `image/fit_to_box(${row.imageWidth}x${row.imageHeight},q${row.jpegQuality})`
-      : `image/resize_shorter_side(${row.shorterSide},q${row.jpegQuality})`;
+
+  const sizing =
+    row.mediaType === "image"
+      ? row.resizingStrategy === "fit_to_box"
+        ? `image/fit_to_box(${row.imageWidth}x${row.imageHeight})`
+        : `image/resize_shorter_side(ss${row.shorterSide})`
+      : row.outputType === "mosaic"
+        ? `video/mosaic(${row.tileRowCount}x${row.tileColumnCount},ss${row.shorterSide})`
+        : `video/preview(ss${row.shorterSide},frames${row.frameCount},delay${row.frameDelayMs}ms)`;
+
+  const encoding =
+    row.outputMime === "image/jpeg"
+      ? `jpeg(q${row.jpegQuality})`
+      : row.outputMime === "image/png"
+        ? `png(level${row.pngCompressionLevel})`
+        : row.outputMime === "image/webp"
+          ? `webp(q${row.webpQuality},lossless${row.webpLossless ? 1 : 0})`
+          : `gif(colors${row.gifMaxColors},dither${row.gifDither})`;
+
+  return `${sizing} ${encoding}`;
+}
+
+/**
+ * CLI-layer defaults for encoding fields that don't have one -- applied
+ * only at `create` time, so the stored row is always concrete and the
+ * params segment (src/fs/thumbnail.ts) always reflects what was actually
+ * used. `edit` never applies these: an encoding field left unset there
+ * either carries over from the existing row (branch/mime unchanged) or is
+ * required explicitly (branch/mime changed) -- see
+ * `ThumbnailPoliciesRepository.update`'s own doc comment.
+ */
+const ENCODING_DEFAULTS = {
+  pngCompressionLevel: 9,
+  webpQuality: 80,
+  webpLossless: false,
+  gifMaxColors: 256,
+  gifDither: "sierra2_4a" as ThumbnailGifDither,
+};
+
+/**
+ * The ENCODING half of a `create` input, filling in `ENCODING_DEFAULTS`
+ * for any field the CLI caller didn't pass. `jpegQuality` has no default
+ * (`REQUIRED_ENCODING_FIELDS`) -- `assertGenerateFlagsConsistentForCreate`
+ * already guarantees it's present by the time this runs.
+ */
+function buildEncodingInput(outputMime: ThumbnailOutputMime, generateFields: ParsedGenerateFields) {
+  switch (outputMime) {
+    case "image/jpeg":
+      return { outputMime, jpegQuality: generateFields.jpegQuality! };
+    case "image/png":
+      return {
+        outputMime,
+        pngCompressionLevel:
+          generateFields.pngCompressionLevel ?? ENCODING_DEFAULTS.pngCompressionLevel,
+      };
+    case "image/webp":
+      return {
+        outputMime,
+        webpQuality: generateFields.webpQuality ?? ENCODING_DEFAULTS.webpQuality,
+        webpLossless: generateFields.webpLossless ?? ENCODING_DEFAULTS.webpLossless,
+      };
+    case "image/gif":
+      return {
+        outputMime,
+        gifMaxColors: generateFields.gifMaxColors ?? ENCODING_DEFAULTS.gifMaxColors,
+        gifDither: generateFields.gifDither ?? ENCODING_DEFAULTS.gifDither,
+      };
   }
-  return row.outputType === "mosaic"
-    ? `video/mosaic(${row.tileRowCount}x${row.tileColumnCount},ts${row.tileSize},q${row.jpegQuality})`
-    : `video/gif(ts${row.tileSize},frames${row.frameCount},delay${row.frameDelayMs}ms)`;
 }
 
 /**
  * Builds the real `ThumbnailPolicyCreateInput` union value from
  * independently-parsed pieces. The `!` assertions on `generateFields`'
  * own-type members are safe: `assertGenerateFlagsConsistentForCreate`
- * already ran (and would have thrown) before this is ever called, so
- * every field this branch needs is guaranteed present.
+ * already ran (and would have thrown) before this is ever called, so every
+ * required field this branch needs is guaranteed present (defaultable
+ * encoding fields are filled by `buildEncodingInput`). The `as
+ * ThumbnailPolicyCreateInput` casts on the video branches mirror the
+ * repository's own `fromRawRow` precedent: TS can't statically know
+ * `LEGAL_OUTPUT_MIMES` already rules out e.g. gif-for-mosaic here -- the
+ * repository's own validation is what actually guarantees it at runtime,
+ * with a friendly error (see `assertGenerateFlagsConsistentForCreate` and
+ * `ThumbnailPoliciesRepository.create`).
  */
 function buildCreateInput(
   name: string,
@@ -359,6 +555,8 @@ function buildCreateInput(
   }
 
   const mediaType = parseMediaType(opts.mediaType!);
+  const outputMime = parseOutputMime(opts.outputMime!);
+  const encoding = buildEncodingInput(outputMime, generateFields);
 
   if (mediaType === "image") {
     const resizingStrategy = parseResizingStrategy(opts.resizingStrategy!);
@@ -372,8 +570,8 @@ function buildCreateInput(
         mimeTypes,
         imageWidth: generateFields.imageWidth!,
         imageHeight: generateFields.imageHeight!,
-        jpegQuality: generateFields.jpegQuality!,
-      };
+        ...encoding,
+      } as ThumbnailPolicyCreateInput;
     }
     return {
       name,
@@ -383,8 +581,8 @@ function buildCreateInput(
       resizingStrategy: "resize_shorter_side",
       mimeTypes,
       shorterSide: generateFields.shorterSide!,
-      jpegQuality: generateFields.jpegQuality!,
-    };
+      ...encoding,
+    } as ThumbnailPolicyCreateInput;
   }
 
   const outputType = parseOutputType(opts.outputType!);
@@ -396,23 +594,24 @@ function buildCreateInput(
       mediaType: "video",
       outputType: "mosaic",
       mimeTypes,
+      shorterSide: generateFields.shorterSide!,
       tileRowCount: generateFields.tileRowCount!,
       tileColumnCount: generateFields.tileColumnCount!,
-      tileSize: generateFields.tileSize!,
-      jpegQuality: generateFields.jpegQuality!,
-    };
+      ...encoding,
+    } as ThumbnailPolicyCreateInput;
   }
   return {
     name,
     glob,
     action: "generate",
     mediaType: "video",
-    outputType: "gif",
+    outputType: "preview",
     mimeTypes,
-    tileSize: generateFields.tileSize!,
+    shorterSide: generateFields.shorterSide!,
     frameCount: generateFields.frameCount!,
     frameDelayMs: generateFields.frameDelayMs!,
-  };
+    ...encoding,
+  } as ThumbnailPolicyCreateInput;
 }
 
 async function runCreate(
@@ -452,6 +651,7 @@ async function runEdit(
     if (opts.resizingStrategy !== undefined)
       changes.resizingStrategy = parseResizingStrategy(opts.resizingStrategy);
     if (opts.outputType !== undefined) changes.outputType = parseOutputType(opts.outputType);
+    if (opts.outputMime !== undefined) changes.outputMime = parseOutputMime(opts.outputMime);
     Object.assign(changes, parseGenerateFields(opts));
     if (!new ThumbnailPoliciesRepository(db).update(id, changes)) {
       throw new Error(`no thumbnail policy with id ${id}`);
@@ -535,24 +735,35 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     .option("--image-height <n>", "generate policies only, for 'fit_to_box' image policies")
     .option(
       "--shorter-side <n>",
-      "generate policies only, for 'resize_shorter_side' image policies -- the resized image's shorter side, in pixels",
+      "generate policies only, for every branch except 'fit_to_box' -- one output unit's shorter side, in pixels: the resized image's own for 'resize_shorter_side', one tile's for 'mosaic' (not the composed grid's), one frame's for 'preview'",
     )
     .option(
-      "--output-type <mosaic|gif>",
+      "--output-type <mosaic|preview>",
       "generate/video policies only; which of the tile-row/column or frame-count/delay fields applies",
     )
     .option("--tile-rows <n>", "generate policies only, for 'mosaic' video policies")
     .option("--tile-columns <n>", "generate policies only, for 'mosaic' video policies")
-    .option(
-      "--tile-size <n>",
-      "generate policies only, for video policies -- one mosaic tile's or gif frame's shorter side, in pixels",
-    )
-    .option("--frame-count <n>", "generate policies only, for 'gif' video policies")
+    .option("--frame-count <n>", "generate policies only, for 'preview' video policies")
     .option(
       "--frame-delay-ms <n>",
-      "generate policies only, for 'gif' video policies -- each frame's display duration",
+      `generate policies only, for 'preview' video policies -- each frame's display duration, minimum ${MIN_FRAME_DELAY_MS}ms. GIF output stores this in centiseconds (10ms granularity, rounded); animated WebP stores it exactly.`,
     )
-    .option("--jpeg-quality <1-100>", "generate policies only, every branch except 'gif'")
+    .option(
+      "--output-mime <image/jpeg|image/png|image/webp|image/gif>",
+      "generate policies only, always required -- the produced thumbnail's format. 'mosaic' never allows image/gif (a one-frame \"animation\"); 'preview' only allows image/gif or image/webp (always animated)",
+    )
+    .option("--jpeg-quality <1-100>", "required when --output-mime is image/jpeg")
+    .option(
+      "--png-compression-level <0-9>",
+      "when --output-mime is image/png -- lossless compression effort, not visual quality (default 9)",
+    )
+    .option("--webp-quality <1-100>", "when --output-mime is image/webp (default 80)")
+    .option("--webp-lossless <true|false>", "when --output-mime is image/webp (default false)")
+    .option("--gif-max-colors <2-256>", "when --output-mime is image/gif (default 256)")
+    .option(
+      `--gif-dither <${GIF_DITHER_VALUES.join("|")}>`,
+      "when --output-mime is image/gif (default sierra2_4a)",
+    )
     .action(async (glob: string, action: string, opts: CreateOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
       const json = globalOpts.json ?? false;
@@ -605,22 +816,33 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     )
     .option("--image-width <n>", "new image width ('fit_to_box' image policies only)")
     .option("--image-height <n>", "new image height ('fit_to_box' image policies only)")
-    .option(
-      "--shorter-side <n>",
-      "new shorter side, in pixels ('resize_shorter_side' image policies only)",
-    )
-    .option("--output-type <mosaic|gif>", "new output type (generate/video policies only)")
+    .option("--shorter-side <n>", "new shorter side, in pixels (every branch except 'fit_to_box')")
+    .option("--output-type <mosaic|preview>", "new output type (generate/video policies only)")
     .option("--tile-rows <n>", "new tile row count ('mosaic' video policies only)")
     .option("--tile-columns <n>", "new tile column count ('mosaic' video policies only)")
+    .option("--frame-count <n>", "new frame count ('preview' video policies only)")
     .option(
-      "--tile-size <n>",
-      "new mosaic tile's or gif frame's shorter side, in pixels (generate/video policies only)",
+      "--frame-delay-ms <n>",
+      `new per-frame display duration ('preview' video policies only, minimum ${MIN_FRAME_DELAY_MS}ms)`,
     )
-    .option("--frame-count <n>", "new frame count ('gif' video policies only)")
-    .option("--frame-delay-ms <n>", "new per-frame display duration ('gif' video policies only)")
     .option(
-      "--jpeg-quality <1-100>",
-      "new jpeg quality (generate policies only, every branch except 'gif')",
+      "--output-mime <image/jpeg|image/png|image/webp|image/gif>",
+      "new output mime (generate policies only)",
+    )
+    .option("--jpeg-quality <1-100>", "new jpeg quality (when output mime is image/jpeg)")
+    .option(
+      "--png-compression-level <0-9>",
+      "new png compression level (when output mime is image/png)",
+    )
+    .option("--webp-quality <1-100>", "new webp quality (when output mime is image/webp)")
+    .option(
+      "--webp-lossless <true|false>",
+      "new webp lossless flag (when output mime is image/webp)",
+    )
+    .option("--gif-max-colors <2-256>", "new gif max colors (when output mime is image/gif)")
+    .option(
+      `--gif-dither <${GIF_DITHER_VALUES.join("|")}>`,
+      "new gif dither mode (when output mime is image/gif)",
     )
     .action(async (idRaw: string, opts: EditOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();

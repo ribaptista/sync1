@@ -56,7 +56,7 @@ documented consequence of scoping by directory rather than a bug; see
   "stale_stub_previews": [
     {
       "path": "clip.mp4",
-      "thumbnail_path": "_thumbnail/clip.mp4.p1-video_mosaic-tr4-tc4-ts90-q80.a1b2c3.jpg"
+      "thumbnail_path": "_thumbnail/clip.mp4.p2-video_mosaic-ss90-tr4-tc4-fmtimage_jpeg-q80.a1b2c3.jpg"
     }
   ],
   "errors": 0
@@ -96,7 +96,8 @@ all).
 sync1 thumbnail_policy create "**/*.jpg" generate --root ~/Pictures \
   --name jpg_thumb --mime-types image/jpeg --media-type image \
   --resizing-strategy fit_to_box \
-  --image-width 320 --image-height 240 --jpeg-quality 80 --json
+  --image-width 320 --image-height 240 \
+  --output-mime image/jpeg --jpeg-quality 80 --json
 
 sync1 update_cache --root ~/Pictures --json
 sync1 thumbnail state --root ~/Pictures --json

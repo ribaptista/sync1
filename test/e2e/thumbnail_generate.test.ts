@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -44,7 +45,7 @@ describe("generateImageThumbnail (real convert)", () => {
         destPath,
         width: size.width,
         height: size.height,
-        jpegQuality: 80,
+        encoding: { outputMime: "image/jpeg", jpegQuality: 80 },
       },
       silentLogger,
     );
@@ -53,7 +54,7 @@ describe("generateImageThumbnail (real convert)", () => {
     expect(probed).toEqual({ kind: "image", mimeType: "image/jpeg", width: 20, height: 15 });
   });
 
-  it("generates a PNG thumbnail (format matches the original, no -quality flag)", async () => {
+  it("generates a PNG thumbnail", async () => {
     const size = computeContainFitSize({ width: 32, height: 24 }, { width: 16, height: 16 });
     const destPath = path.join(mkTempDir(), "thumb.png");
     await realThumbnailGenerator.generateImageThumbnail(
@@ -62,13 +63,64 @@ describe("generateImageThumbnail (real convert)", () => {
         destPath,
         width: size.width,
         height: size.height,
-        jpegQuality: 80,
+        encoding: { outputMime: "image/png", pngCompressionLevel: 9 },
       },
       silentLogger,
     );
 
     const probed = await realMediaProber.detectMedia(destPath);
     expect(probed).toMatchObject({ kind: "image", mimeType: "image/png" });
+  });
+
+  it("generates a WebP thumbnail (lossy)", async () => {
+    const size = computeContainFitSize({ width: 32, height: 24 }, { width: 16, height: 16 });
+    const destPath = path.join(mkTempDir(), "thumb.webp");
+    await realThumbnailGenerator.generateImageThumbnail(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.png"),
+        destPath,
+        width: size.width,
+        height: size.height,
+        encoding: { outputMime: "image/webp", webpQuality: 80, webpLossless: false },
+      },
+      silentLogger,
+    );
+
+    const probed = await realMediaProber.detectMedia(destPath);
+    expect(probed).toMatchObject({ kind: "image", mimeType: "image/webp" });
+  });
+
+  it("generates a GIF thumbnail from a still image, honoring gif_max_colors", async () => {
+    // tiny.jpg/tiny.png are synthetic 1-2 color fixtures -- quantizing them
+    // to 8 vs 256 colors makes no difference at all, since there's nothing
+    // to quantize. tiny.CR2 is a real photo, with real color complexity for
+    // gif_max_colors to actually act on.
+    const size = computeContainFitSize({ width: 3906, height: 2602 }, { width: 64, height: 64 });
+    const fewColorsPath = path.join(mkTempDir(), "few.gif");
+    const manyColorsPath = path.join(mkTempDir(), "many.gif");
+    for (const [destPath, gifMaxColors] of [
+      [fewColorsPath, 8],
+      [manyColorsPath, 256],
+    ] as const) {
+      await realThumbnailGenerator.generateImageThumbnail(
+        {
+          sourcePath: path.join(FIXTURES_DIR, "tiny.CR2"),
+          destPath,
+          width: size.width,
+          height: size.height,
+          encoding: { outputMime: "image/gif", gifMaxColors, gifDither: "sierra2_4a" },
+        },
+        silentLogger,
+      );
+    }
+
+    const probed = await realMediaProber.detectMedia(fewColorsPath);
+    expect(probed).toMatchObject({ kind: "image", mimeType: "image/gif" });
+    // A knob that's plumbed but ignored would still pass a bare mime-type
+    // assertion -- fewer palette colors on a real photo measurably shrinks
+    // the file, proving gif_max_colors actually reaches ImageMagick's
+    // -colors flag rather than being silently dropped.
+    expect(fs.statSync(fewColorsPath).size).toBeLessThan(fs.statSync(manyColorsPath).size);
   });
 
   it("generates an extreme-aspect-ratio thumbnail without distorting or cropping", async () => {
@@ -91,7 +143,7 @@ describe("generateImageThumbnail (real convert)", () => {
         destPath,
         width: extremeSize.width,
         height: extremeSize.height,
-        jpegQuality: 80,
+        encoding: { outputMime: "image/jpeg", jpegQuality: 80 },
       },
       silentLogger,
     );
@@ -105,13 +157,12 @@ describe("generateImageThumbnail (real convert)", () => {
     });
   });
 
-  it("generates a JPEG thumbnail from a Canon CR2 raw source (write-incapable format, forced to a JPEG destPath by the caller)", async () => {
+  it("generates a JPEG thumbnail from a Canon CR2 raw source (write-incapable format -- output_mime is required, so the destPath's own format is never inferred from the source)", async () => {
     // tiny.CR2 is 3906x2602 (landscape, ratio 1.501) -- generateImageThumbnail
     // itself is source-format-agnostic (just hands sourcePath/destPath to
-    // convert); the CR2-forces-.jpg-output decision lives one layer up, in
-    // expectedThumbExtension (src/fs/thumbnail.ts) -- this only proves
-    // convert can actually read a real CR2 and write a resized JPEG from
-    // it, which identify succeeding doesn't by itself guarantee.
+    // convert); this only proves convert can actually read a real CR2 and
+    // write a resized JPEG from it, which identify succeeding doesn't by
+    // itself guarantee.
     const size = computeContainFitSize({ width: 3906, height: 2602 }, { width: 100, height: 100 });
     const destPath = path.join(mkTempDir(), "thumb.jpg");
     await realThumbnailGenerator.generateImageThumbnail(
@@ -120,7 +171,7 @@ describe("generateImageThumbnail (real convert)", () => {
         destPath,
         width: size.width,
         height: size.height,
-        jpegQuality: 80,
+        encoding: { outputMime: "image/jpeg", jpegQuality: 80 },
       },
       silentLogger,
     );
@@ -154,14 +205,83 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
         durationSeconds: 2,
         tileRowCount: 2,
         tileColumnCount: 2,
-        tileSize: 12,
-        jpegQuality: 80,
+        shorterSide: 12,
+        encoding: { outputMime: "image/jpeg", jpegQuality: 80 },
       },
       silentLogger,
     );
 
     const probed = await realMediaProber.detectMedia(destPath);
     expect(probed).toEqual({ kind: "image", mimeType: "image/jpeg", width: 32, height: 24 });
+  });
+
+  it("shorterSide sizes one tile, not the composed grid -- a 2x2 mosaic at shorterSide 12 composes to roughly 2x that, not a 12-ish image", async () => {
+    // tiny.mp4 is 32x24, 2s at 5fps (10 real frames) -- tileRowCount *
+    // tileColumnCount must stay small enough that every sampled timestamp
+    // still lands before the source's last frame (~1.8s here); this is a
+    // fixture/sampling constraint, unrelated to what's under test, so the
+    // grid is kept to 2x2 rather than something more visually asymmetric.
+    // shorterSide 12 gives frame scale 12/24 = 0.5, so each tile is 16x12;
+    // the composed grid is 2 cols * 16 = 32 wide, 2 rows * 12 = 24 tall. If
+    // shorterSide instead sized the whole grid (the bug this test guards
+    // against), the composite would come out close to 12px on its own
+    // shorter side -- nowhere near 24x32.
+    const destPath = path.join(mkTempDir(), "mosaic.jpg");
+    await realThumbnailGenerator.generateVideoMosaic(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        tileRowCount: 2,
+        tileColumnCount: 2,
+        shorterSide: 12,
+        encoding: { outputMime: "image/jpeg", jpegQuality: 80 },
+      },
+      silentLogger,
+    );
+
+    const probed = await realMediaProber.detectMedia(destPath);
+    expect(probed).toEqual({ kind: "image", mimeType: "image/jpeg", width: 32, height: 24 });
+  });
+
+  it("generates a PNG mosaic honoring png_compression_level, and a WebP mosaic", async () => {
+    const pngPath = path.join(mkTempDir(), "mosaic.png");
+    await realThumbnailGenerator.generateVideoMosaic(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath: pngPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        tileRowCount: 2,
+        tileColumnCount: 2,
+        shorterSide: 12,
+        encoding: { outputMime: "image/png", pngCompressionLevel: 9 },
+      },
+      silentLogger,
+    );
+    const pngProbed = await realMediaProber.detectMedia(pngPath);
+    expect(pngProbed).toMatchObject({ kind: "image", mimeType: "image/png" });
+
+    const webpPath = path.join(mkTempDir(), "mosaic.webp");
+    await realThumbnailGenerator.generateVideoMosaic(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath: webpPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        tileRowCount: 2,
+        tileColumnCount: 2,
+        shorterSide: 12,
+        encoding: { outputMime: "image/webp", webpQuality: 80, webpLossless: false },
+      },
+      silentLogger,
+    );
+    const webpProbed = await realMediaProber.detectMedia(webpPath);
+    expect(webpProbed).toMatchObject({ kind: "image", mimeType: "image/webp" });
   });
 
   it("cleans up its temp frame directory even after generating successfully", async () => {
@@ -190,8 +310,8 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
         durationSeconds: 2,
         tileRowCount: 1,
         tileColumnCount: 3,
-        tileSize: 10,
-        jpegQuality: 50,
+        shorterSide: 10,
+        encoding: { outputMime: "image/jpeg", jpegQuality: 50 },
       },
       silentLogger,
     );
@@ -236,8 +356,8 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
         durationSeconds: 2,
         tileRowCount: 2,
         tileColumnCount: 1,
-        tileSize: 10,
-        jpegQuality: 80,
+        shorterSide: 10,
+        encoding: { outputMime: "image/jpeg", jpegQuality: 80 },
       },
       silentLogger,
     );
@@ -257,16 +377,15 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
   });
 });
 
-describe("generateVideoGif (real ffmpeg)", () => {
+describe("generateVideoPreview (real ffmpeg)", () => {
   it("generates an animated GIF sized by computeShorterSideFitSize, same frame-extraction shape as a mosaic", async () => {
     const destPath = path.join(mkTempDir(), "clip.gif");
-    // tiny.mp4 is 32x24 (landscape, min dimension 24). tileSize 16 (reused
-    // as the GIF's own per-frame shorter-side target, same knob a mosaic
-    // policy's tileSize is) gives scale 16/24, frame = {width:
-    // round(32*16/24)=21, height: round(24*16/24)=16} -- computed the same
-    // way generateVideoMosaic's own frame size is.
+    // tiny.mp4 is 32x24 (landscape, min dimension 24). shorterSide 16 gives
+    // scale 16/24, frame = {width: round(32*16/24)=21, height:
+    // round(24*16/24)=16} -- computed the same way generateVideoMosaic's
+    // own frame size is.
     const frame = computeShorterSideFitSize({ width: 32, height: 24 }, 16);
-    await realThumbnailGenerator.generateVideoGif(
+    await realThumbnailGenerator.generateVideoPreview(
       {
         sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
         destPath,
@@ -275,7 +394,8 @@ describe("generateVideoGif (real ffmpeg)", () => {
         durationSeconds: 2,
         frameCount: 4,
         frameDelayMs: 100,
-        tileSize: 16,
+        shorterSide: 16,
+        encoding: { outputMime: "image/gif", gifMaxColors: 256, gifDither: "sierra2_4a" },
       },
       silentLogger,
     );
@@ -294,9 +414,11 @@ describe("generateVideoGif (real ffmpeg)", () => {
 
   it("cleans up its temp frame directory even after generating successfully", async () => {
     const destPath = path.join(mkTempDir(), "clip.gif");
-    const tmpEntriesBefore = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith("sync1-gif-"));
+    const tmpEntriesBefore = fs
+      .readdirSync(os.tmpdir())
+      .filter((n) => n.startsWith("sync1-preview-"));
 
-    await realThumbnailGenerator.generateVideoGif(
+    await realThumbnailGenerator.generateVideoPreview(
       {
         sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
         destPath,
@@ -305,12 +427,15 @@ describe("generateVideoGif (real ffmpeg)", () => {
         durationSeconds: 2,
         frameCount: 3,
         frameDelayMs: 200,
-        tileSize: 10,
+        shorterSide: 10,
+        encoding: { outputMime: "image/gif", gifMaxColors: 256, gifDither: "sierra2_4a" },
       },
       silentLogger,
     );
 
-    const tmpEntriesAfter = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith("sync1-gif-"));
+    const tmpEntriesAfter = fs
+      .readdirSync(os.tmpdir())
+      .filter((n) => n.startsWith("sync1-preview-"));
     expect(tmpEntriesAfter.length).toBe(tmpEntriesBefore.length);
 
     const probed = await realMediaProber.detectMedia(destPath);
@@ -333,7 +458,7 @@ describe("generateVideoGif (real ffmpeg)", () => {
     const frame = computeShorterSideFitSize({ width: sourceWidth, height: sourceHeight }, 10);
     expect(frame.height).toBeGreaterThan(frame.width); // portrait, matching the display-rotated source
 
-    await realThumbnailGenerator.generateVideoGif(
+    await realThumbnailGenerator.generateVideoPreview(
       {
         sourcePath: path.join(FIXTURES_DIR, "rotated-90.mp4"),
         destPath,
@@ -342,7 +467,8 @@ describe("generateVideoGif (real ffmpeg)", () => {
         durationSeconds: 2,
         frameCount: 3,
         frameDelayMs: 100,
-        tileSize: 10,
+        shorterSide: 10,
+        encoding: { outputMime: "image/gif", gifMaxColors: 256, gifDither: "sierra2_4a" },
       },
       silentLogger,
     );
@@ -355,4 +481,125 @@ describe("generateVideoGif (real ffmpeg)", () => {
       height: frame.height,
     });
   });
+
+  it("generates a genuinely animated WebP preview (more than one frame, not just a .webp-named still)", async () => {
+    const destPath = path.join(mkTempDir(), "clip.webp");
+    await realThumbnailGenerator.generateVideoPreview(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        frameCount: 4,
+        frameDelayMs: 100,
+        shorterSide: 16,
+        encoding: { outputMime: "image/webp", webpQuality: 80, webpLossless: false },
+      },
+      silentLogger,
+    );
+
+    const probed = await realMediaProber.detectMedia(destPath);
+    expect(probed).toMatchObject({ kind: "image", mimeType: "image/webp" });
+
+    // A single-frame WebP would probe identically to an animated one via
+    // `realMediaProber` (mime type alone) -- the real, decoded frame count
+    // is what actually distinguishes "genuinely animated" from "happens to
+    // have a .webp extension".
+    const frameCount = await countAnimatedFrames(destPath);
+    expect(frameCount).toBeGreaterThan(1);
+  });
+
+  it("gif_max_colors is load-bearing -- fewer palette colors measurably shrinks the file", async () => {
+    const fewColorsPath = path.join(mkTempDir(), "few.gif");
+    const manyColorsPath = path.join(mkTempDir(), "many.gif");
+    for (const [destPath, gifMaxColors] of [
+      [fewColorsPath, 8],
+      [manyColorsPath, 256],
+    ] as const) {
+      await realThumbnailGenerator.generateVideoPreview(
+        {
+          sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+          destPath,
+          sourceWidth: 32,
+          sourceHeight: 24,
+          durationSeconds: 2,
+          frameCount: 4,
+          frameDelayMs: 100,
+          shorterSide: 16,
+          encoding: { outputMime: "image/gif", gifMaxColors, gifDither: "sierra2_4a" },
+        },
+        silentLogger,
+      );
+    }
+
+    expect(fs.statSync(fewColorsPath).size).toBeLessThan(fs.statSync(manyColorsPath).size);
+  });
+
+  it("a GIF's stored per-frame delay round-trips at 10ms (centisecond) granularity, rounding a non-multiple-of-10 request", async () => {
+    // frameDelayMs 33 -> 3.3cs, which GIF (centisecond granularity) can
+    // only store as a whole number of centiseconds -- rounds to 3cs (30ms).
+    // Pinning this here means the quantization is a known, tested fact
+    // rather than something discovered later against a real file.
+    const destPath = path.join(mkTempDir(), "clip.gif");
+    await realThumbnailGenerator.generateVideoPreview(
+      {
+        sourcePath: path.join(FIXTURES_DIR, "tiny.mp4"),
+        destPath,
+        sourceWidth: 32,
+        sourceHeight: 24,
+        durationSeconds: 2,
+        frameCount: 3,
+        frameDelayMs: 33,
+        shorterSide: 16,
+        encoding: { outputMime: "image/gif", gifMaxColors: 256, gifDither: "sierra2_4a" },
+      },
+      silentLogger,
+    );
+
+    const centiseconds = await readGifFrameDelayCentiseconds(destPath);
+    expect(centiseconds).toBe(3);
+  });
 });
+
+/**
+ * Real, decoded frame count -- distinguishes a genuinely animated image
+ * from a single-frame one sharing the same mime type. Via ImageMagick's
+ * `identify`, not ffprobe: this build's ffprobe doesn't understand
+ * animated WebP's ANIM/ANMF chunks at all ("skipping unsupported chunk"),
+ * so it can't count frames for that format, while `identify` (already this
+ * project's own prober for still images) handles it correctly.
+ */
+async function countAnimatedFrames(mediaPath: string): Promise<number> {
+  const { stdout } = await execFileP("identify", ["-format", "%n\n", mediaPath]);
+  return Number(stdout.trim().split("\n")[0]);
+}
+
+/** The first frame's stored duration, in centiseconds, via ffprobe's per-frame side data. */
+async function readGifFrameDelayCentiseconds(gifPath: string): Promise<number> {
+  const { stdout } = await execFileP("ffprobe", [
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "frame=duration_time",
+    "-of",
+    "csv=p=0",
+    gifPath,
+  ]);
+  const seconds = Number(stdout.trim().split("\n")[0]);
+  return Math.round(seconds * 100);
+}
+
+function execFileP(command: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { encoding: "utf8" }, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}

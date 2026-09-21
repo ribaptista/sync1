@@ -48,6 +48,8 @@ const IMAGE_GENERATE_FLAGS = [
   "16",
   "--image-height",
   "16",
+  "--output-mime",
+  "image/jpeg",
   "--jpeg-quality",
   "80",
 ];
@@ -61,8 +63,10 @@ const VIDEO_GENERATE_FLAGS = [
   "2",
   "--tile-columns",
   "2",
-  "--tile-size",
+  "--shorter-side",
   "16",
+  "--output-mime",
+  "image/jpeg",
   "--jpeg-quality",
   "80",
 ];
@@ -181,10 +185,14 @@ describe("thumbnail lifecycle (end to end)", () => {
     const rootThumbs = fs.readdirSync(path.join(root, "_thumbnail"));
     expect(rootThumbs).toHaveLength(2);
     expect(
-      rootThumbs.some((f) => /^photo\.jpg\.p1-img-iw16-ih16-q80\.[0-9a-f]+\.jpg$/.test(f)),
+      rootThumbs.some((f) =>
+        /^photo\.jpg\.p2-img-iw16-ih16-fmtimage_jpeg-q80\.[0-9a-f]+\.jpg$/.test(f),
+      ),
     ).toBe(true);
     expect(
-      rootThumbs.some((f) => /^clip\.mp4\.p1-vid-tr2-tc2-ts16-q80\.[0-9a-f]+\.jpg$/.test(f)),
+      rootThumbs.some((f) =>
+        /^clip\.mp4\.p2-vid-ss16-tr2-tc2-fmtimage_jpeg-q80\.[0-9a-f]+\.jpg$/.test(f),
+      ),
     ).toBe(true);
     expect(fs.existsSync(path.join(root, "private", "_thumbnail"))).toBe(false);
 
@@ -221,7 +229,9 @@ describe("thumbnail lifecycle (end to end)", () => {
 
     const remainingThumbs = fs.readdirSync(path.join(root, "_thumbnail"));
     expect(remainingThumbs).toHaveLength(1);
-    expect(remainingThumbs[0]).toMatch(/^clip\.mp4\.p1-vid-tr2-tc2-ts16-q80\.[0-9a-f]+\.jpg$/);
+    expect(remainingThumbs[0]).toMatch(
+      /^clip\.mp4\.p2-vid-ss16-tr2-tc2-fmtimage_jpeg-q80\.[0-9a-f]+\.jpg$/,
+    );
 
     // A plain update_cache + sync picks up the surviving thumbnail as
     // ordinary tracked content -- no special-casing anywhere in that path.
@@ -248,7 +258,7 @@ describe("thumbnail lifecycle (end to end)", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("generates a .jpg thumbnail from a Canon CR2 raw original through the real CLI, never a .CR2 destination", async () => {
+  it("generates a .jpg thumbnail from a Canon CR2 raw original through the real CLI (output_mime is always explicit now, so a write-incapable source format is no longer special-cased)", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
     const bucket = await createFreshBucket(s3);
     const root = mkTempRoot();
@@ -297,9 +307,10 @@ describe("thumbnail lifecycle (end to end)", () => {
 
     const thumbs = fs.readdirSync(path.join(root, "_thumbnail"));
     expect(thumbs).toHaveLength(1);
-    // CR2 is write-incapable in ImageMagick -- forced to .jpg regardless
-    // of the original's own .CR2 extension, per RAW_IMAGE_MIME_TYPES.
-    expect(thumbs[0]).toMatch(/^photo\.CR2\.p1-raw-iw16-ih16-q80\.[0-9a-f]+\.jpg$/);
+    // CR2 is write-incapable in ImageMagick, but that no longer matters --
+    // the policy's own output_mime (image/jpeg) determines the extension,
+    // regardless of what the original's own .CR2 extension/mime type is.
+    expect(thumbs[0]).toMatch(/^photo\.CR2\.p2-raw-iw16-ih16-fmtimage_jpeg-q80\.[0-9a-f]+\.jpg$/);
 
     fs.rmSync(root, { recursive: true, force: true });
   });
@@ -528,13 +539,18 @@ describe("thumbnail lifecycle (end to end)", () => {
         "--media-type",
         "video",
         "--output-type",
-        "gif",
-        "--tile-size",
+        "preview",
+        "--shorter-side",
         "16",
         "--frame-count",
         "4",
         "--frame-delay-ms",
         "100",
+        "--output-mime",
+        "image/gif",
+        // gif-max-colors/gif-dither deliberately omitted -- exercises the
+        // CLI layer's own defaults (256, sierra2_4a), which is exactly
+        // what the destPath regex below expects.
         "--json",
       ],
       { env: { SYNC1_PASSWORD: PASSWORD } },
@@ -551,11 +567,17 @@ describe("thumbnail lifecycle (end to end)", () => {
     const thumbs = fs.readdirSync(path.join(root, "_thumbnail"));
     expect(thumbs).toHaveLength(2);
     expect(
-      thumbs.some((f) => /^clip\.mp4\.p1-mosaic-tr2-tc2-ts16-q80\.[0-9a-f]+\.jpg$/.test(f)),
+      thumbs.some((f) =>
+        /^clip\.mp4\.p2-mosaic-ss16-tr2-tc2-fmtimage_jpeg-q80\.[0-9a-f]+\.jpg$/.test(f),
+      ),
     ).toBe(true);
-    expect(thumbs.some((f) => /^clip\.mp4\.p1-gif-ts16-fc4-fd100\.[0-9a-f]+\.gif$/.test(f))).toBe(
-      true,
-    );
+    expect(
+      thumbs.some((f) =>
+        /^clip\.mp4\.p2-gif-ss16-fc4-fd100-fmtimage_gif-mc256-dtsierra2_4a\.[0-9a-f]+\.gif$/.test(
+          f,
+        ),
+      ),
+    ).toBe(true);
 
     const second = await runCli(["thumbnail", "state", "--root", root, "--json"]);
     expect(JSON.parse(second.stdout) as ThumbnailStatsJson).toMatchObject({

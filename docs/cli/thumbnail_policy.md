@@ -23,23 +23,68 @@ themselves.
 `create`/`edit`/`delete` mutate shared state, so each is a real commit (new state.db version, uploaded,
 CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactive prompt).
 
-## The four `generate` branches
+## Two independent axes: sizing and encoding
 
-A `generate` policy is always exactly one of four branches — an image policy picks a
-`--resizing-strategy`, a video policy picks an `--output-type` — each with its own required fields:
+A `generate` policy's fields split into two axes that never interact except at one legality check (see
+the table below): **sizing** (how many pixels the output has) and **encoding** (how those pixels are
+compressed). Every `generate` policy picks exactly one sizing branch and exactly one encoding, and
+`--output-mime` is **always required** — there is no format inheritance from the original file.
 
-| `--media-type` | branch flag                               | required fields                                    |
-| -------------- | ----------------------------------------- | -------------------------------------------------- |
-| `image`        | `--resizing-strategy fit_to_box`          | `--image-width`, `--image-height`                  |
-| `image`        | `--resizing-strategy resize_shorter_side` | `--shorter-side`                                   |
-| `video`        | `--output-type mosaic`                    | `--tile-rows`, `--tile-columns`, `--tile-size`     |
-| `video`        | `--output-type gif`                       | `--tile-size`, `--frame-count`, `--frame-delay-ms` |
+**Sizing** — an image policy picks `--resizing-strategy`, a video policy picks `--output-type`:
 
-`--jpeg-quality` is required for every branch **except** `gif` — a GIF is never JPEG-encoded, so it has no
-quality setting to configure. `--tile-size` means "one mosaic tile's shorter side" for `mosaic` and "one
-GIF frame's shorter side" for `gif` — the same flag and column, deliberately reused rather than
-duplicated (see [thumbnails.md](../architecture/thumbnails.md#video-mosaics)); it's what lets an
-`edit --output-type gif` on an existing mosaic policy carry the same tile size straight over.
+| `--media-type` | branch flag                               | required fields                                       |
+| -------------- | ----------------------------------------- | ----------------------------------------------------- |
+| `image`        | `--resizing-strategy fit_to_box`          | `--image-width`, `--image-height`                     |
+| `image`        | `--resizing-strategy resize_shorter_side` | `--shorter-side`                                      |
+| `video`        | `--output-type mosaic`                    | `--tile-rows`, `--tile-columns`, `--shorter-side`     |
+| `video`        | `--output-type preview`                   | `--shorter-side`, `--frame-count`, `--frame-delay-ms` |
+
+`--shorter-side` means **one output unit's own shorter side**, not the composed grid's: for an image or a
+preview frame that's the produced file's own shorter side, but for a `mosaic` it's **one tile's** — a
+`--shorter-side 90` mosaic on a 3×4 grid composes to roughly 270×(4× the derived long side), not a
+90-ish image. It's shared by every branch except `fit_to_box`, which is why an `edit` switching between
+those three branches (e.g. `mosaic` ↔ `preview`, or `resize_shorter_side` ↔ any video branch) carries the
+value straight over instead of dropping it.
+
+**Encoding** — every branch picks `--output-mime`, then that mime's own fields:
+
+| `--output-mime` | required fields                     | default (when omitted on `create`) |
+| --------------- | ----------------------------------- | ---------------------------------- |
+| `image/jpeg`    | `--jpeg-quality`                    | none — always required             |
+| `image/png`     | `--png-compression-level`           | `9`                                |
+| `image/webp`    | `--webp-quality`, `--webp-lossless` | `80`, `false`                      |
+| `image/gif`     | `--gif-max-colors`, `--gif-dither`  | `256`, `sierra2_4a`                |
+
+Defaults are applied **only on `create`**, and only in the CLI layer — the stored row is always fully
+concrete (never relies on a database-side default), which is what lets the thumbnail filename segment
+always reflect exactly what was used. `edit` never applies a default: an omitted encoding field either
+carries over from the existing row (when the branch/mime is unchanged) or must be supplied explicitly
+(when it changed) — see the "carries" rule below.
+
+**Which encodings are legal for which sizing branch** — the one place the two axes meet:
+
+| sizing branch                                    | legal `--output-mime` values                                                                                                 |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `fit_to_box` / `resize_shorter_side` (any image) | `image/jpeg`, `image/png`, `image/webp`, `image/gif`                                                                         |
+| `mosaic`                                         | `image/jpeg`, `image/png`, `image/webp` — never `image/gif` (a one-frame "animation" is strictly worse than any alternative) |
+| `preview`                                        | `image/gif`, `image/webp` — never a still format (always animated)                                                           |
+
+`--frame-delay-ms` has a floor of **20ms** — below that, GIF's own centisecond-granularity storage and
+most browsers' clamping of a near-zero stored delay make the requested delay meaningless. GIF also
+rounds any delay to the nearest 10ms when stored (`33` → 30ms); animated WebP stores the value exactly.
+
+`create`/`edit` validate the `skip`/`generate`/media-type/sizing-branch/encoding combination before
+touching the network: a `skip` policy must not set `--media-type`, `--resizing-strategy`, `--output-type`,
+`--output-mime`, or any generation/encoding flag; a `generate` policy must set `--media-type`, then (for
+`image`) `--resizing-strategy` or (for `video`) `--output-type`, then `--output-mime` (legal for that
+sizing branch), then exactly that branch's own sizing and encoding fields and none of the other
+branches'/mimes'. `edit` re-validates the _merged_ result, so switching `--action generate` to
+`--action skip` (or back), switching `--media-type` (image↔video), switching `--resizing-strategy`/
+`--output-type` within a media type, or switching `--output-mime`, must also supply/clear the relevant
+fields as needed — a media-type switch also requires resupplying `--mime-types` to match the new type. A
+field survives a branch switch whenever the _new_ branch also uses it: `--shorter-side` survives any
+switch except one landing on `fit_to_box`; an encoding field (`--jpeg-quality`, etc.) survives any switch
+that leaves `--output-mime` unchanged.
 
 ## Usage
 
@@ -52,10 +97,14 @@ sync1 thumbnail_policy create <glob> <skip|generate> [--root <local-path>] \
   --media-type <image|video> \
   [--resizing-strategy <fit_to_box|resize_shorter_side>] \
   [--image-width <n>] [--image-height <n>] [--shorter-side <n>] \
-  [--output-type <mosaic|gif>] \
-  [--tile-rows <n>] [--tile-columns <n>] [--tile-size <n>] \
+  [--output-type <mosaic|preview>] \
+  [--tile-rows <n>] [--tile-columns <n>] \
   [--frame-count <n>] [--frame-delay-ms <n>] \
+  --output-mime <image/jpeg|image/png|image/webp|image/gif> \
   [--jpeg-quality <1-100>] \
+  [--png-compression-level <0-9>] \
+  [--webp-quality <1-100>] [--webp-lossless <true|false>] \
+  [--gif-max-colors <2-256>] [--gif-dither <name>] \
   [--json]
 
 sync1 thumbnail_policy edit <id> [--root <local-path>] \
@@ -64,14 +113,24 @@ sync1 thumbnail_policy edit <id> [--root <local-path>] \
   [--media-type <image|video>] \
   [--resizing-strategy <fit_to_box|resize_shorter_side>] \
   [--image-width <n>] [--image-height <n>] [--shorter-side <n>] \
-  [--output-type <mosaic|gif>] \
-  [--tile-rows <n>] [--tile-columns <n>] [--tile-size <n>] \
+  [--output-type <mosaic|preview>] \
+  [--tile-rows <n>] [--tile-columns <n>] \
   [--frame-count <n>] [--frame-delay-ms <n>] \
+  [--output-mime <image/jpeg|image/png|image/webp|image/gif>] \
   [--jpeg-quality <1-100>] \
+  [--png-compression-level <0-9>] \
+  [--webp-quality <1-100>] [--webp-lossless <true|false>] \
+  [--gif-max-colors <2-256>] [--gif-dither <name>] \
   [--json]
 
 sync1 thumbnail_policy delete <id> [--root <local-path>] [--json]
 ```
+
+`--gif-dither` accepts `none`, `bayer`, `heckbert`, `floyd_steinberg`, `sierra2`, `sierra2_4a`, `sierra3`,
+`burkes`, or `atkinson` — ffmpeg's full dithering enum, used verbatim for a `preview` (video) policy's
+animated-GIF output. A still-image `generate` policy using `image/gif` maps this down to ImageMagick's
+only comparable option: `none` stays `none`, everything else becomes ordinary Floyd-Steinberg
+error-diffusion dithering — the stored value is exact for video, approximate for the still-image path.
 
 `--root` is optional on every subcommand — omitted, it defaults to the nearest ancestor directory
 containing a `.sync1/`, searched from the current directory upward.
@@ -92,24 +151,15 @@ policy — mime type still gates what a skip actually applies to). For a `genera
 _type_ segment (`image`/`video`, never wildcarded) must match `--media-type` — `image/jpeg,video/*` is
 never valid on the same `generate` row, since a `generate` policy is always exactly one media type or the
 other, never both (a `skip` row has no such restriction: it legitimately mixes types, e.g.
-`image/*,video/*`, since matching a skip never needs to know a media type at all).
-
-`create`/`edit` validate the `skip`/`generate`/media-type/branch combination before touching the network:
-a `skip` policy must not set `--media-type`, `--resizing-strategy`, `--output-type`, or any generation
-flag; a `generate` policy must set `--media-type`, then (for `image`) `--resizing-strategy` or (for
-`video`) `--output-type`, then exactly that branch's own fields (see the table above) and none of the
-other branches'. `edit` re-validates the _merged_ result, so switching `--action generate` to
-`--action skip` (or back), switching `--media-type` (image↔video), or switching `--resizing-strategy`/
-`--output-type` within a media type, must also supply/clear the relevant fields as needed — a media-type
-switch also requires resupplying `--mime-types` to match the new type. A field survives a branch switch
-whenever the _new_ branch also uses it: `--jpeg-quality` survives any switch except one landing on `gif`;
-`--tile-size` survives a `mosaic`↔`gif` switch specifically, since both use it.
+`image/*,video/*`, since matching a skip never needs to know a media type at all). This is entirely about
+the _source_ mime filter, unrelated to `--output-mime`, which is what a `generate` policy _produces_.
 
 ## Output
 
 A `generate` row's shape depends on its `mediaType` and, within that, its `resizingStrategy`/`outputType`
-— each of the four branches carries only its own fields (see the table above). A `skip` row carries none
-of them, and no `mediaType` at all. Every row always carries `name`:
+(sizing) plus its `outputMime` (encoding) — each combination carries only its own fields (see the tables
+above). A `skip` row carries none of them, and no `mediaType`/`outputMime` at all. Every row always
+carries `name`:
 
 ```json
 {
@@ -125,6 +175,7 @@ of them, and no `mediaType` at all. Every row always carries `name`:
       "mimeTypes": ["image/jpeg"],
       "imageWidth": 320,
       "imageHeight": 240,
+      "outputMime": "image/jpeg",
       "jpegQuality": 80,
       "createdAt": "2026-01-01T00:00:00.000Z"
     },
@@ -138,21 +189,26 @@ of them, and no `mediaType` at all. Every row always carries `name`:
       "mimeTypes": ["video/*"],
       "tileRowCount": 4,
       "tileColumnCount": 4,
-      "tileSize": 90,
-      "jpegQuality": 80,
+      "shorterSide": 90,
+      "outputMime": "image/webp",
+      "webpQuality": 80,
+      "webpLossless": false,
       "createdAt": "2026-01-01T00:00:00.000Z"
     },
     {
       "id": 3,
-      "name": "video_gif",
+      "name": "video_preview",
       "glob": "**/*.mp4",
       "action": "generate",
       "mediaType": "video",
-      "outputType": "gif",
+      "outputType": "preview",
       "mimeTypes": ["video/*"],
-      "tileSize": 64,
+      "shorterSide": 64,
       "frameCount": 8,
       "frameDelayMs": 100,
+      "outputMime": "image/gif",
+      "gifMaxColors": 256,
+      "gifDither": "sierra2_4a",
       "createdAt": "2026-01-01T00:00:00.000Z"
     },
     {
@@ -171,8 +227,9 @@ of them, and no `mediaType` at all. Every row always carries `name`:
 
 - `0` — success.
 - `1` — the root isn't initialized/attached, an invalid glob/action/media-type/resizing-strategy/
-  output-type/mime-type/name/dimension was given, the name was already taken, the
-  `skip`/`generate`/branch field combination was inconsistent, or `edit`/`delete` referenced an id that
+  output-type/output-mime/mime-type/name/dimension/dither value was given, the name was already taken,
+  the `skip`/`generate`/branch/encoding field combination was inconsistent (including an encoding illegal
+  for the chosen sizing branch, e.g. `image/gif` on a `mosaic`), or `edit`/`delete` referenced an id that
   doesn't exist.
 
 ## Example
@@ -181,22 +238,26 @@ of them, and no `mediaType` at all. Every row always carries `name`:
 sync1 thumbnail_policy create "**/*.jpg" generate --root ~/Pictures \
   --name photo_thumb --mime-types image/jpeg --media-type image \
   --resizing-strategy fit_to_box \
-  --image-width 320 --image-height 240 --jpeg-quality 80 --json
+  --image-width 320 --image-height 240 \
+  --output-mime image/jpeg --jpeg-quality 80 --json
 
 sync1 thumbnail_policy create "**/*.jpg" generate --root ~/Pictures \
-  --name photo_thumb_wide --mime-types image/jpeg --media-type image \
+  --name photo_thumb_webp --mime-types image/jpeg --media-type image \
   --resizing-strategy resize_shorter_side \
-  --shorter-side 150 --jpeg-quality 80 --json
+  --shorter-side 150 \
+  --output-mime image/webp --webp-quality 80 --webp-lossless false --json
 
 sync1 thumbnail_policy create "**/*.mp4" generate --root ~/Pictures \
   --name video_mosaic --mime-types video/* --media-type video \
   --output-type mosaic \
-  --tile-rows 4 --tile-columns 4 --tile-size 90 --jpeg-quality 80 --json
+  --tile-rows 4 --tile-columns 4 --shorter-side 90 \
+  --output-mime image/png --png-compression-level 9 --json
 
 sync1 thumbnail_policy create "**/*.mp4" generate --root ~/Pictures \
-  --name video_gif --mime-types video/* --media-type video \
-  --output-type gif \
-  --tile-size 64 --frame-count 8 --frame-delay-ms 100 --json
+  --name video_preview --mime-types video/* --media-type video \
+  --output-type preview \
+  --shorter-side 64 --frame-count 8 --frame-delay-ms 100 \
+  --output-mime image/gif --gif-max-colors 256 --gif-dither sierra2_4a --json
 
 sync1 thumbnail_policy create "private/**" skip --root ~/Pictures \
   --name skip_private --mime-types "image/*,video/*" --json

@@ -42,58 +42,97 @@ is not optional decoration, so a policy can say "skip _videos_ under `private/**
 there alone."
 
 A `generate` row is also always **exactly one media type or the other**, via a `media_type` column
-(`image` or `video`, `NULL` for a `skip` row) — no policy carries fields belonging to the other type. Each
-media type further splits into two branches of its own, giving four `generate` shapes in total:
+(`image` or `video`, `NULL` for a `skip` row) — no policy carries fields belonging to the other type.
+Beyond that, a `generate` row's fields split into **two independent axes** that never interact except at
+one legality check: **sizing** (how many pixels the output has) and **encoding** (how those pixels are
+compressed).
 
-| `media_type` | discriminant                                | its own fields                                     |
-| ------------ | ------------------------------------------- | -------------------------------------------------- |
-| `image`      | `resizing_strategy = 'fit_to_box'`          | `image_width`, `image_height`                      |
-| `image`      | `resizing_strategy = 'resize_shorter_side'` | `shorter_side`                                     |
-| `video`      | `output_type = 'mosaic'`                    | `tile_row_count`, `tile_column_count`, `tile_size` |
-| `video`      | `output_type = 'gif'`                       | `tile_size`, `frame_count`, `frame_delay_ms`       |
+**Sizing** — each media type further splits into two branches of its own:
 
-`jpeg_quality` belongs to every branch **except** `gif` — a GIF is never JPEG-encoded, so requiring (and
-silently ignoring) a JPEG quality for one would violate this table's own "no nonsense fields for a branch
-that doesn't use them" discipline. `tile_size` is deliberately the one field `mosaic` and `gif` share: one
-mosaic tile's, or one GIF frame's, shorter-side target in pixels — see
-["Video mosaics"](#video-mosaics) and ["Animated GIFs"](#animated-gifs) below for why there's no separate
-GIF-specific column or flag for the same knob.
+| `media_type` | discriminant                                | its own fields                                        |
+| ------------ | ------------------------------------------- | ----------------------------------------------------- |
+| `image`      | `resizing_strategy = 'fit_to_box'`          | `image_width`, `image_height`                         |
+| `image`      | `resizing_strategy = 'resize_shorter_side'` | `shorter_side`                                        |
+| `video`      | `output_type = 'mosaic'`                    | `tile_row_count`, `tile_column_count`, `shorter_side` |
+| `video`      | `output_type = 'preview'`                   | `shorter_side`, `frame_count`, `frame_delay_ms`       |
 
-A five-way `CHECK` constraint (mirrored by repository-level validation, for a friendlier pre-network
-error) enforces this: a `skip` row has `media_type` and all nine generate-only columns `NULL`; each of the
-four `generate` branches above has exactly its own fields `NOT NULL` (plus `jpeg_quality`, except for
-`gif`) and every other generate-only column `NULL`.
+`shorter_side` is deliberately the one field shared by every branch but `fit_to_box`: one output _unit's_
+shorter-side target in pixels — an image's own for `resize_shorter_side`, one mosaic tile's (**not** the
+composed grid's) for `mosaic`, one frame's for `preview`. It used to be two separately-named columns
+(`shorter_side` for images, `tile_size` for video) before this policy gained a second discriminant; they
+were always the same operation (`computeShorterSideFitSize`), so the columns were merged.
+
+**Encoding** — every `generate` row also picks `output_mime`, independent of its sizing branch:
+
+| `output_mime` | its own fields                  |
+| ------------- | ------------------------------- |
+| `image/jpeg`  | `jpeg_quality`                  |
+| `image/png`   | `png_compression_level`         |
+| `image/webp`  | `webp_quality`, `webp_lossless` |
+| `image/gif`   | `gif_max_colors`, `gif_dither`  |
+
+`output_mime` is **always required** — there is no format inheritance from the original file (an earlier
+design inherited the source's own extension, which is both why HEIC sources used to fail generation
+forever — ImageMagick can read `image/heic` but not write it — and why an unbrowsable format like TIFF
+could end up as a thumbnail's own output format; dropping inheritance entirely makes both bugs disappear
+by construction, rather than patching around them with more source-format special cases).
+
+The two axes meet at exactly one legality rule: `mosaic` never allows `image/gif` (a one-frame
+"animation" is strictly worse than any alternative still format), and `preview` only allows
+`image/gif`/`image/webp` (always animated, never a still format). Every image sizing branch allows all
+four encodings.
+
+A three-way `CHECK` constraint (mirrored by repository-level validation, for a friendlier pre-network
+error) enforces all of this: one clause for sizing-columns-match-branch, one for
+encoding-columns-match-`output_mime`, and one small clause connecting the two axes (the legality rule
+above) — three independent, much smaller clauses rather than one flat enumeration of all 14 legal
+combinations, exactly as strict either way.
 
 `ThumbnailPolicyRow` (`src/db/repositories/thumbnail-policies-repository.ts`) mirrors this at the type
-level as a flat discriminated union — five arms (`skip` plus the four `generate` branches above), flat
-rather than nested so every consumer reads a field like `policy.tileSize` or `policy.shorterSide`
-directly. A `generate`+`video`+`gif` row is statically guaranteed to have `frameCount` and statically
-guaranteed _not_ to have `jpegQuality` — no `!` non-null assertions needed anywhere generation code
-narrows on it. `GENERATE_BRANCH_FIELDS` (exported from the repository, reused verbatim by the CLI's own
-pre-network validation rather than duplicated) is the single source of truth for which fields belong to
-which branch. Every `mimeTypes` entry's own type segment (`image`/`video`, never wildcarded) is validated
-to match a `generate` row's `mediaType`, which is what makes a `resolvePolicies`-selected policy's
-`mediaType` _provably_ agree with whatever a file actually probed as (`resolvePolicies` only ever returns
-policies whose `mimeTypes` matched the file's real, sniffed mime type), not just usually-true by
-convention.
+level as a flat discriminated union generated from the same two axes (`Generate<Sizing, Encoding>`, a
+distributive mapped type — `Generate<A|B, C|D>` produces the genuine flat union `(A&C)|(A&D)|(B&C)|(B&D)`,
+not a union nested inside an intersection, so ordinary discriminant narrowing on `resizingStrategy`/
+`outputType`/`outputMime` behaves exactly as ​it would for a hand-written union) rather than a hand-written
+14-arm union repeating every field across every arm that has it — a future fifth encoding format is one
+new declaration, not four new arms. `SIZING_FIELDS`/`ENCODING_FIELDS` (exported from the repository,
+reused verbatim by the CLI's own pre-network validation rather than duplicated) are the single source of
+truth for which fields belong to which axis value. Every `mimeTypes` entry's own type segment
+(`image`/`video`, never wildcarded) is validated to match a `generate` row's `mediaType`, which is what
+makes a `resolvePolicies`-selected policy's `mediaType` _provably_ agree with whatever a file actually
+probed as (`resolvePolicies` only ever returns policies whose `mimeTypes` matched the file's real,
+sniffed mime type), not just usually-true by convention — this is entirely about the _source_ mime
+filter, unrelated to `outputMime`, which is what a `generate` policy _produces_.
 
-### Switching branches via `edit`, and why two fields carry across it
+**One TypeScript design note worth flagging:** `ThumbnailPolicyCreateInput` (`Omit<ThumbnailPolicyRow,
+"id"|"createdAt">`) must use a _distributive_ `Omit`, not the built-in one — plain `Omit` computes
+`keyof` on a union as the _intersection_ of member keys, which silently collapses a multi-arm union down
+to only the fields every arm shares, losing every discriminant-specific field (`imageWidth`,
+`jpegQuality`, etc.) without a type error anywhere. `DistributiveOmit<T, K> = T extends unknown ?
+Omit<T, K> : never` forces the union to distribute first, exactly like `Generate<>` above, before
+applying `Omit` to each already-narrowed member individually.
+
+### Switching branches via `edit`, and why fields carry across it
 
 `ThumbnailPoliciesRepository.update()` merges a partial edit onto the existing row, and a single generic
-rule decides whether each type-specific field carries over: it carries only if the row's **new** branch
-(after applying whatever `action`/`mediaType`/`resizingStrategy`/`outputType` the edit itself changes)
-also includes that field in its own set. Concretely, `old[fieldName]` (already `null` for any field the
-_old_ branch didn't have, by construction) is used as the fallback whenever a field isn't explicitly
-overridden in the edit — so "carry forward if the new branch wants this field" degrades correctly to
-"nothing to carry" when the old branch never had it either, with no field-specific special case needed.
+rule decides whether each axis-specific field carries over: it carries only if the row's **new** branch
+(after applying whatever `action`/`mediaType`/`resizingStrategy`/`outputType`/`outputMime` the edit itself
+changes) also includes that field in its own set (`SIZING_FIELDS` ∪ `ENCODING_FIELDS` for the new
+combination). Concretely, `old[fieldName]` (already `null` for any field the _old_ branch didn't have, by
+construction) is used as the fallback whenever a field isn't explicitly overridden in the edit — so
+"carry forward if the new branch wants this field" degrades correctly to "nothing to carry" when the old
+branch never had it either, with no field-specific special case needed.
 
-This one rule is what makes `jpegQuality` survive an `image`↔`video` switch (both non-`gif` branches
-share it) _and_, new in this schema, what makes `tileSize` survive a `mosaic`↔`gif` switch — the same
-mechanism, not two different ones. `edit --output-type gif` on an existing `mosaic` policy keeps its
-`tileSize` untouched (now meaning "this GIF's frame shorter side" instead of "this mosaic's tile shorter
-side") while dropping `tileRowCount`/`tileColumnCount` (mosaic-only) and `jpegQuality` (forbidden for
-`gif`) — and still requires `--frame-count`/`--frame-delay-ms` to be supplied, since neither the old
-branch nor a bare `--output-type gif` edit provides them.
+This one rule is what makes `shorterSide` survive a `mosaic`↔`preview` switch, or an
+`image/resize_shorter_side`↔any-video switch (every branch but `fit_to_box` shares it), _and_ what makes
+an encoding field (`jpegQuality`, etc.) survive any switch that leaves `outputMime` unchanged — the same
+mechanism, not two different ones. But switching `outputType` from `mosaic` to `preview` **without**
+also changing `outputMime` fails outright, even before the missing-fields check runs: `preview` never
+allows `image/jpeg`, so simply carrying the old `outputMime` forward is caught by the legality rule
+described above. `edit --output-type preview --output-mime image/gif ...` on an existing `mosaic` policy
+keeps its `shorterSide` untouched (now meaning "this preview's frame shorter side" instead of "this
+mosaic tile's shorter side") while dropping `tileRowCount`/`tileColumnCount` (mosaic-only) and
+`jpegQuality` (now illegal) — and still requires `--gif-max-colors`/`--gif-dither` to be supplied, since
+neither the old branch nor a bare `--output-mime image/gif` edit provides them.
 
 ## Walk-scoping via `literalPrefixOf`
 
@@ -112,26 +151,47 @@ much of the tree needs visiting.
 A thumbnail/mosaic lives in a `_thumbnail/` subdirectory of the same directory as its original, named
 `<original-filename-with-extension>.<params-segment>.<hash-hex>.<thumb-ext>`:
 
-- `photos/sunset.jpg` → `photos/_thumbnail/sunset.jpg.p1-thumb-iw320-ih240-q80.<hash>.jpg`
-- `videos/clip.mp4` → `videos/_thumbnail/clip.mp4.p1-mosaic-tr4-tc4-ts90-q80.<hash>.jpg`
+- `photos/sunset.jpg` → `photos/_thumbnail/sunset.jpg.p2-thumb-iw320-ih240-fmtimage_jpeg-q80.<hash>.jpg`
+- `videos/clip.mp4` → `videos/_thumbnail/clip.mp4.p2-mosaic-ss90-tr4-tc4-fmtimage_jpeg-q80.<hash>.jpg`
 
 (assuming policies named `thumb` and `mosaic` respectively — see below.)
 
-`<params-segment>` encodes the policy's own `name` followed by its raw _configured_ generation
-parameters — never a per-file computed/derived size — as short literal abbreviated fields, one shape per
-`ThumbnailPolicyGenerateRow` branch:
+`<params-segment>` encodes the policy's own `name`, then one token per SIZING field, then an
+`fmt<outputMime>` token, then one token per ENCODING field — raw _configured_ generation parameters,
+never a per-file computed/derived size — mirroring the repository's own two-axis split
+(`expectedParamsSegment` in `src/fs/thumbnail.ts`):
 
-| branch                        | shape                                                                        |
-| ----------------------------- | ---------------------------------------------------------------------------- |
-| `image`/`fit_to_box`          | `p1-<name>-iw<imageWidth>-ih<imageHeight>-q<jpegQuality>`                    |
-| `image`/`resize_shorter_side` | `p1-<name>-ss<shorterSide>-q<jpegQuality>`                                   |
-| `video`/`mosaic`              | `p1-<name>-tr<tileRowCount>-tc<tileColumnCount>-ts<tileSize>-q<jpegQuality>` |
-| `video`/`gif`                 | `p1-<name>-ts<tileSize>-fc<frameCount>-fd<frameDelayMs>`                     |
+| sizing branch                 | sizing tokens                                          |
+| ----------------------------- | ------------------------------------------------------ |
+| `image`/`fit_to_box`          | `iw<imageWidth>-ih<imageHeight>`                       |
+| `image`/`resize_shorter_side` | `ss<shorterSide>`                                      |
+| `video`/`mosaic`              | `ss<shorterSide>-tr<tileRowCount>-tc<tileColumnCount>` |
+| `video`/`preview`             | `ss<shorterSide>-fc<frameCount>-fd<frameDelayMs>`      |
 
-Note the `gif` shape has no `q` field at all — a GIF is never JPEG-encoded, so there's no quality setting
-to encode (see the branch table above). The `p1` prefix is a format version, not a real per-policy field —
-it exists so a future incompatible change to this segment's own shape can be told apart from today's
-instead of silently misparsed.
+| `outputMime` | encoding tokens (after `fmt<outputMime>`) |
+| ------------ | ----------------------------------------- |
+| `image/jpeg` | `q<jpegQuality>`                          |
+| `image/png`  | `pl<pngCompressionLevel>`                 |
+| `image/webp` | `wq<webpQuality>-wl<0\|1>`                |
+| `image/gif`  | `mc<gifMaxColors>-dt<gifDither>`          |
+
+Example: `sunset.jpg.p2-photo_thumb-iw320-ih240-fmtimage_webp-wq80-wl0.<hash>.webp`. The `p2` prefix is a
+format version, not a real per-policy field — it exists so a future incompatible change to this segment's
+own shape can be told apart from today's instead of silently misparsed. It bumped from `p1` when this
+policy gained `output_mime`/per-format encoding fields, since some of the new tokens (`gifDither` values
+like `sierra2_4a`, the `fmt` token itself) aren't purely numeric the way every `p1` field was —
+`PARAMS_SEGMENT_RE` deliberately still accepts **both** `p1-` and `p2-`: an existing `p1` thumbnail on a
+real vault stays recognized (by the policy-name lookup, which parses identically on either version),
+counted `toRegenerate`, and is deleted as its `p2` replacement is written — no manual cleanup needed for
+the one-time upgrade.
+
+Field _values_ are normalized, not escaped, through a single rule: any character outside
+`[0-9A-Za-z_]` becomes `_` (so `image/webp` serializes as `fmtimage_webp`). No escaping and no tokenizer
+needed — plain `split("-")` stays correct, since a normalized value can never reintroduce the `-` field
+separator. This is only safe because of what's actually serialized through it: policy names are already
+restricted to this exact charset by `NAME_PATTERN` (so normalization is a no-op for them, and `UNIQUE(name)`
+still implies a unique serialized token), and the two closed enums that pass through it (`outputMime`,
+`gifDither`) have members that stay distinct after normalization.
 
 The name is _why_ more than one matching `generate` policy for the same original never collides on disk
 — two different policies, whatever their own fields, always produce two different segments as long as
@@ -139,29 +199,28 @@ their names differ (which the table's own `UNIQUE` constraint guarantees). It al
 identity reconciliation itself keys on: when deciding whether an existing file is _this_ policy's own
 previous output (safe to delete-and-regenerate) versus some other policy's output or a genuine orphan,
 `parseThumbnailEntry` extracts just the name token (`paramsSegment.split("-")[1]`, since the segment's
-shape is always `p1-<name>-<field><num>...` by construction — no need to parse the rest) and compares
-that, not the whole segment string, against the currently-resolved policy's own name. Matching by name
-alone (not the full segment) is what lets an ordinary config edit — jpeg quality, image box, tile size —
-still read as a regeneration of the _same_ thumbnail rather than a new one, while a full-segment
-comparison is still what "up to date" itself means (see "One shared scan, three modes" below): a config
-edit changes the segment, so the old file no longer satisfies the stricter up-to-date check even though
-it's still recognized as this policy's own prior output.
+shape is always `p{1,2}-<name>-<field><value>...` by construction — no need to parse the rest) and
+compares that, not the whole segment string, against the currently-resolved policy's own name. Matching
+by name alone (not the full segment) is what lets an ordinary config edit — jpeg quality, image box,
+output mime — still read as a regeneration of the _same_ thumbnail rather than a new one, while a
+full-segment comparison is still what "up to date" itself means (see "One shared scan, three modes"
+below): a config edit changes the segment, so the old file no longer satisfies the stricter up-to-date
+check even though it's still recognized as this policy's own prior output.
 
 A literal encoding was a deliberate choice over hashing the parameters together: worked the actual byte
-budget rather than guessing — worst case (`p1-somepolicyname-tr9999-tc9999-ts65535-q100`) still leaves
-plenty of the 255-byte-per-path-component limit spare even after the content hash (64 hex chars) and
-extension, so length was never close to binding. A human being able to `ls _thumbnail/` and read off
-exactly which policy, and what config, produced a file — no database cross-reference needed — is worth
-far more than the handful of bytes a hash-of-params scheme would reclaim.
+budget rather than guessing — worst case still leaves plenty of the 255-byte-per-path-component limit
+spare even after the content hash (64 hex chars) and extension, so length was never close to binding. A
+human being able to `ls _thumbnail/` and read off exactly which policy, and what config, produced a file
+— no database cross-reference needed — is worth far more than the handful of bytes a hash-of-params
+scheme would reclaim.
 
-For an image (either resizing strategy), `<thumb-ext>` is normally the original's own extension, verbatim
-(`.jpg` stays `.jpg`, `.png` stays `.png`) — except for a source mime type ImageMagick can read but not
-write at all (currently just Canon's CR2 raw format, `image/x-canon-cr2` — see `RAW_IMAGE_MIME_TYPES` in
-`src/fs/thumbnail.ts`), which is always forced to `.jpg` instead, since asking `convert` to _write_ the
-original's own format would fail outright with no encoder available. For video, `<thumb-ext>` is the
-policy's own `output_type`, not a property of the source at all: `mosaic` is always the literal `jpg`
-(never `jpeg` — one single spelling for "this is a JPEG" everywhere a thumbnail filename gets
-reverse-parsed), `gif` is always `gif`, regardless of the source video's own container either way.
+`<thumb-ext>` is a pure function of the policy's own `outputMime` — `jpg`/`png`/`webp`/`gif` (never
+`jpeg` — one single spelling for "this is a JPEG" everywhere a thumbnail filename gets reverse-parsed) —
+and has nothing to do with the source's own extension or mime type at all, now that `output_mime` is
+always required. This is what makes a write-incapable source format (Canon CR2 raw, `image/x-canon-cr2`
+— `identify -list format` reports `CR2 DNG r--`, no encoder) and an unbrowsable one (TIFF) both a
+non-issue by construction: the policy simply states a browser-compatible `output_mime` and that's what
+gets written, regardless of what `convert`/`ffmpeg` can or can't do with the source's own format.
 
 The embedded `<hash-hex>` is the original's current content hash, from `cache.db` — combined with
 `<params-segment>` matching the current policy, this is what makes "is this thumbnail up to date" a pure
@@ -294,10 +353,10 @@ table is ever treated as an image; anything else — including a video that `ide
 
 **Canon CR2 raw is read-only** (`identify -list format` reports `CR2 DNG r--` — no encoder), confirmed
 directly against a real file: `identify` reads its mime type and dimensions fine, and `convert` can decode
-and resize it into a real JPEG, but asking `convert` to _write_ a `.CR2` would fail outright with no
-encoder available. Every CR2 thumbnail is therefore forced to a `.jpg` destination regardless of the
-source's own extension (see "Naming convention" above) — the same pattern video mosaics already use, for
-the same reason.
+and resize it into any output format a policy's own `output_mime` requests. This used to require a
+special case (CR2 forced to `.jpg` regardless of the policy's intent, since output format used to be
+inherited from the source); now that `output_mime` is always explicit, there's nothing CR2-specific left
+at all — see "Naming convention" above.
 
 **Video rotation.** `ffprobe`'s default `-show_entries` never asked for rotation metadata, so `probeVideo`
 used to always report a stream's raw encoded dimensions — but `ffmpeg`'s own frame decoding auto-rotates
@@ -320,12 +379,15 @@ An image policy picks one of two resizing strategies (`resizing_strategy`), each
 I/O-free sizing function in `src/media/thumbnail-generate.ts`, unit tested exhaustively
 (`test/unit/media/thumbnail-generate.test.ts`): `fit_to_box` uses `computeContainFitSize` (below);
 `resize_shorter_side` uses `computeShorterSideFitSize` — the _same_ function a video policy's own
-`tile_size` uses (see "Video mosaics" and "Animated GIFs" below) — scaling the source so its shorter side
-lands on the policy's `shorter_side`, aspect ratio otherwise preserved, no orientation concept at all
-(there's only one aspect ratio to preserve, unlike fitting into a box with its own independent
-orientation). Both strategies feed their computed `{width, height}` into the exact same
-`generateImageThumbnail` call — the generator itself is agnostic to which strategy produced the numbers
-it's handed.
+`shorter_side` uses for one mosaic tile or one preview frame (see "Video mosaics" and "Animated previews"
+below) — scaling the source so its shorter side lands on the policy's `shorter_side`, aspect ratio
+otherwise preserved, no orientation concept at all (there's only one aspect ratio to preserve, unlike
+fitting into a box with its own independent orientation). Both strategies feed their computed
+`{width, height}` into the exact same `generateImageThumbnail` call — the generator itself is agnostic to
+which strategy produced the numbers it's handed, and to which of the four `output_mime` encodings the
+policy also picked (see "Two independent axes" above) — an `ImageEncoding` union parameter, one arm per
+`output_mime`, carries the encoding-specific ImageMagick flags (`-quality`, `-define
+png:compression-level=`, `-define webp:lossless=`, `-colors`/`-dither`).
 
 The box's width/height are swapped internally (`effectiveBox`) so its long axis always aligns with the
 source's long axis, regardless of how the box itself is configured — a portrait source always gets a
@@ -348,10 +410,11 @@ A mosaic samples `tile_row_count * tile_column_count` frames at evenly-spaced, c
 timestamps (`t_i = duration * (i + 0.5) / N`), deliberately avoiding literal first/last frames (often
 black, blank, or credits).
 
-There's no fixed tile box. A policy configures one `tile_size` — the pixel length of a mosaic tile's
-_shorter_ side — and `computeShorterSideFitSize` (`src/media/thumbnail-generate.ts`, a pure function, no
-I/O) scales the source so its own shorter side hits that value, with the longer side falling out of the
-source's own aspect ratio rather than being configured independently:
+There's no fixed tile box. A policy configures one `shorter_side` — the pixel length of a mosaic tile's
+_shorter_ side, **not** the composed grid's — and `computeShorterSideFitSize`
+(`src/media/thumbnail-generate.ts`, a pure function, no I/O) scales the source so its own shorter side
+hits that value, with the longer side falling out of the source's own aspect ratio rather than being
+configured independently:
 
 ```ts
 const scale = shortSide / Math.min(source.width, source.height);
@@ -371,40 +434,61 @@ rotation metadata bug would have turned a silent stretch into a hard crash again
 not fixed the underlying bug.
 
 The grid itself is assembled via `ffmpeg`'s `xstack` filter with a computed row-major layout string, into
-one JPEG (always JPEG, regardless of the source container) at a quality mapped from the policy's 1-100
-`jpeg_quality` onto `ffmpeg`'s mjpeg `-q:v` scale (2 = best, 31 = worst — inverted and much coarser than
-JPEG's own percent scale). The frame-extraction step passes `-autorotate` explicitly (a bare boolean flag
-in this ffmpeg build's CLI — confirmed directly that `-autorotate 1` misparses as two separate tokens,
-the flag plus a stray value ffmpeg then tries to apply to the _output_ file instead) rather than relying
-on the tool's own default (on since ffmpeg ~4.4 — see [platform-setup.md](../platform-setup.md) for the
-external tool version this project is developed and tested against). Temporary per-frame PNGs live under
-a fresh temp directory, always removed in a `finally`, even when generation fails partway through.
+a still image encoded per the policy's own `output_mime` (`jpeg`/`png`/`webp` — never `gif`, see "Two
+independent axes" above): JPEG maps the policy's 1-100 `jpeg_quality` onto `ffmpeg`'s mjpeg `-q:v` scale
+(2 = best, 31 = worst — inverted and much coarser than JPEG's own percent scale); PNG uses
+`-compression_level`; WebP switches the output codec to `-c:v libwebp` with `-quality`/`-lossless`. The
+frame-extraction step passes `-autorotate` explicitly (a bare boolean flag in this ffmpeg build's CLI —
+confirmed directly that `-autorotate 1` misparses as two separate tokens, the flag plus a stray value
+ffmpeg then tries to apply to the _output_ file instead) rather than relying on the tool's own default (on
+since ffmpeg ~4.4 — see [platform-setup.md](../platform-setup.md) for the external tool version this
+project is developed and tested against). Temporary per-frame PNGs live under a fresh temp directory,
+always removed in a `finally`, even when generation fails partway through.
 
-## Animated GIFs
+## Animated previews
 
-`output_type = 'gif'` reuses stage 1 of mosaic generation completely unchanged: `frame_count` frames
+`output_type = 'preview'` (renamed from `'gif'` when this policy gained `output_mime` — GIF is no longer
+the only animated format) reuses stage 1 of mosaic generation completely unchanged: `frame_count` frames
 sampled at the same evenly-spaced, center-of-bucket timestamps (`t_i = duration * (i + 0.5) / N`), each
-scaled via `computeShorterSideFitSize` against the policy's `tile_size` (the same field, and the same
-per-frame target, a mosaic's own `tile_size` is — see the header comment on `expectedParamsSegment` in
-`src/fs/thumbnail.ts` for why this is a deliberate reuse rather than a GIF-specific column). Only stage 2
-— what happens to the extracted PNG frames — differs, replacing `xstack`'s single-JPEG grid composite with
-the standard two-pass high-quality animated-GIF pipeline:
+scaled via `computeShorterSideFitSize` against the policy's `shorter_side` (the same field, and the same
+per-frame target, a mosaic's own `shorter_side` is). Only stage 2 — what happens to the extracted PNG
+frames — differs, branching on `output_mime` (`image/gif` or `image/webp`, `preview`'s only two legal
+encodings):
 
-1. `ffmpeg -framerate <fps> -i frame-%d.png -vf palettegen palette.png` builds one shared color palette
-   across every frame. A per-frame or fixed palette produces visibly banded/dithered output; sharing one
-   palette across the whole sequence avoids that.
-2. `ffmpeg -framerate <fps> -i frame-%d.png -i palette.png -lavfi paletteuse -loop 0 out.gif` re-encodes
-   the frame sequence against that shared palette into the final, infinitely-looping (`-loop 0`) GIF.
+**`image/gif`** replaces `xstack`'s single-JPEG grid composite with the standard two-pass high-quality
+animated-GIF pipeline:
 
-Both passes read the same on-disk frame sequence via `ffmpeg`'s image2 demuxer (`frame-%d.png`, with
+1. `ffmpeg -framerate <fps> -i frame-%d.png -vf palettegen=max_colors=<gifMaxColors>:reserve_transparent=0
+palette.png` builds one shared color palette across every frame, capped at the policy's own
+   `gif_max_colors`. A per-frame or fixed palette produces visibly banded/dithered output; sharing one
+   palette across the whole sequence avoids that. `reserve_transparent=0` is hardcoded, not a policy
+   field — every sampled frame is opaque, so the reserved palette slot would be pure waste.
+2. `ffmpeg -framerate <fps> -i frame-%d.png -i palette.png -lavfi paletteuse=dither=<gifDither> -loop 0
+out.gif` re-encodes the frame sequence against that shared palette into the final, infinitely-looping
+   (`-loop 0`) GIF, using the policy's `gif_dither` mode. `paletteuse`'s `dither` values match
+   `ThumbnailGifDither`'s own enum verbatim, except `bayer`, which additionally takes a `bayer_scale`
+   sub-parameter with no policy field of its own — a fixed mid-range constant is used, the same
+   "hardcode it, don't add a field for it" treatment `reserve_transparent` gets.
+
+**`image/webp`** is a single pass — `-c:v libwebp_anim -quality <webpQuality> -lossless <0|1> -loop 0` —
+directly on the same frame sequence; animated WebP needs no separate palette step at all.
+
+Both branches read the same on-disk frame sequence via `ffmpeg`'s image2 demuxer (`frame-%d.png`, with
 `-start_number 0` passed explicitly rather than relying on its default), at an input `fps` derived from
 `frame_delay_ms` (`1000 / frameDelayMs`) — there's no separate "set this frame's on-screen delay" flag;
-the GIF muxer stores each frame's delay as however long the filtered stream says it should be on screen,
-so the input framerate _is_ the delay control. `jpeg_quality` plays no role at all (see the branch table
-above) — a GIF has no JPEG quality setting to map onto.
+the muxer stores each frame's delay as however long the filtered stream says it should be on screen, so
+the input framerate _is_ the delay control. `jpeg_quality`/`png_compression_level` play no role at all — a
+`preview` is never a still format (see "Two independent axes" above).
 
-Temporary per-frame PNGs and the intermediate palette PNG live under a fresh temp directory, always
-removed in a `finally`, same discipline as a mosaic's own frame directory.
+**`frame_delay_ms` fidelity differs by `output_mime`, and this matters for real use.** GIF stores the
+delay in its Graphics Control Extension in **centiseconds** — 10ms is the storage floor, and every
+requested value rounds (`33` → 3cs → 30ms stored); most browsers additionally clamp a stored delay of 0-1cs
+up to 100ms, so a very small requested delay can render far slower than asked. Animated WebP stores the
+delay in its ANMF chunk in **milliseconds**, honored exactly. The CLI enforces a 20ms floor on
+`--frame-delay-ms` for exactly this reason (see [thumbnail_policy.md](../cli/thumbnail_policy.md)).
+
+Temporary per-frame PNGs (and, for GIF, the intermediate palette PNG) live under a fresh temp directory,
+always removed in a `finally`, same discipline as a mosaic's own frame directory.
 
 ## Parallelism
 

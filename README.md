@@ -161,7 +161,8 @@ SYNC1_PASSWORD='correct horse battery staple' \
   sync1 thumbnail_policy create "*.jpg" generate --root ~/backups/photos \
   --name jpg_thumb --mime-types image/jpeg --media-type image \
   --resizing-strategy fit_to_box \
-  --image-width 320 --image-height 240 --jpeg-quality 80
+  --image-width 320 --image-height 240 \
+  --output-mime image/jpeg --jpeg-quality 80
 ```
 
 ```
@@ -180,12 +181,13 @@ sync1 thumbnail ensure --root ~/backups/photos
 thumbnail ensure: 0 up to date, 1 to generate, 0 to regenerate, 0 to delete, 0 missing cache entry, 0 stubbed original, 0 stubbed preserved, 0 stale stub preview(s), 0 error(s)
 ```
 
-A small `sunset.jpg.p1-jpg_thumb-iw320-ih240-q80.<hash>.jpg` now sits in `_thumbnail/` next to the
-original — a preview you can browse without materializing (or downloading) the full-size photo. The
-`p1-jpg_thumb-iw320-ih240-q80` segment encodes the policy's own name and configured parameters, so
-editing the policy later (a different size or quality) naturally produces a different expected filename
-and triggers regeneration, even though `sunset.jpg` itself never changed -- and a second policy matching
-the same file would produce its own, separately-named thumbnail alongside this one, never a conflict.
+A small `sunset.jpg.p2-jpg_thumb-iw320-ih240-fmtimage_jpeg-q80.<hash>.jpg` now sits in `_thumbnail/` next
+to the original — a preview you can browse without materializing (or downloading) the full-size photo.
+The `p2-jpg_thumb-iw320-ih240-fmtimage_jpeg-q80` segment encodes the policy's own name and configured
+parameters (both its sizing and its output format/quality), so editing the policy later (a different
+size, format, or quality) naturally produces a different expected filename and triggers regeneration,
+even though `sunset.jpg` itself never changed -- and a second policy matching the same file would produce
+its own, separately-named thumbnail alongside this one, never a conflict.
 
 ### Manage S3 storage classes
 

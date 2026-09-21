@@ -59,6 +59,7 @@ describe("migration runner", () => {
       { filename: "0006_add_object_ciphertext_checksum.sql" },
       { filename: "0007_thumbnail_policy_names_no_priority.sql" },
       { filename: "0008_thumbnail_output_types_and_resizing.sql" },
+      { filename: "0009_thumbnail_output_mime_and_encoding.sql" },
     ]);
 
     // Running again must not error (e.g. re-executing CREATE TABLE) and must
@@ -67,7 +68,7 @@ describe("migration runner", () => {
     const appliedSecond = db
       .prepare<[], { filename: string }>("SELECT filename FROM _migrations")
       .all();
-    expect(appliedSecond).toHaveLength(8);
+    expect(appliedSecond).toHaveLength(9);
   });
 
   it("creates the indexes named in the schema", () => {

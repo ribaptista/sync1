@@ -11,6 +11,7 @@ import type { CacheEntriesRepository } from "../db/repositories/cache-entries-re
 import type {
   ThumbnailPolicyRow,
   ThumbnailPolicyGenerateRow,
+  ThumbnailOutputMime,
 } from "../db/repositories/thumbnail-policies-repository.js";
 import type { MediaProber, ProbedMedia } from "../media/probe.js";
 import {
@@ -72,17 +73,16 @@ export function isUnderThumbnailDir(relativePath: string): boolean {
  * produces exactly one deletion and one regeneration, which is the
  * correct reaction to a rename it has no other way to detect.
  *
- * Literal abbreviated fields rather than a hash of them: worst case
- * (`p1-somepolicyname-tr9999-tc9999-ts65535-q100`) still leaves plenty of
- * the 255-byte path-component limit spare even after the hash and
- * extension, so length was never the binding constraint -- a human being
- * able to `ls _thumbnail/` and read off what config produced a file, with
- * no database cross-reference, is worth far more than the bytes a hash
- * would reclaim. `PARAMS_VERSION` exists so a future incompatible change
- * to this segment's own shape can be told apart from today's, rather than
- * silently misparsed.
+ * Literal abbreviated fields rather than a hash of them: worst case still
+ * leaves plenty of the 255-byte path-component limit spare even after the
+ * hash and extension, so length was never the binding constraint -- a
+ * human being able to `ls _thumbnail/` and read off what config produced a
+ * file, with no database cross-reference, is worth far more than the bytes
+ * a hash would reclaim. `PARAMS_VERSION` exists so a future incompatible
+ * change to this segment's own shape can be told apart from today's,
+ * rather than silently misparsed.
  */
-const PARAMS_VERSION = "p1";
+const PARAMS_VERSION = "p2";
 /**
  * Deliberately loose about the name segment specifically: parsing an
  * existing filename never extracts individual fields out of this segment
@@ -93,28 +93,71 @@ const PARAMS_VERSION = "p1";
  * reject a filename that doesn't look like *any* recognized shape (fewer
  * than one name plus one field pair) so it's left alone rather than
  * mis-tracked -- see the fuller discussion at `parseThumbnailEntry`.
+ *
+ * Accepts both `p1-` and `p2-`: if this only matched `p2`, every existing
+ * `p1` thumbnail on a real vault would become permanently unrecognized --
+ * never claimed, but also never swept -- and would sit beside its `p2`
+ * replacement forever. Keeping `p1` recognized means each old file is
+ * still found by the policy-name lookup (`split("-")[1]` works identically
+ * on either version's segment), counted `toRegenerate`, and deleted as its
+ * `p2` replacement is written -- zero manual cleanup. Field values widen
+ * from `p1`'s digits-only (`\d+`) to `[0-9A-Za-z_]+` for `p2`, since the
+ * output-mime and dither tokens are no longer purely numeric -- see
+ * `normalizeParamsValue`.
  */
-const PARAMS_SEGMENT_RE = /^p1-[A-Za-z0-9_]+(?:-[a-z]+\d+)+$/;
+const PARAMS_SEGMENT_RE = /^p[12]-[A-Za-z0-9_]+(?:-[a-z]+[0-9A-Za-z_]+)+$/;
 
 /**
- * Four branches, one per `ThumbnailPolicyGenerateRow` arm -- see that
- * type's own doc comment (thumbnail-policies-repository.ts) for why each
- * carries exactly these fields and no others. `ss`/`fc`/`fd` are new for
- * 'resize_shorter_side'/'gif'; `iw`/`ih`/`tr`/`tc`/`ts`/`q` are unchanged
- * from before this policy gained a second discriminant per media type. A
- * 'gif' row has no `q` segment at all -- a GIF is never JPEG-encoded, so
- * there's no quality setting to encode (see the repository's own
- * `GENERATE_BRANCH_FIELDS`).
+ * Any character outside `[0-9A-Za-z_]` becomes `_`, so a serialized value
+ * can never contain the `-` field separator (nor a `.`, which would break
+ * the outer filename split). No escaping and no tokenizer needed --
+ * `split("-")` stays correct, and the segment stays readable. Lossy in
+ * general, which is only safe because of what's actually serialized
+ * through it: policy names (already restricted to this exact charset by
+ * `NAME_PATTERN`, so this is a no-op for them) and the closed `outputMime`/
+ * `gifDither` enums, whose members stay distinct after normalization.
+ */
+function normalizeParamsValue(v: string): string {
+  return v.replace(/[^0-9A-Za-z_]/g, "_");
+}
+
+/**
+ * One token per SIZING field, then `fmt<outputMime>`, then one token per
+ * ENCODING field -- mirrors the repository's own two-axis split (see
+ * `SIZING_FIELDS`/`ENCODING_FIELDS` in thumbnail-policies-repository.ts).
+ * `shorterSide` (`ss`) is shared by every branch but `fit_to_box`, exactly
+ * as the repository's own field carries across those branches.
  */
 function expectedParamsSegment(policy: ThumbnailPolicyGenerateRow): string {
-  if (policy.mediaType === "image") {
-    return policy.resizingStrategy === "fit_to_box"
-      ? `${PARAMS_VERSION}-${policy.name}-iw${policy.imageWidth}-ih${policy.imageHeight}-q${policy.jpegQuality}`
-      : `${PARAMS_VERSION}-${policy.name}-ss${policy.shorterSide}-q${policy.jpegQuality}`;
+  const sizingTokens: string[] =
+    policy.mediaType === "image"
+      ? policy.resizingStrategy === "fit_to_box"
+        ? [`iw${policy.imageWidth}`, `ih${policy.imageHeight}`]
+        : [`ss${policy.shorterSide}`]
+      : policy.outputType === "mosaic"
+        ? [`ss${policy.shorterSide}`, `tr${policy.tileRowCount}`, `tc${policy.tileColumnCount}`]
+        : [`ss${policy.shorterSide}`, `fc${policy.frameCount}`, `fd${policy.frameDelayMs}`];
+
+  const encodingTokens: string[] = [`fmt${normalizeParamsValue(policy.outputMime)}`];
+  switch (policy.outputMime) {
+    case "image/jpeg":
+      encodingTokens.push(`q${policy.jpegQuality}`);
+      break;
+    case "image/png":
+      encodingTokens.push(`pl${policy.pngCompressionLevel}`);
+      break;
+    case "image/webp":
+      encodingTokens.push(`wq${policy.webpQuality}`, `wl${policy.webpLossless ? 1 : 0}`);
+      break;
+    case "image/gif":
+      encodingTokens.push(
+        `mc${policy.gifMaxColors}`,
+        `dt${normalizeParamsValue(policy.gifDither)}`,
+      );
+      break;
   }
-  return policy.outputType === "mosaic"
-    ? `${PARAMS_VERSION}-${policy.name}-tr${policy.tileRowCount}-tc${policy.tileColumnCount}-ts${policy.tileSize}-q${policy.jpegQuality}`
-    : `${PARAMS_VERSION}-${policy.name}-ts${policy.tileSize}-fc${policy.frameCount}-fd${policy.frameDelayMs}`;
+
+  return [PARAMS_VERSION, policy.name, ...sizingTokens, ...encodingTokens].join("-");
 }
 
 interface ExistingThumbnailFile {
@@ -177,12 +220,6 @@ function parseThumbnailEntry(relativePath: string): ExistingThumbnailFile | unde
     originalDir === "." ? originalName : `${originalDir}/${originalName}`;
 
   return { relativePath, originalRelativePath, paramsSegment, policyName, hash, thumbExt };
-}
-
-function fileExtension(relativePath: string): string {
-  const base = path.basename(relativePath);
-  const dotIndex = base.lastIndexOf(".");
-  return dotIndex === -1 ? "" : base.slice(dotIndex + 1);
 }
 
 function thumbnailRelativePath(
@@ -288,30 +325,20 @@ interface GenerationJob {
 }
 
 /**
- * Image mime types ImageMagick can read but not write (`identify -list
- * format` shows each as `r--`) -- a thumbnail generated from one can
- * never keep the original's own extension the way an ordinary image does,
- * since asking `convert` to *write* that format would fail outright with
- * no encoder available. Forced to `.jpg` instead, the same way a video
- * mosaic always is regardless of its own container.
+ * A pure map from what the policy declares it will produce to the file
+ * extension that names it -- the source's own extension/mime type plays no
+ * role at all, now that `output_mime` is always required (no inheritance).
+ * `jpg`, never `jpeg`, matching the existing single-spelling convention.
  */
-const RAW_IMAGE_MIME_TYPES = new Set<string>(["image/x-canon-cr2"]);
+const EXTENSION_BY_OUTPUT_MIME: Record<ThumbnailOutputMime, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+};
 
-/**
- * For a video, the extension is the *policy's* own `outputType`, not a
- * property of the source at all -- 'mosaic' is always a JPEG regardless of
- * container, 'gif' is always a GIF. For an image, unchanged: the policy's
- * `resizingStrategy` plays no role, since both image branches produce the
- * same output format (the original's own extension, or `.jpg` for a
- * write-incapable source format).
- */
-function expectedThumbExtension(
-  decision: ProvisionalDecisionProbed,
-  policy: ThumbnailPolicyGenerateRow,
-): string {
-  if (policy.mediaType === "video") return policy.outputType === "gif" ? "gif" : "jpg";
-  if (RAW_IMAGE_MIME_TYPES.has(decision.probed.mimeType)) return "jpg";
-  return fileExtension(decision.relativePath);
+function expectedThumbExtension(policy: ThumbnailPolicyGenerateRow): string {
+  return EXTENSION_BY_OUTPUT_MIME[policy.outputMime];
 }
 
 async function classifyProbed(
@@ -388,7 +415,7 @@ async function generateForDecision(
 ): Promise<void> {
   if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
 
-  const thumbExt = expectedThumbExtension(decision, policy);
+  const thumbExt = expectedThumbExtension(policy);
   const paramsSegment = expectedParamsSegment(policy);
   const destRelativePath = thumbnailRelativePath(
     decision.relativePath,
@@ -417,7 +444,7 @@ async function generateForDecision(
         destPath: destAbsolutePath,
         width: size.width,
         height: size.height,
-        jpegQuality: policy.jpegQuality,
+        encoding: policy,
       },
       logger,
     );
@@ -437,13 +464,13 @@ async function generateForDecision(
           durationSeconds: decision.probed.durationSeconds,
           tileRowCount: policy.tileRowCount,
           tileColumnCount: policy.tileColumnCount,
-          tileSize: policy.tileSize,
-          jpegQuality: policy.jpegQuality,
+          shorterSide: policy.shorterSide,
+          encoding: policy,
         },
         logger,
       );
     } else {
-      await generator.generateVideoGif(
+      await generator.generateVideoPreview(
         {
           sourcePath: sourceAbsolutePath,
           destPath: destAbsolutePath,
@@ -452,7 +479,8 @@ async function generateForDecision(
           durationSeconds: decision.probed.durationSeconds,
           frameCount: policy.frameCount,
           frameDelayMs: policy.frameDelayMs,
-          tileSize: policy.tileSize,
+          shorterSide: policy.shorterSide,
+          encoding: policy,
         },
         logger,
       );
@@ -699,7 +727,7 @@ export async function scanThumbnails(
     const claimedThumbs = new Set<ExistingThumbnailFile>();
 
     for (const policy of decision.resolution.policies) {
-      const expectedExt = expectedThumbExtension(decision, policy);
+      const expectedExt = expectedThumbExtension(policy);
       const expectedParams = expectedParamsSegment(policy);
       const upToDateMatch = existing.find(
         (t) =>

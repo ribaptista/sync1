@@ -80,9 +80,13 @@ const GENERATE_JPEG = {
   mimeTypes: ["image/jpeg"],
   imageWidth: 320,
   imageHeight: 240,
+  outputMime: "image/jpeg",
   jpegQuality: 80,
 } satisfies Omit<
-  Extract<ThumbnailPolicyCreateInput, { mediaType: "image"; resizingStrategy: "fit_to_box" }>,
+  Extract<
+    ThumbnailPolicyCreateInput,
+    { mediaType: "image"; resizingStrategy: "fit_to_box"; outputMime: "image/jpeg" }
+  >,
   "glob"
 >;
 
@@ -91,14 +95,15 @@ function createGeneratePolicy(glob: string, overrides: Partial<typeof GENERATE_J
 }
 
 // Matches expectedParamsSegment's own encoding for GENERATE_JPEG's default
-// name+fields ("img"; imageWidth 320, imageHeight 240, jpegQuality 80) and
-// for the video policy created directly in the mosaic test below ("vid";
-// tileRowCount 3, tileColumnCount 3, tileSize 48, jpegQuality 80) -- every
+// name+fields ("img"; imageWidth 320, imageHeight 240, output mime
+// image/jpeg, jpegQuality 80) and for the video policy created directly in
+// the mosaic test below ("vid"; tileRowCount 3, tileColumnCount 3,
+// shorterSide 48, output mime image/jpeg, jpegQuality 80) -- every
 // thumbnail filename asserted against in this file now carries one of
 // these two segments, since parseThumbnailEntry requires a shape-valid
 // params segment to recognize a thumbnail file at all.
-const IMAGE_PARAMS = "p1-img-iw320-ih240-q80";
-const VIDEO_PARAMS = "p1-vid-tr3-tc3-ts48-q80";
+const IMAGE_PARAMS = "p2-img-iw320-ih240-fmtimage_jpeg-q80";
+const VIDEO_PARAMS = "p2-vid-ss48-tr3-tc3-fmtimage_jpeg-q80";
 
 function createSkipPolicy(glob: string, mimeTypes = ["image/jpeg"], name = "skip"): number {
   return policiesRepo.create({ name, glob, action: "skip", mimeTypes });
@@ -140,7 +145,7 @@ function fakeGenerator(failFor: Set<string> = new Set()): ThumbnailGenerator & {
       fs.mkdirSync(path.dirname(input.destPath), { recursive: true });
       fs.writeFileSync(input.destPath, "mosaic");
     },
-    async generateVideoGif(input) {
+    async generateVideoPreview(input) {
       if (failFor.has(input.sourcePath)) {
         throw new ThumbnailGenerationError(`simulated failure for ${input.sourcePath}`);
       }
@@ -290,7 +295,54 @@ describe("scanThumbnails", () => {
       fs.existsSync(path.join(root, `_thumbnail/photo.jpg.${IMAGE_PARAMS}.samehash.jpg`)),
     ).toBe(false);
     expect(
-      fs.existsSync(path.join(root, "_thumbnail/photo.jpg.p1-img-iw200-ih240-q80.samehash.jpg")),
+      fs.existsSync(
+        path.join(root, "_thumbnail/photo.jpg.p2-img-iw200-ih240-fmtimage_jpeg-q80.samehash.jpg"),
+      ),
+    ).toBe(true);
+  });
+
+  it("recognizes a pre-existing p1 thumbnail as this policy's own stale output, regenerating it under p2 rather than orphaning it", async () => {
+    // The p1->p2 filename-grammar bump must not turn every real vault's
+    // existing thumbnails invisible: PARAMS_SEGMENT_RE still recognizes a
+    // p1 segment, and the policy-name lookup (split("-")[1]) parses it
+    // identically to a p2 one, so it's found, matched by name, and
+    // regenerated -- never left behind as an unrecognized/orphaned file.
+    createGeneratePolicy("*.jpg");
+    writeFile("photo.jpg");
+    seedCache("photo.jpg", "samehash");
+    // Hand-written in the OLD p1 shape (digits-only fields, no fmt/q token
+    // split) -- what a real vault's thumbnail from before this change
+    // would look like, for the same policy ("img") and the same content
+    // hash.
+    writeFile("_thumbnail/photo.jpg.p1-img-iw320-ih240-q80.samehash.jpg");
+
+    const stateStats = await run(
+      "state",
+      undefined,
+      fakeProber({ "photo.jpg": JPEG_IMAGE }),
+      fakeGenerator(),
+    );
+    // Not "up to date" (the p1 file's whole segment doesn't match the
+    // freshly-computed p2 one) but also not an unrecognized/orphaned file
+    // -- it's this same policy's own prior output, just under the old
+    // grammar, so it's toRegenerate.
+    expect(stateStats).toMatchObject({ upToDate: 0, toRegenerate: 1, toDelete: 0 });
+
+    const ensureStats = await run(
+      "ensure",
+      undefined,
+      fakeProber({ "photo.jpg": JPEG_IMAGE }),
+      fakeGenerator(),
+    );
+    expect(ensureStats).toMatchObject({ toRegenerate: 1 });
+    // The old p1 file is deleted as part of the same regeneration job...
+    expect(
+      fs.existsSync(path.join(root, "_thumbnail/photo.jpg.p1-img-iw320-ih240-q80.samehash.jpg")),
+    ).toBe(false);
+    // ...and its p2 replacement is written in its place, no manual cleanup
+    // needed for the one-time upgrade.
+    expect(
+      fs.existsSync(path.join(root, `_thumbnail/photo.jpg.${IMAGE_PARAMS}.samehash.jpg`)),
     ).toBe(true);
   });
 
@@ -365,11 +417,14 @@ describe("scanThumbnails", () => {
     // JPEG_IMAGE is 800x600 (4:3) -- contain-fit into each policy's own box.
     expect(byWidth.get(999)).toMatchObject({
       height: 749,
-      destPath: path.join(root, "_thumbnail/both.jpg.p1-big-iw999-ih999-q80.abc.jpg"),
+      destPath: path.join(root, "_thumbnail/both.jpg.p2-big-iw999-ih999-fmtimage_jpeg-q80.abc.jpg"),
     });
     expect(byWidth.get(100)).toMatchObject({
       height: 75,
-      destPath: path.join(root, "_thumbnail/both.jpg.p1-small-iw100-ih100-q80.abc.jpg"),
+      destPath: path.join(
+        root,
+        "_thumbnail/both.jpg.p2-small-iw100-ih100-fmtimage_jpeg-q80.abc.jpg",
+      ),
     });
 
     // A second run finds both up to date, and deletes neither -- each
@@ -411,7 +466,9 @@ describe("scanThumbnails", () => {
       true,
     ); // "keep" survives
     expect(
-      fs.existsSync(path.join(root, "_thumbnail/both.jpg.p1-drop-iw100-ih100-q80.abc.jpg")),
+      fs.existsSync(
+        path.join(root, "_thumbnail/both.jpg.p2-drop-iw100-ih100-fmtimage_jpeg-q80.abc.jpg"),
+      ),
     ).toBe(false); // "drop"'s own output is swept
   });
 
@@ -576,7 +633,7 @@ describe("scanThumbnails", () => {
           else resolveB = finish;
         }),
       generateVideoMosaic: async () => {},
-      generateVideoGif: async () => {},
+      generateVideoPreview: async () => {},
     };
 
     const updates: { total: number; generated: number }[] = [];
@@ -734,7 +791,8 @@ describe("scanThumbnails", () => {
       mimeTypes: ["video/*"],
       tileRowCount: 3,
       tileColumnCount: 3,
-      tileSize: 48,
+      shorterSide: 48,
+      outputMime: "image/jpeg",
       jpegQuality: 80,
     });
     writeFile("clip.mp4");
@@ -759,17 +817,20 @@ describe("scanThumbnails", () => {
     });
   });
 
-  it("generates via generateVideoGif for an 'output_type=gif' policy -- .gif extension, no jpegQuality in the params segment", async () => {
+  it("generates via generateVideoPreview for an 'output_type=preview' policy -- .gif extension, no jpegQuality in the params segment", async () => {
     policiesRepo.create({
       name: "gifpolicy",
       glob: "*.mp4",
       action: "generate",
       mediaType: "video",
-      outputType: "gif",
+      outputType: "preview",
       mimeTypes: ["video/*"],
-      tileSize: 32,
+      shorterSide: 32,
       frameCount: 6,
       frameDelayMs: 100,
+      outputMime: "image/gif",
+      gifMaxColors: 256,
+      gifDither: "sierra2_4a",
     });
     writeFile("clip.mp4");
     seedCache("clip.mp4", "vid1");
@@ -788,7 +849,10 @@ describe("scanThumbnails", () => {
     expect(generator.videoCalls).toHaveLength(0); // mosaic generator untouched
     expect(generator.gifCalls).toHaveLength(1);
     expect(generator.gifCalls[0]).toMatchObject({
-      destPath: path.join(root, "_thumbnail/clip.mp4.p1-gifpolicy-ts32-fc6-fd100.vid1.gif"),
+      destPath: path.join(
+        root,
+        "_thumbnail/clip.mp4.p2-gifpolicy-ss32-fc6-fd100-fmtimage_gif-mc256-dtsierra2_4a.vid1.gif",
+      ),
     });
 
     // Up to date on the next run -- the .gif extension round-trips through
@@ -812,7 +876,8 @@ describe("scanThumbnails", () => {
       mimeTypes: ["video/*"],
       tileRowCount: 2,
       tileColumnCount: 2,
-      tileSize: 32,
+      shorterSide: 32,
+      outputMime: "image/jpeg",
       jpegQuality: 80,
     });
     policiesRepo.create({
@@ -820,11 +885,14 @@ describe("scanThumbnails", () => {
       glob: "*.mp4",
       action: "generate",
       mediaType: "video",
-      outputType: "gif",
+      outputType: "preview",
       mimeTypes: ["video/*"],
-      tileSize: 32,
+      shorterSide: 32,
       frameCount: 4,
       frameDelayMs: 100,
+      outputMime: "image/gif",
+      gifMaxColors: 256,
+      gifDither: "sierra2_4a",
     });
     writeFile("clip.mp4");
     seedCache("clip.mp4", "vid1");
@@ -844,11 +912,19 @@ describe("scanThumbnails", () => {
     expect(generator.gifCalls).toHaveLength(1);
     expect(
       fs.existsSync(
-        path.join(root, "_thumbnail/clip.mp4.p1-mosaicpolicy-tr2-tc2-ts32-q80.vid1.jpg"),
+        path.join(
+          root,
+          "_thumbnail/clip.mp4.p2-mosaicpolicy-ss32-tr2-tc2-fmtimage_jpeg-q80.vid1.jpg",
+        ),
       ),
     ).toBe(true);
     expect(
-      fs.existsSync(path.join(root, "_thumbnail/clip.mp4.p1-gifpolicy-ts32-fc4-fd100.vid1.gif")),
+      fs.existsSync(
+        path.join(
+          root,
+          "_thumbnail/clip.mp4.p2-gifpolicy-ss32-fc4-fd100-fmtimage_gif-mc256-dtsierra2_4a.vid1.gif",
+        ),
+      ),
     ).toBe(true);
   });
 
@@ -861,6 +937,7 @@ describe("scanThumbnails", () => {
       resizingStrategy: "resize_shorter_side",
       mimeTypes: ["image/jpeg"],
       shorterSide: 100,
+      outputMime: "image/jpeg",
       jpegQuality: 80,
     });
     writeFile("photo.jpg");
@@ -881,12 +958,24 @@ describe("scanThumbnails", () => {
     expect(generator.imageCalls[0]).toMatchObject({
       width: 133,
       height: 100,
-      destPath: path.join(root, "_thumbnail/photo.jpg.p1-short-ss100-q80.abc.jpg"),
+      destPath: path.join(root, "_thumbnail/photo.jpg.p2-short-ss100-fmtimage_jpeg-q80.abc.jpg"),
     });
   });
 
-  it("forces a .jpg thumbnail extension for a RAW (CR2) source, regardless of the original's own .CR2 extension", async () => {
-    createGeneratePolicy("*.CR2", { mimeTypes: ["image/x-canon-cr2"] });
+  it("the thumbnail's extension comes from the policy's output_mime alone, never the source's own extension/mime type -- a source ImageMagick can read but not write (e.g. CR2) is no longer special-cased", async () => {
+    policiesRepo.create({
+      name: "raw_to_webp",
+      glob: "*.CR2",
+      action: "generate",
+      mediaType: "image",
+      resizingStrategy: "fit_to_box",
+      mimeTypes: ["image/x-canon-cr2"],
+      imageWidth: 320,
+      imageHeight: 240,
+      outputMime: "image/webp",
+      webpQuality: 80,
+      webpLossless: false,
+    });
     writeFile("photo.CR2");
     seedCache("photo.CR2", "rawhash");
 
@@ -896,7 +985,7 @@ describe("scanThumbnails", () => {
 
     expect(stats).toMatchObject({ toGenerate: 1, errors: 0 });
     expect(generator.imageCalls).toHaveLength(1);
-    expect(generator.imageCalls[0]!.destPath).toMatch(/\.jpg$/);
+    expect(generator.imageCalls[0]!.destPath).toMatch(/\.webp$/);
     expect(generator.imageCalls[0]!.destPath).not.toMatch(/\.CR2$/i);
   });
 
