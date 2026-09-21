@@ -197,7 +197,10 @@ export async function applyLocalChangesToCandidate(
       handledPaths.set(row.path, null);
       if (decision.kind === "apply") {
         appliedCount++;
-        entriesRepo.delete(row.path);
+        // `decideDeleted`'s own "apply" branch is only ever reached when
+        // `existingEntry` is truthy (its `!existingEntry` case returns
+        // "noop" instead) -- see src/sync/conflict-rules.ts.
+        entriesRepo.deleteWithHistory(existingEntry!, versionStamp);
         logger.debug({ path: row.path }, "removing entry (deleted locally)");
       } else {
         logger.debug({ path: row.path }, "local change already reconciled remotely (no-op)");

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { HeadObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import {
   startLocalStack,
@@ -10,6 +11,25 @@ import {
   type LocalStackHandle,
 } from "./helpers/localstack.js";
 import { runCli } from "./helpers/cli.js";
+
+interface RawEntryDeletionRow {
+  path: string;
+  type: string;
+  hash: string | null;
+  introduced_in_version: string;
+  deleted_in_version: string;
+}
+
+function readEntryDeletions(root: string, forPath: string): RawEntryDeletionRow[] {
+  const db = new Database(path.join(root, ".sync1", "state.db"), { readonly: true });
+  const rows = db
+    .prepare(
+      "SELECT path, type, hash, introduced_in_version, deleted_in_version FROM entry_deletions WHERE path = ?",
+    )
+    .all(forPath) as RawEntryDeletionRow[];
+  db.close();
+  return rows;
+}
 
 const PASSWORD = "correct horse battery staple";
 
@@ -118,6 +138,63 @@ describe("gc", () => {
 
     const objects = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: "objects/" }));
     expect(objects.KeyCount).toBe(1); // still there, still referenced by b.txt
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("records a deletion in entry_deletions with both version stamps, and the row survives gc --apply after the object is gone", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    fs.writeFileSync(path.join(root, "a.txt"), "will be deleted");
+    const createSync = await runCli(["sync", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    const introducedInVersion = (JSON.parse(createSync.stdout) as { version_stamp: string })
+      .version_stamp;
+
+    fs.rmSync(path.join(root, "a.txt"));
+    const deleteSync = await runCli(["sync", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+    const deletedInVersion = (JSON.parse(deleteSync.stdout) as { version_stamp: string })
+      .version_stamp;
+
+    const beforeGc = readEntryDeletions(root, "a.txt");
+    expect(beforeGc).toHaveLength(1);
+    expect(beforeGc[0]).toMatchObject({
+      path: "a.txt",
+      type: "file",
+      introduced_in_version: introducedInVersion,
+      deleted_in_version: deletedInVersion,
+    });
+    const hash = beforeGc[0]!.hash;
+    expect(hash).toEqual(expect.any(String));
+
+    const applied = await gc(root, true);
+    expect(applied.parsed).toMatchObject({ applied: true, orphan_count: 1 });
+
+    // The object is really gone from S3 now...
+    const objects = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: "objects/" }));
+    expect(objects.KeyCount).toBe(0);
+    // ...but the history row survives, hash now dangling -- it records
+    // what the hash *was*, not a live reference (see migration 0010).
+    const afterGc = readEntryDeletions(root, "a.txt");
+    expect(afterGc).toEqual(beforeGc);
 
     fs.rmSync(root, { recursive: true, force: true });
   });

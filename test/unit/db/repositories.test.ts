@@ -128,6 +128,42 @@ describe("ObjectsRepository", () => {
     const staged = [...objectsRepo.iterateStagedOrphans()];
     expect(staged).toEqual([{ hash: "orphan1", s3_key: "objects/orphan1", size: 20 }]);
   });
+
+  it("still collects an object whose only remaining reference is an entry_deletions row -- the anti-join names 'entries' literally, so a history row can't accidentally pin content", () => {
+    // This is the invariant that's invisible in the code (it holds only
+    // because objects-repository.ts's own orphan query is written against
+    // `entries` literally, not via generic reference discovery) and would
+    // be silently broken by anyone later "fixing" entry_deletions to lack
+    // a hash reference, or by a future reference-discovery rewrite that
+    // widens the anti-join to cover every table with a `hash` column.
+    const db = openStateDb(":memory:");
+    new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+    new VersionsRepository(db).insert("v1", "2026-01-02T00:00:00.000Z");
+    const objectsRepo = new ObjectsRepository(db);
+    const entriesRepo = new EntriesRepository(db);
+
+    objectsRepo.upsert({ hash: "gone", s3_key: "objects/gone", size: 20 });
+    const entry = { path: "a.txt", type: "file" as const, hash: "gone", state_version: "v0" };
+    entriesRepo.upsert(entry);
+    entriesRepo.deleteWithHistory(entry, "v1");
+
+    // The entries row is gone, but a history row referencing "gone" still
+    // exists -- confirming this test actually exercises the scenario it
+    // claims to, not a vacuous one.
+    expect(entriesRepo.get("a.txt")).toBeUndefined();
+    expect(entriesRepo.listDeletionsForPath("a.txt")).toMatchObject([{ hash: "gone" }]);
+
+    objectsRepo.stageOrphansForDeletion();
+    expect(objectsRepo.countStagedOrphans()).toEqual({ count: 1, totalSize: 20 });
+
+    objectsRepo.deleteStagedOrphans();
+    expect(objectsRepo.has("gone")).toBe(false);
+
+    // The history row survives the gc, now with a permanently-dangling
+    // hash -- it records what the hash *was*, per the migration's own doc
+    // comment, not a live reference.
+    expect(entriesRepo.listDeletionsForPath("a.txt")).toMatchObject([{ hash: "gone" }]);
+  });
 });
 
 describe("EntriesRepository (state.db)", () => {
@@ -149,10 +185,70 @@ describe("EntriesRepository (state.db)", () => {
   it("deletions are full row removals, not tombstones", () => {
     const db = openStateDb(":memory:");
     new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+    new VersionsRepository(db).insert("v1", "2026-01-02T00:00:00.000Z");
     const repo = new EntriesRepository(db);
-    repo.upsert({ path: "a.txt", type: "file", hash: null, state_version: "v0" });
-    repo.delete("a.txt");
+    const entry = { path: "a.txt", type: "file" as const, hash: null, state_version: "v0" };
+    repo.upsert(entry);
+    repo.deleteWithHistory(entry, "v1");
     expect(repo.get("a.txt")).toBeUndefined();
+  });
+
+  describe("deleteWithHistory", () => {
+    it("writes exactly one entry_deletions row carrying the file's hash and both version stamps", () => {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      new VersionsRepository(db).insert("v1", "2026-01-02T00:00:00.000Z");
+      new ObjectsRepository(db).upsert({ hash: "h1", s3_key: "objects/h1", size: 10 });
+      const repo = new EntriesRepository(db);
+      const entry = {
+        path: "photos/a.jpg",
+        type: "file" as const,
+        hash: "h1",
+        state_version: "v0",
+      };
+      repo.upsert(entry);
+
+      repo.deleteWithHistory(entry, "v1");
+
+      const deletions = repo.listDeletionsForPath("photos/a.jpg");
+      expect(deletions).toHaveLength(1);
+      expect(deletions[0]).toMatchObject({
+        path: "photos/a.jpg",
+        type: "file",
+        hash: "h1",
+        introducedInVersion: "v0",
+        deletedInVersion: "v1",
+      });
+    });
+
+    it("records a NULL hash for a deleted directory", () => {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      new VersionsRepository(db).insert("v1", "2026-01-02T00:00:00.000Z");
+      const repo = new EntriesRepository(db);
+      const entry = { path: "photos", type: "dir" as const, hash: null, state_version: "v0" };
+      repo.upsert(entry);
+
+      repo.deleteWithHistory(entry, "v1");
+
+      expect(repo.listDeletionsForPath("photos")).toMatchObject([{ type: "dir", hash: null }]);
+    });
+
+    it("is atomic -- a failed history insert leaves the entries row untouched", () => {
+      const db = openStateDb(":memory:");
+      new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      const repo = new EntriesRepository(db);
+      const entry = { path: "a.txt", type: "file" as const, hash: null, state_version: "v0" };
+      repo.upsert(entry);
+
+      // "v1" was never inserted into `versions` -- entry_deletions.
+      // deleted_in_version REFERENCES versions(version_stamp), so this
+      // insert fails its FK check (state.db opens with foreign_keys = ON).
+      // If the two statements weren't one transaction, the `entries`
+      // DELETE would have already committed by the time this throws.
+      expect(() => repo.deleteWithHistory(entry, "v1")).toThrow();
+      expect(repo.get("a.txt")).toEqual(entry);
+    });
   });
 
   it("iterateAllSortedByPath returns rows in lexicographic path order", () => {

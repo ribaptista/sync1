@@ -13,6 +13,17 @@ export interface EntryRow {
   state_version: string;
 }
 
+/** A row from the write-only `entry_deletions` audit trail -- see migration 0010's own header comment and docs/architecture/conflict-resolution.md. */
+export interface EntryDeletionRow {
+  id: number;
+  path: string;
+  type: EntryType;
+  hash: string | null;
+  introducedInVersion: string;
+  deletedInVersion: string;
+  createdAt: string;
+}
+
 const ROW_COLUMNS = "path, type, hash, state_version";
 
 interface CountRow {
@@ -21,6 +32,28 @@ interface CountRow {
 
 interface HashRow {
   hash: string;
+}
+
+interface RawEntryDeletionRow {
+  id: number;
+  path: string;
+  type: EntryType;
+  hash: string | null;
+  introduced_in_version: string;
+  deleted_in_version: string;
+  created_at: string;
+}
+
+function fromRawDeletionRow(row: RawEntryDeletionRow): EntryDeletionRow {
+  return {
+    id: row.id,
+    path: row.path,
+    type: row.type,
+    hash: row.hash,
+    introducedInVersion: row.introduced_in_version,
+    deletedInVersion: row.deleted_in_version,
+    createdAt: row.created_at,
+  };
 }
 
 /** state.db's `entries` table — the versioned, committed source of truth. */
@@ -41,9 +74,46 @@ export class EntriesRepository {
       .run(row.path, row.type, row.hash, row.state_version, toCollisionKey(row.path));
   }
 
-  /** Deletions are full row removals, never tombstones (see conflict-resolution design). */
-  delete(path: string): void {
-    this.db.prepare<[string]>("DELETE FROM entries WHERE path = ?").run(path);
+  /**
+   * Deletions are full row removals, never tombstones (see
+   * conflict-resolution design) -- but, unlike a plain `DELETE`, this also
+   * records an audit-trail row in `entry_deletions` in the same
+   * transaction, so "what happened to this path, and when?" stays
+   * answerable from the vault itself after the row is gone. `entry` is the
+   * row being removed (the one caller already has it, from the `get()` it
+   * used to decide to delete in the first place, so this costs no extra
+   * query); `deletedInVersion` is the version stamp of the commit doing the
+   * removing. See migration 0010's own header comment.
+   */
+  deleteWithHistory(entry: EntryRow, deletedInVersion: string): void {
+    const run = this.db.transaction(() => {
+      this.db.prepare<[string]>("DELETE FROM entries WHERE path = ?").run(entry.path);
+      this.db
+        .prepare<[string, EntryType, string | null, string, string, string]>(
+          `INSERT INTO entry_deletions
+            (path, type, hash, introduced_in_version, deleted_in_version, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          entry.path,
+          entry.type,
+          entry.hash,
+          entry.state_version,
+          deletedInVersion,
+          new Date().toISOString(),
+        );
+    });
+    run();
+  }
+
+  /** Every recorded deletion for `path`, oldest first -- debug/audit only, never consulted by sync logic. */
+  listDeletionsForPath(path: string): EntryDeletionRow[] {
+    return this.db
+      .prepare<[string], RawEntryDeletionRow>(
+        "SELECT id, path, type, hash, introduced_in_version, deleted_in_version, created_at FROM entry_deletions WHERE path = ? ORDER BY id ASC",
+      )
+      .all(path)
+      .map(fromRawDeletionRow);
   }
 
   /**

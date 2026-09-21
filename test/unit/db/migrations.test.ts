@@ -21,6 +21,7 @@ describe("migration runner", () => {
     expect(tables).toEqual([
       "_migrations",
       "entries",
+      "entry_deletions",
       "ignore_policies",
       "objects",
       "storage_policies",
@@ -60,6 +61,7 @@ describe("migration runner", () => {
       { filename: "0007_thumbnail_policy_names_no_priority.sql" },
       { filename: "0008_thumbnail_output_types_and_resizing.sql" },
       { filename: "0009_thumbnail_output_mime_and_encoding.sql" },
+      { filename: "0010_add_entry_deletions.sql" },
     ]);
 
     // Running again must not error (e.g. re-executing CREATE TABLE) and must
@@ -68,7 +70,7 @@ describe("migration runner", () => {
     const appliedSecond = db
       .prepare<[], { filename: string }>("SELECT filename FROM _migrations")
       .all();
-    expect(appliedSecond).toHaveLength(9);
+    expect(appliedSecond).toHaveLength(10);
   });
 
   it("creates the indexes named in the schema", () => {
@@ -85,6 +87,7 @@ describe("migration runner", () => {
       "idx_entries_hash",
       "idx_entries_normalized_path",
       "idx_entries_state_version",
+      "idx_entry_deletions_path",
     ]);
   });
 

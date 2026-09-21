@@ -84,6 +84,51 @@ any) currently exists in state.db for that path:
 - Otherwise → conflict (remote modified the path after this machine's baseline, before deleting it
   locally).
 
+## `entry_deletions`: an audit trail for a decision this design makes deliberately lossy
+
+A deletion is a full row removal, not a tombstone (see above) — deliberate, not an oversight: it's what
+lets "created, no entry exists remotely" cover both "genuinely new" and "existed, then was deleted
+remotely" identically, with no third state for every other decision in the matrix to account for. The
+cost is that once a path's `entries` row is gone, nothing in the live vault says it ever existed at all —
+once `gc` later collects the now-unreferenced object, there's no way to answer "what happened to this
+file, and when?" from the vault itself.
+
+`entry_deletions` (migration 0010) is a write-only audit table that answers exactly that question,
+without touching sync semantics at all: nothing in the conflict matrix, `decideLocalChange`, or any other
+sync logic ever reads it. `EntriesRepository.deleteWithHistory(entry, deletedInVersion)` — the sole
+replacement for a plain `delete`, with exactly one call site (`apply-local-changes.ts`'s Pass 1, the only
+place in the whole tree that removes an `entries` row) — wraps the `entries` `DELETE` and the
+`entry_deletions` `INSERT` in one transaction, recording the path, type, the deleted content's hash (`NULL`
+for a directory), and **both** version stamps: `introduced_in_version` (the entry's own `state_version` at
+the moment it was fetched, i.e. the commit that last wrote it) and `deleted_in_version` (the commit doing
+the removing, a parameter already in scope at the one call site — both cost zero extra queries).
+
+`hash` deliberately has **no** foreign key to `objects`, unlike `entries.hash` — the asymmetry matters.
+`gc`'s own orphan anti-join (`objects-repository.ts`) is written against `entries` _literally_
+(`WHERE hash NOT IN (SELECT DISTINCT hash FROM entries WHERE hash IS NOT NULL)`), not via generic
+reference discovery, so a row in `entry_deletions` can never accidentally pin content the vault no longer
+references — an object is still correctly collected once its last `entries` reference is gone, even
+though a history row naming its hash remains. That's also exactly why an FK on `hash` would be actively
+dangerous rather than merely redundant: state.db opens with `foreign_keys = ON`, so it would make
+`gc --apply` fail outright with a constraint violation the moment it tried to delete an object a history
+row still named. The two version-stamp columns _do_ carry FKs (`REFERENCES versions (version_stamp)`) —
+safe today, since nothing anywhere deletes from `versions`, and worth having to catch a bogus stamp; this
+does mean `entry_deletions` quietly commits the schema to never pruning `versions` while it stays FK'd.
+
+Two things worth stating plainly so the table isn't over-read at audit time: a **rename** (there's no
+rename primitive anywhere in this system — `update_cache` resolves one as an independent delete + create)
+shows up here as an ordinary deletion, recoverable only by an audit-time query over data already stored
+(a deletion row whose `hash` matches a path _created_ in the same `deleted_in_version`); an **overwrite**
+(a path's row replaced via `upsert`, e.g. a file↔dir type change) never passes through `delete` at all, so
+it leaves no row here — this logs rows removed from `entries`, not every way a path's content stopped
+being reachable.
+
+Growth is unbounded by design — there's no retention policy, and none is planned. The cost is paid
+repeatedly, not once: the candidate state.db is what gets encrypted and uploaded as every future
+`/states/<version>` snapshot, so these rows ride along in every one of them from the commit that wrote
+them onward. Deletions are rare relative to file count in ordinary use; the pathological case is removing
+a very large tree in one commit.
+
 ## The no-op leniency rules are also what makes crash recovery self-heal
 
 The "same hash despite version mismatch" and "already gone" no-op rules aren't just about two machines
