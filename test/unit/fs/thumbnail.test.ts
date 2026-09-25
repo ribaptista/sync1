@@ -287,6 +287,40 @@ describe("scanThumbnails", () => {
     expect(fs.existsSync(path.join(root, "_thumbnail", thumbnailName))).toBe(true);
   });
 
+  /**
+   * Over the limit the source is simply un-thumbnailable, and the only fix
+   * is renaming it -- but that has to be reported per file, not thrown.
+   * The destination name is derived from the source's own filename, so a
+   * name the filesystem rejects is a fact about that one source; letting
+   * the raw fs error escape reached the pool error box and aborted the
+   * entire run.
+   */
+  it("tallies a source whose thumbnail name exceeds the filename limit, without aborting the run", async () => {
+    const tooLongName = `${"y".repeat(240)}.jpg`;
+    createGeneratePolicy("*.jpg");
+    writeFile(tooLongName);
+    writeFile("fine.jpg");
+    seedCache(tooLongName, "hash1");
+    seedCache("fine.jpg", "hash2");
+
+    const generator = fakeGenerator();
+    const stats = await run(
+      "ensure",
+      undefined,
+      fakeProber({ [tooLongName]: JPEG_IMAGE, "fine.jpg": JPEG_IMAGE }),
+      generator,
+    );
+
+    expect(stats.errors).toBe(1);
+    expect(stats.failures).toHaveLength(1);
+    expect(stats.failures[0]!.path).toBe(tooLongName);
+    expect(stats.failures[0]!.reason).toMatch(/filesystem rejects|rename the source/);
+    // The healthy source in the same run still published.
+    expect(fs.existsSync(path.join(root, `_thumbnail/fine.jpg.${IMAGE_PARAMS}.hash2.jpg`))).toBe(
+      true,
+    );
+  });
+
   it("reports toRegenerate for a stale existing thumbnail, and ensure deletes the old one before generating the new one", async () => {
     createGeneratePolicy("*.jpg");
     writeFile("changed.jpg");

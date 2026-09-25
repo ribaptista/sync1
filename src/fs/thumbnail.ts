@@ -402,6 +402,45 @@ function deleteThumbnailFile(root: string, thumb: ExistingThumbnailFile): void {
  * reached by some future path that bypasses the repository, not expected
  * to ever fire in practice.
  */
+/**
+ * A thumbnail's destination name is derived from its *source's* own
+ * filename, so a name this filesystem won't accept is a fact about that
+ * one source, not a program error -- it has to be raised as a
+ * `ThumbnailGenerationError` (per-file: tallied, named, run continues)
+ * rather than escaping as a raw fs error, which reaches the pool error box
+ * and aborts the whole run from `throwIfPoolErrored`. ENAMETOOLONG gets
+ * its own message because the generic one ("rename ... -> ...") buries the
+ * only actionable fact under two 250-character paths.
+ */
+function asPerFileFsError(err: unknown, destAbsolutePath: string, what: string): never {
+  const name = path.basename(destAbsolutePath);
+  if ((err as NodeJS.ErrnoException).code === "ENAMETOOLONG") {
+    throw new ThumbnailGenerationError(
+      `thumbnail filename would be ${Buffer.byteLength(name)} bytes, which this filesystem rejects -- rename the source to something shorter`,
+    );
+  }
+  throw new ThumbnailGenerationError(
+    `could not ${what} "${name}": ${err instanceof Error ? err.message : String(err)}`,
+  );
+}
+
+function prepareThumbnailDir(destAbsolutePath: string): void {
+  try {
+    fs.mkdirSync(path.dirname(destAbsolutePath), { recursive: true });
+  } catch (err) {
+    asPerFileFsError(err, destAbsolutePath, "create the thumbnail directory for");
+  }
+}
+
+/** Publishes the staged file under its real name -- the one step whose failure means the *destination* is unusable rather than the generation having gone wrong. */
+function publishThumbnail(tempAbsolutePath: string, destAbsolutePath: string): void {
+  try {
+    fs.renameSync(tempAbsolutePath, destAbsolutePath);
+  } catch (err) {
+    asPerFileFsError(err, destAbsolutePath, "publish thumbnail");
+  }
+}
+
 async function generateForDecision(
   root: string,
   decision: ProvisionalDecisionProbed,
@@ -419,7 +458,7 @@ async function generateForDecision(
     thumbExt,
   );
   const destAbsolutePath = path.join(root, destRelativePath);
-  fs.mkdirSync(path.dirname(destAbsolutePath), { recursive: true });
+  prepareThumbnailDir(destAbsolutePath);
   const tempAbsolutePath = inTreeTempPathPreservingExtension(destAbsolutePath);
   const sourceAbsolutePath = path.join(root, decision.relativePath);
 
@@ -483,7 +522,7 @@ async function generateForDecision(
         );
       }
     }
-    fs.renameSync(tempAbsolutePath, destAbsolutePath);
+    publishThumbnail(tempAbsolutePath, destAbsolutePath);
     if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
   } catch (error) {
     // Never let discarding the staged file replace the failure that
