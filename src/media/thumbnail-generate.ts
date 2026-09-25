@@ -230,46 +230,19 @@ async function generateImageThumbnail(
   input: GenerateImageThumbnailInput,
   logger: Logger,
 ): Promise<void> {
-  try {
-    await runTool(
-      "convert",
-      [
-        `${input.sourcePath}[0]`,
-        "-auto-orient",
-        "-resize",
-        `${input.width}x${input.height}!`,
-        ...magickArgsForEncoding(input.encoding),
-        input.destPath,
-      ],
-      "convert",
-      logger,
-    );
-  } catch (err) {
-    // The same trap `probeImage` has to handle, one layer down: ImageMagick
-    // exits nonzero for a recoverable warning -- an invalid colormap index,
-    // say -- *after* writing a complete, valid image. Verified on a GIF
-    // naming a colour past its own palette: exit 1, and a perfectly good
-    // 38-byte WebP on disk. Treating the exit code as the verdict threw
-    // that away and refused to thumbnail the file at all.
-    //
-    // Only the image path gets this. ImageMagick writes its output whole or
-    // not at all, whereas a failing ffmpeg can leave a truncated file
-    // behind, so the video paths stay strict rather than risk publishing a
-    // half-written mosaic as if it were fine.
-    if (!producedNonEmptyFile(input.destPath)) throw err;
-    logger.debug(
-      { path: input.destPath, err: err instanceof Error ? err.message : String(err) },
-      "convert warned but produced a complete image -- keeping it",
-    );
-  }
-}
-
-function producedNonEmptyFile(absolutePath: string): boolean {
-  try {
-    return fs.statSync(absolutePath).size > 0;
-  } catch {
-    return false;
-  }
+  await runTool(
+    "convert",
+    [
+      `${input.sourcePath}[0]`,
+      "-auto-orient",
+      "-resize",
+      `${input.width}x${input.height}!`,
+      ...magickArgsForEncoding(input.encoding),
+      input.destPath,
+    ],
+    "convert",
+    logger,
+  );
 }
 
 export interface GenerateVideoMosaicInput {

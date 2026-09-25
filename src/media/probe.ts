@@ -53,12 +53,10 @@ export interface MediaProber {
 }
 
 /**
- * `stdout`/`stderr` are attached to the rejection, mirroring
- * thumbnail-generate.ts's own runner: a nonzero exit does not mean the tool
- * produced nothing useful. `identify` will report a complete
- * `%m|%w|%h` line *and* exit 1 over a recoverable warning (an invalid
- * colormap index, say), and discarding that answer meant refusing to
- * thumbnail a perfectly readable file.
+ * `stderr` is attached to the rejection so a failure can say *why* rather
+ * than only that it happened -- see `toolReason`. A nonzero exit is taken
+ * at face value: a tool that reports trouble is not second-guessed, even
+ * when it also printed something usable alongside the complaint.
  */
 function execFileP(command: string, args: string[]): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
@@ -92,10 +90,6 @@ function toolReason(err: unknown, absolutePath: string): string {
     ? withoutSuffix.slice(absolutePath.length + 2)
     : withoutSuffix;
   return withoutPathPrefix.replace(/^\w+:\s*/, "").slice(0, 160);
-}
-
-function errorStdout(err: unknown): string {
-  return typeof err === "object" && err !== null ? ((err as { stdout?: string }).stdout ?? "") : "";
 }
 
 function isEnoent(err: unknown): boolean {
@@ -155,14 +149,13 @@ async function probeImage(absolutePath: string): Promise<ProbeAttempt<ProbedImag
         '"identify" (ImageMagick) not found on PATH -- required for thumbnail generation',
       );
     }
-    // A nonzero exit is not proof it produced nothing: identify reports a
-    // complete answer alongside a recoverable warning (an invalid colormap
-    // index, say) and still exits 1. Take the answer when there is one, and
-    // only treat the exit code as a verdict when there isn't.
-    const salvaged = parseIdentifyOutput(errorStdout(err));
-    return salvaged
-      ? { media: salvaged }
-      : { reason: `identify: ${toolReason(err, absolutePath)}` };
+    // The exit code is the verdict. identify does sometimes print a
+    // complete answer beside a recoverable warning and still exit 1, but
+    // second-guessing it would mean deciding which warnings are safe to
+    // ignore -- a judgement this has no basis for making. Such files are
+    // rare, and are now reported as unreadable rather than passing
+    // silently.
+    return { reason: `identify: ${toolReason(err, absolutePath)}` };
   }
 
   const parsed = parseIdentifyOutput(stdout);
@@ -270,10 +263,7 @@ async function probeVideo(absolutePath: string): Promise<ProbeAttempt<ProbedVide
         '"ffprobe" (ffmpeg) not found on PATH -- required for thumbnail generation',
       );
     }
-    // Same salvage rule as probeImage: ffprobe can emit a complete JSON
-    // document and still exit nonzero over a stream it disliked.
-    const salvaged = parseFfprobeOutput(errorStdout(err));
-    return salvaged ? { media: salvaged } : { reason: `ffprobe: ${toolReason(err, absolutePath)}` };
+    return { reason: `ffprobe: ${toolReason(err, absolutePath)}` };
   }
 
   const parsed = parseFfprobeOutput(stdout);

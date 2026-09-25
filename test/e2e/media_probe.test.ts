@@ -1,18 +1,11 @@
 import { describe, it, expect, afterEach } from "vitest";
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { realMediaProber } from "../../src/media/probe.js";
 import { makeAudioTailVideo, cleanupGeneratedMedia } from "./helpers/media.js";
 
 const FIXTURES_DIR = path.resolve("test/fixtures/media");
 
-const tempDirs: string[] = [];
-
-afterEach(() => {
-  cleanupGeneratedMedia();
-  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
+afterEach(cleanupGeneratedMedia);
 
 describe("realMediaProber (real identify/ffprobe binaries)", () => {
   it("detects a JPEG's mime type and dimensions", async () => {
@@ -72,65 +65,6 @@ describe("realMediaProber (real identify/ffprobe binaries)", () => {
   it("reports a nonexistent file as unreadable rather than throwing", async () => {
     const result = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "does-not-exist.jpg"));
     expect(result.kind).toBe("unreadable");
-  });
-
-  /**
-   * `identify` reports a complete answer *and* exits nonzero over a
-   * recoverable warning. Treating the exit code as the verdict meant
-   * discarding a perfectly good probe and refusing to thumbnail a readable
-   * file -- observed on a real 52x52 GIF with an invalid colormap index.
-   */
-  it("uses identify's answer when it exits nonzero but printed a usable one", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-warned-gif-"));
-    tempDirs.push(dir);
-    const filePath = path.join(dir, "warned.gif");
-    // A 1x1 GIF whose single pixel names colour index 3 against a
-    // two-entry palette. identify reports `GIF|1|1` on stdout and *still*
-    // exits 1 with "invalid colormap index" -- verified against this exact
-    // byte sequence, and the same shape as the real file that exposed it.
-    fs.writeFileSync(
-      filePath,
-      Buffer.from([
-        0x47,
-        0x49,
-        0x46,
-        0x38,
-        0x39,
-        0x61, // GIF89a
-        0x01,
-        0x00,
-        0x01,
-        0x00, // 1x1
-        0x80,
-        0x00,
-        0x00, // global colour table, 2 entries
-        0xff,
-        0xff,
-        0xff,
-        0x00,
-        0x00,
-        0x00, // white, black
-        0x2c,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x01,
-        0x00,
-        0x01,
-        0x00,
-        0x00, // image descriptor
-        0x02, // LZW minimum code size
-        0x02,
-        0x5c,
-        0x01, // CLEAR(4), index 3 -- past the palette -- EOI(5)
-        0x00,
-        0x3b,
-      ]),
-    );
-
-    const result = await realMediaProber.detectMedia(filePath);
-    expect(result).toMatchObject({ kind: "image", mimeType: "image/gif" });
   });
 
   /**
