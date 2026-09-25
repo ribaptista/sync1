@@ -53,6 +53,20 @@ export interface ThumbnailScanStats {
   stubbedPreserved: number;
   staleStubPreviews: StaleStubPreview[];
   errors: number;
+  /**
+   * The source path behind every `errors` tally, with the reason. Bounded
+   * by the error count, not by tree size. Without it a per-file failure is
+   * only a number, and the per-file warning that would have explained it
+   * is invisible unless the caller happened to redirect fd 3 (see
+   * src/cli/progress.ts, which diverts logging there while a bar owns
+   * stderr).
+   */
+  failures: ThumbnailFailure[];
+}
+
+export interface ThumbnailFailure {
+  path: string;
+  reason: string;
 }
 
 /** Exported for `stubify.ts`: the thumbnail dir's name is hardcoded, so `stubify` can exclude it automatically -- see `isUnderThumbnailDir`. */
@@ -472,7 +486,21 @@ async function generateForDecision(
     fs.renameSync(tempAbsolutePath, destAbsolutePath);
     if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
   } catch (error) {
-    fs.rmSync(tempAbsolutePath, { force: true });
+    // Never let discarding the staged file replace the failure that
+    // caused it to be discarded. `force: true` swallows ENOENT but not,
+    // say, ENAMETOOLONG or EACCES -- and a throw here would substitute a
+    // plain Error for the caller's `ThumbnailGenerationError`, which is
+    // the only thing that marks a failure as *per-file*. That swap turned
+    // one unwritable thumbnail into an aborted run with no summary and no
+    // named path, which is exactly how this stayed invisible.
+    try {
+      fs.rmSync(tempAbsolutePath, { force: true });
+    } catch (cleanupError) {
+      logger.debug(
+        { path: tempAbsolutePath, err: String(cleanupError) },
+        "could not remove staged thumbnail after a failed generation",
+      );
+    }
     throw error;
   }
 }
@@ -770,6 +798,7 @@ async function reconcileProbedSource(
     } catch (err) {
       if (!(err instanceof ThumbnailGenerationError)) throw err;
       stats.errors++;
+      stats.failures.push({ path: relativePath, reason: err.message });
       logger.warn(
         { path: relativePath, err: err.message },
         state.stale
@@ -885,6 +914,7 @@ export async function scanThumbnails(
     stubbedPreserved: 0,
     staleStubPreviews: [],
     errors: 0,
+    failures: [],
   };
 
   const literalPrefix = glob ? literalPrefixOf(glob) : "";

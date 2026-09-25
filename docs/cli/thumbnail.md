@@ -65,9 +65,20 @@ documented consequence of scoping by directory rather than a bug; see
       "thumbnail_path": "_thumbnail/clip.mp4.p2-video_mosaic-ss90-tr4-tc4-fmtimage_jpeg-q80.a1b2c3.jpg"
     }
   ],
-  "errors": 0
+  "errors": 0,
+  "failures": [
+    {
+      "path": "me_playing/long-name.mp4",
+      "reason": "ffmpeg (mosaic composite) failed: ..."
+    }
+  ]
 }
 ```
+
+`failures` names the source behind every `errors` tally, with the reason. It exists because the per-file
+warning that would otherwise explain a failure is written to file descriptor 3 while a progress bar owns
+stderr (see [concurrency-and-progress.md](../architecture/concurrency-and-progress.md)), so unless the
+caller redirected it (`3>/tmp/sync1.log`) the count alone would be all that survives.
 
 `ok` is `false` (nonzero exit) when `errors > 0` **or** `stale_stub_previews` is non-empty — a per-file
 generation failure, or an unregenerable stale preview sitting on disk, both mark the run as not fully

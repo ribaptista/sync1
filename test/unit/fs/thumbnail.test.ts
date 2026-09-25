@@ -694,6 +694,58 @@ describe("scanThumbnails", () => {
     // writes through is synthesized and names nothing.
     expect(generator.imageCalls[0]!.sourcePath).toBe(path.join(root, "good.jpg"));
     expect(fs.existsSync(path.join(root, `_thumbnail/good.jpg.${IMAGE_PARAMS}.b.jpg`))).toBe(true);
+    // Named, not merely counted -- the per-file warning explaining this
+    // goes to fd 3 while a progress bar owns stderr, so the count alone
+    // leaves the caller with no way to know *which* file failed or why.
+    expect(stats.failures).toEqual([
+      { path: "bad.jpg", reason: expect.stringContaining("simulated failure") as string },
+    ]);
+  });
+
+  /**
+   * Discarding the staged file must never replace the failure that caused
+   * it to be discarded. `force: true` swallows ENOENT but not ENAMETOOLONG
+   * or EACCES, and a throw from the cleanup substitutes a plain Error for
+   * the `ThumbnailGenerationError` that marks a failure as *per-file* --
+   * which escalated one unwritable thumbnail into an aborted run that
+   * printed no summary and named no path.
+   */
+  it("stays non-fatal when discarding the staged file itself fails", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile("bad.jpg");
+    writeFile("good.jpg");
+    seedCache("bad.jpg", "a");
+    seedCache("good.jpg", "b");
+
+    const generator = fakeGenerator(new Set([path.join(root, "bad.jpg")]));
+    const realRmSync = fs.rmSync;
+    const rmSpy = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (typeof target === "string" && path.basename(target).startsWith(".sync1-tmp-")) {
+        throw Object.assign(new Error("ENAMETOOLONG: name too long"), { code: "ENAMETOOLONG" });
+      }
+      return realRmSync(target, options);
+    });
+
+    try {
+      const stats = await run(
+        "ensure",
+        undefined,
+        fakeProber({ "bad.jpg": JPEG_IMAGE, "good.jpg": JPEG_IMAGE }),
+        generator,
+      );
+
+      // The run completed: both sources were decided, the healthy one was
+      // published, and the sick one was tallied rather than thrown.
+      expect(stats.errors).toBe(1);
+      expect(stats.toGenerate).toBe(2);
+      expect(stats.failures).toHaveLength(1);
+      expect(stats.failures[0]!.path).toBe("bad.jpg");
+      expect(fs.existsSync(path.join(root, `_thumbnail/good.jpg.${IMAGE_PARAMS}.b.jpg`))).toBe(
+        true,
+      );
+    } finally {
+      rmSpy.mockRestore();
+    }
   });
 
   it("starts generation before discovery finalizes and advances once per resolved source", async () => {
