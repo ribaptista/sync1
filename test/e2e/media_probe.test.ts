@@ -1,8 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import path from "node:path";
 import { realMediaProber } from "../../src/media/probe.js";
+import { makeAudioTailVideo, cleanupGeneratedMedia } from "./helpers/media.js";
 
 const FIXTURES_DIR = path.resolve("test/fixtures/media");
+
+afterEach(cleanupGeneratedMedia);
 
 describe("realMediaProber (real identify/ffprobe binaries)", () => {
   it("detects a JPEG's mime type and dimensions", async () => {
@@ -59,5 +62,24 @@ describe("realMediaProber (real identify/ffprobe binaries)", () => {
   it("returns undefined for a nonexistent file rather than throwing", async () => {
     const result = await realMediaProber.detectMedia(path.join(FIXTURES_DIR, "does-not-exist.jpg"));
     expect(result).toBeUndefined();
+  });
+
+  /**
+   * The container's duration is its *longest* stream's, so an audio tail
+   * makes it overstate how far into the file a video frame can still be
+   * found. Every frame sampler places its last sample near the end, so
+   * taking the container's figure put that sample past the final frame --
+   * ffmpeg then wrote nothing and still exited 0, and the thumbnail failed
+   * forever with an error naming the compositing step instead.
+   */
+  it("reports the video stream's own duration, not the container's longer one", async () => {
+    const filePath = await makeAudioTailVideo();
+
+    const result = await realMediaProber.detectMedia(filePath);
+
+    expect(result).toMatchObject({ kind: "video", mimeType: "video/mp4" });
+    const { durationSeconds } = result as { durationSeconds: number };
+    expect(durationSeconds).toBeCloseTo(1, 1); // the video stream
+    expect(durationSeconds).toBeLessThan(1.5); // decisively not the 2s container
   });
 });

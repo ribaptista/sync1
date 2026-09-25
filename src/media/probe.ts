@@ -127,6 +127,7 @@ const VIDEO_FORMAT_TO_MIME: Record<string, string> = {
 interface FfprobeStream {
   width?: number;
   height?: number;
+  duration?: string;
   side_data_list?: Array<{ rotation?: number }>;
   tags?: { rotate?: string };
 }
@@ -169,7 +170,7 @@ async function probeVideo(absolutePath: string): Promise<ProbedVideo | undefined
       "-select_streams",
       "v:0",
       "-show_entries",
-      "stream=width,height",
+      "stream=width,height,duration",
       "-show_entries",
       "stream_side_data=rotation",
       "-show_entries",
@@ -203,8 +204,28 @@ async function probeVideo(absolutePath: string): Promise<ProbedVideo | undefined
   const stream = parsed.streams?.[0];
   const rawWidth = stream?.width;
   const rawHeight = stream?.height;
-  const durationSeconds =
+  // The *video stream's* own duration, not the container's, and the
+  // difference is not academic: a phone keeps recording audio for a
+  // fraction of a second after the last video frame, so the container --
+  // whose duration is the longest stream's -- overstates how far into the
+  // file a frame can still be found. Every sampler downstream
+  // (generateVideoMosaic, generateVideoPreview) places its last sample at
+  // `duration * (n - 0.5) / n`, which lands past the final frame once that
+  // audio tail exceeds `duration / 2n`; ffmpeg then writes no frame at all
+  // and still exits 0. Measured on 8 real phone clips, the tail ran
+  // 43-208ms while the budget was 51-220ms -- routinely over.
+  //
+  // Falls back to the container duration: not every container reports a
+  // per-stream duration (ffprobe gives "N/A", which `Number` makes NaN),
+  // and an approximate duration is still far better than refusing to
+  // thumbnail the file.
+  const streamDuration = stream?.duration !== undefined ? Number(stream.duration) : undefined;
+  const containerDuration =
     parsed.format?.duration !== undefined ? Number(parsed.format.duration) : undefined;
+  const durationSeconds =
+    streamDuration !== undefined && Number.isFinite(streamDuration)
+      ? streamDuration
+      : containerDuration;
   if (
     rawWidth === undefined ||
     rawHeight === undefined ||

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { realMediaProber } from "../../src/media/probe.js";
+import { makeAudioTailVideo, cleanupGeneratedMedia } from "./helpers/media.js";
 import {
   computeContainFitSize,
   computeShorterSideFitSize,
@@ -28,6 +29,7 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+  cleanupGeneratedMedia();
 });
 
 describe("generateImageThumbnail (real convert)", () => {
@@ -373,6 +375,48 @@ describe("generateVideoMosaic (real ffmpeg)", () => {
       mimeType: "image/jpeg",
       width: frame.width,
       height: frame.height * 2,
+    });
+  });
+
+  /**
+   * The bug this pairing exists for, end to end. A clip whose audio
+   * outlasts its video used to be un-thumbnailable forever: the last tile
+   * is placed at `duration * 15.5 / 16`, and taking that from the
+   * *container's* duration put it past the final video frame. ffmpeg
+   * answers a seek past the end by writing nothing and exiting 0, so the
+   * failure only surfaced a stage later, as the composite reporting "No
+   * such file or directory" for a frame that was never written.
+   */
+  it("composes a mosaic from a clip whose audio outlasts its video", async () => {
+    const sourcePath = await makeAudioTailVideo();
+    const probed = await realMediaProber.detectMedia(sourcePath);
+    const { width, height, durationSeconds } = probed as {
+      width: number;
+      height: number;
+      durationSeconds: number;
+    };
+
+    const destPath = path.join(mkTempDir(), "mosaic.jpg");
+    await realThumbnailGenerator.generateVideoMosaic(
+      {
+        sourcePath,
+        destPath,
+        sourceWidth: width,
+        sourceHeight: height,
+        durationSeconds,
+        tileRowCount: 4,
+        tileColumnCount: 4,
+        shorterSide: 12,
+        encoding: { outputMime: "image/jpeg", jpegQuality: 80 },
+      },
+      silentLogger,
+    );
+
+    // All 16 tiles extracted and composed -- not an abort on a frame that
+    // was never written.
+    expect(await realMediaProber.detectMedia(destPath)).toMatchObject({
+      kind: "image",
+      mimeType: "image/jpeg",
     });
   });
 });

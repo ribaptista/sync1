@@ -283,6 +283,85 @@ function ffmpegMosaicArgsForEncoding(encoding: MosaicEncoding): string[] {
 }
 
 /**
+ * Extracts one scaled frame at `timestampSeconds`, stepping back by
+ * `stepBackSeconds` and retrying if that instant has no frame.
+ *
+ * Both halves matter. ffmpeg does not treat "seek past the last frame" as
+ * an error: it writes nothing, prints "Output file is empty, nothing was
+ * encoded", and **exits 0**. `runTool` only raises on a nonzero exit, so
+ * this silently handed back a frame path naming no file, and the run fell
+ * over a stage later -- the composite reporting "No such file or
+ * directory" for a temp frame, with nothing left to connect it to a
+ * timestamp past the end of the video.
+ *
+ * And a sample can legitimately land past the last frame even with an
+ * honest duration: `-ss` emits the first frame at or *after* its target,
+ * while the final frame's own display window extends to the end of the
+ * stream. So any sample inside that last window finds nothing after it.
+ * The centre-of-bucket sampler puts its last sample within
+ * `duration / 2n` of the end, which is inside that window whenever a clip
+ * has fewer than roughly `2n` frames. Stepping back one sampling interval
+ * lands on the previous bucket's frame -- a repeated tile at worst, which
+ * beats refusing to thumbnail a short clip at all.
+ */
+const MAX_STEP_BACK_ATTEMPTS = 3;
+
+async function extractFrame(
+  sourcePath: string,
+  framePath: string,
+  timestampSeconds: number,
+  stepBackSeconds: number,
+  frame: Dimensions,
+  logger: Logger,
+): Promise<void> {
+  for (let attempt = 0; attempt <= MAX_STEP_BACK_ATTEMPTS; attempt++) {
+    const target = Math.max(0, timestampSeconds - attempt * stepBackSeconds);
+    if (await tryExtractFrame(sourcePath, framePath, target, frame, logger)) return;
+    if (target === 0) break;
+  }
+  throw new ThumbnailGenerationError(
+    `ffmpeg wrote no frame at ${timestampSeconds.toFixed(3)}s, or at any earlier sample, and still exited 0 -- the source has no decodable video frames there`,
+  );
+}
+
+/** Resolves false when ffmpeg succeeded but wrote nothing -- see `extractFrame`. */
+async function tryExtractFrame(
+  sourcePath: string,
+  framePath: string,
+  timestampSeconds: number,
+  frame: Dimensions,
+  logger: Logger,
+): Promise<boolean> {
+  await runTool(
+    "ffmpeg",
+    [
+      "-y",
+      // Bare flag, no value: confirmed empirically that this build's CLI
+      // treats "-autorotate 1" as two separate tokens (the boolean flag,
+      // then a stray "1" ffmpeg then tries to apply to the *output* file,
+      // erroring "input option ... applied to output url"), unlike e.g.
+      // "-tile-rows <n>"-style options. Mirrors "-noautorotate" (also
+      // bare) used elsewhere for fixture setup.
+      "-autorotate",
+      "-ss",
+      timestampSeconds.toFixed(3),
+      "-i",
+      sourcePath,
+      "-frames:v",
+      "1",
+      "-update",
+      "1",
+      "-vf",
+      `scale=${frame.width}:${frame.height}`,
+      framePath,
+    ],
+    "ffmpeg (frame extraction)",
+    logger,
+  );
+  return fs.existsSync(framePath);
+}
+
+/**
  * Samples `tileRowCount * tileColumnCount` frames at evenly-spaced,
  * center-of-bucket timestamps (deliberately avoiding literal first/last
  * frames, often black/blank/credits), scales each to `frame` (via
@@ -313,30 +392,12 @@ async function generateVideoMosaic(input: GenerateVideoMosaicInput, logger: Logg
     for (let i = 0; i < tileCount; i++) {
       const timestampSeconds = (input.durationSeconds * (i + 0.5)) / tileCount;
       const framePath = path.join(tempDir, `frame-${i}.png`);
-      await runTool(
-        "ffmpeg",
-        [
-          "-y",
-          // Bare flag, no value: confirmed empirically that this build's
-          // CLI treats "-autorotate 1" as two separate tokens (the boolean
-          // flag, then a stray "1" ffmpeg then tries to apply to the
-          // *output* file, erroring "input option ... applied to output
-          // url"), unlike e.g. "-tile-rows <n>"-style options. Mirrors
-          // "-noautorotate" (also bare) used elsewhere for fixture setup.
-          "-autorotate",
-          "-ss",
-          timestampSeconds.toFixed(3),
-          "-i",
-          input.sourcePath,
-          "-frames:v",
-          "1",
-          "-update",
-          "1",
-          "-vf",
-          `scale=${frame.width}:${frame.height}`,
-          framePath,
-        ],
-        "ffmpeg (frame extraction)",
+      await extractFrame(
+        input.sourcePath,
+        framePath,
+        timestampSeconds,
+        input.durationSeconds / tileCount,
+        frame,
         logger,
       );
       framePaths.push(framePath);
@@ -449,24 +510,12 @@ async function generateVideoPreview(
     for (let i = 0; i < input.frameCount; i++) {
       const timestampSeconds = (input.durationSeconds * (i + 0.5)) / input.frameCount;
       const framePath = path.join(tempDir, `frame-${i}.png`);
-      await runTool(
-        "ffmpeg",
-        [
-          "-y",
-          "-autorotate",
-          "-ss",
-          timestampSeconds.toFixed(3),
-          "-i",
-          input.sourcePath,
-          "-frames:v",
-          "1",
-          "-update",
-          "1",
-          "-vf",
-          `scale=${frame.width}:${frame.height}`,
-          framePath,
-        ],
-        "ffmpeg (frame extraction)",
+      await extractFrame(
+        input.sourcePath,
+        framePath,
+        timestampSeconds,
+        input.durationSeconds / input.frameCount,
+        frame,
         logger,
       );
     }
