@@ -186,6 +186,44 @@ describe("generateImageThumbnail (real convert)", () => {
       height: size.height,
     });
   });
+  /**
+   * ImageMagick exits nonzero for a recoverable warning *after* writing a
+   * complete image. Treating the exit code as the verdict meant refusing to
+   * thumbnail a readable file -- the same trap probeImage has to handle one
+   * layer up, and the reason a real GIF in a vault could be probed
+   * successfully and still never get a thumbnail.
+   */
+  it("keeps a complete image when convert warns and exits nonzero", async () => {
+    // A 1x1 GIF whose only pixel names colour index 3 against a two-entry
+    // palette: convert reports "invalid colormap index", exits 1, and
+    // writes a valid WebP regardless.
+    const sourcePath = path.join(mkTempDir(), "badmap.gif");
+    fs.writeFileSync(
+      sourcePath,
+      Buffer.from([
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xff, 0xff,
+        0xff, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02,
+        0x02, 0x5c, 0x01, 0x00, 0x3b,
+      ]),
+    );
+
+    const destPath = path.join(mkTempDir(), "thumb.webp");
+    await realThumbnailGenerator.generateImageThumbnail(
+      {
+        sourcePath,
+        destPath,
+        width: 1,
+        height: 1,
+        encoding: { outputMime: "image/webp", webpQuality: 50, webpLossless: true },
+      },
+      silentLogger,
+    );
+
+    expect(await realMediaProber.detectMedia(destPath)).toMatchObject({
+      kind: "image",
+      mimeType: "image/webp",
+    });
+  });
 });
 
 describe("generateVideoMosaic (real ffmpeg)", () => {

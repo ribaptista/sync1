@@ -66,19 +66,23 @@ documented consequence of scoping by directory rather than a bug; see
     }
   ],
   "errors": 0,
-  "failures": [
-    {
-      "path": "me_playing/long-name.mp4",
-      "reason": "ffmpeg (mosaic composite) failed: ..."
-    }
-  ]
+  "unreadable": 2
 }
 ```
 
-`failures` names the source behind every `errors` tally, with the reason. It exists because the per-file
-warning that would otherwise explain a failure is written to file descriptor 3 while a progress bar owns
-stderr (see [concurrency-and-progress.md](../architecture/concurrency-and-progress.md)), so unless the
-caller redirected it (`3>/tmp/sync1.log`) the count alone would be all that survives.
+`unreadable` counts sources that neither `identify` nor `ffprobe` could read — a corrupt original, or a
+container no format table maps. They are **counted, never swept**: the only way such a source still has
+thumbnails is that it was readable when they were generated, so each one is now the last viewable copy of
+an image that can no longer be read, and deleting it is the hazard `--delete-stale-stub-previews` exists
+to guard against.
+
+Per-file detail for both `errors` and `unreadable` — which path, and what the tool actually said — goes
+to the **log**, not to stdout, so the summary stays a fixed size no matter how many files are involved.
+While a progress bar owns stderr that log is written to file descriptor 3, so redirect it to see them:
+
+```bash
+sync1 thumbnail ensure 3>/tmp/sync1.log
+```
 
 `ok` is `false` (nonzero exit) when `errors > 0` **or** `stale_stub_previews` is non-empty — a per-file
 generation failure, or an unregenerable stale preview sitting on disk, both mark the run as not fully

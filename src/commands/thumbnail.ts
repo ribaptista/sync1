@@ -103,7 +103,7 @@ function emitStats(json: boolean, mode: ThumbnailRunMode, stats: ThumbnailScanSt
         thumbnail_path: s.thumbnailPath,
       })),
       errors: stats.errors,
-      failures: stats.failures.map((f) => ({ path: f.path, reason: f.reason })),
+      unreadable: stats.unreadable,
     });
   } else {
     process.stdout.write(
@@ -111,19 +111,12 @@ function emitStats(json: boolean, mode: ThumbnailRunMode, stats: ThumbnailScanSt
         `${stats.toRegenerate} to regenerate, ${stats.toDelete} to delete, ` +
         `${stats.missingCacheEntry} missing cache entry, ${stats.stubbedOriginal} stubbed original, ` +
         `${stats.stubbedPreserved} stubbed preserved, ${stats.staleStubPreviews.length} stale stub preview(s), ` +
-        `${stats.errors} error(s)\n`,
+        `${stats.errors} error(s), ${stats.unreadable} unreadable\n`,
     );
     for (const s of stats.staleStubPreviews) {
       process.stdout.write(
         `  stale stub preview: "${s.path}" -> "${s.thumbnailPath}" -- stub content changed since this thumbnail was generated; materialize and regenerate, or pass --delete-stale-stub-previews to cleanup to discard it\n`,
       );
-    }
-    // Named here, not only counted: the per-file warning that explains a
-    // failure goes to fd 3 while a progress bar owns stderr (see
-    // src/cli/progress.ts), so without this the reason is invisible unless
-    // the caller happened to redirect it.
-    for (const f of stats.failures) {
-      process.stdout.write(`  failed: "${f.path}" -- ${f.reason}\n`);
     }
   }
   return ok;

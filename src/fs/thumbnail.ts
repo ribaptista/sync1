@@ -54,19 +54,14 @@ export interface ThumbnailScanStats {
   staleStubPreviews: StaleStubPreview[];
   errors: number;
   /**
-   * The source path behind every `errors` tally, with the reason. Bounded
-   * by the error count, not by tree size. Without it a per-file failure is
-   * only a number, and the per-file warning that would have explained it
-   * is invisible unless the caller happened to redirect fd 3 (see
-   * src/cli/progress.ts, which diverts logging there while a bar owns
-   * stderr).
+   * Sources neither `identify` nor `ffprobe` could read -- a corrupt
+   * original, or a container no format table maps. A count only: with a
+   * broad enough glob matched against `image/*` mime types, every non-image
+   * file in a vault lands here, so a retained path list would be an
+   * unbounded accumulation. Each one is logged individually instead, with
+   * the tools' own reason, which is where per-file detail belongs.
    */
-  failures: ThumbnailFailure[];
-}
-
-export interface ThumbnailFailure {
-  path: string;
-  reason: string;
+  unreadable: number;
 }
 
 /** Exported for `stubify.ts`: the thumbnail dir's name is hardcoded, so `stubify` can exclude it automatically -- see `isUnderThumbnailDir`. */
@@ -346,26 +341,43 @@ function expectedThumbExtension(policy: ThumbnailPolicyGenerateRow): string {
   return EXTENSION_BY_OUTPUT_MIME[policy.outputMime];
 }
 
+/**
+ * Three outcomes, deliberately distinct. They used to be two -- a decision,
+ * or `undefined` -- and `undefined` meant both "I could not read this file"
+ * and "I read it fine, its content matches no policy". The caller handled
+ * that single `undefined` exactly like a deliberate 'skip', so an
+ * unreadable source produced no error, no count and no log line, and was
+ * re-probed on every run forever. A union the caller must switch on is what
+ * keeps the two apart.
+ */
+type ClassifiedSource =
+  | { kind: "decision"; decision: ProvisionalDecisionProbed }
+  | { kind: "unreadable"; reason: string }
+  | { kind: "no-policy" };
+
 async function classifyProbed(
   relativePath: string,
   root: string,
   cacheRepo: CacheEntriesRepository,
   policies: readonly ThumbnailPolicyRow[],
   prober: MediaProber,
-): Promise<ProvisionalDecisionProbed | undefined> {
+): Promise<ClassifiedSource> {
   const probed = await prober.detectMedia(path.join(root, relativePath));
-  if (!probed) return undefined;
+  if (probed.kind === "unreadable") return { kind: "unreadable", reason: probed.reason };
 
   const resolution = resolvePolicies(relativePath, probed.mimeType, policies);
-  if (!resolution) return undefined;
+  if (!resolution) return { kind: "no-policy" };
 
   const cacheRow = cacheRepo.get(relativePath);
   return {
-    kind: "probed",
-    relativePath,
-    cacheHash: cacheRow?.hash ?? null,
-    probed,
-    resolution,
+    kind: "decision",
+    decision: {
+      kind: "probed",
+      relativePath,
+      cacheHash: cacheRow?.hash ?? null,
+      probed,
+      resolution,
+    },
   };
 }
 
@@ -757,14 +769,43 @@ interface PolicyThumbnailState {
 async function reconcileProbedSource(
   root: string,
   mode: ThumbnailRunMode,
-  decision: ProvisionalDecisionProbed | undefined,
+  classified: ClassifiedSource,
   relativePath: string,
   generator: ThumbnailGenerator,
   logger: Logger,
   stats: ThumbnailScanStats,
   onActivity?: (verb: string, relativePath: string) => void,
 ): Promise<boolean> {
-  if (!decision || decision.resolution.action === "skip") {
+  // Counted and logged, never swept. The only way an unreadable source has
+  // thumbnails is that it was readable when they were generated -- so each
+  // one is now the last viewable copy of an image that can no longer be
+  // read, and can never be regenerated. Deleting those is the hazard
+  // `--delete-stale-stub-previews` exists to guard against, and that
+  // precedent says an unregenerable preview is never destroyed without an
+  // explicit opt-in. The path and the tools' own reason go to the log
+  // rather than the summary, which carries only the count.
+  if (classified.kind === "unreadable") {
+    stats.unreadable++;
+    logger.warn(
+      { path: relativePath, reason: classified.reason },
+      "source could not be read -- skipping, and leaving any existing thumbnails alone",
+    );
+    return false;
+  }
+
+  // Read fine, content matches no policy -- an extension that lies (an mp3
+  // named .mpeg), or a policy whose mime types were narrowed. Either way no
+  // thumbnail should exist for it, so this keeps sweeping, and stays quiet.
+  if (classified.kind === "no-policy") {
+    await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
+      stats.toDelete++;
+      removeIfCleanup(root, mode, thumbnail);
+    });
+    return false;
+  }
+
+  const decision = classified.decision;
+  if (decision.resolution.action === "skip") {
     await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
       stats.toDelete++;
       removeIfCleanup(root, mode, thumbnail);
@@ -837,7 +878,6 @@ async function reconcileProbedSource(
     } catch (err) {
       if (!(err instanceof ThumbnailGenerationError)) throw err;
       stats.errors++;
-      stats.failures.push({ path: relativePath, reason: err.message });
       logger.warn(
         { path: relativePath, err: err.message },
         state.stale
@@ -953,7 +993,7 @@ export async function scanThumbnails(
     stubbedPreserved: 0,
     staleStubPreviews: [],
     errors: 0,
-    failures: [],
+    unreadable: 0,
   };
 
   const literalPrefix = glob ? literalPrefixOf(glob) : "";
@@ -1026,11 +1066,11 @@ export async function scanThumbnails(
       dispatchTracked(pool, poolErrors, async () => {
         onActivity?.("processing", relativePath);
         try {
-          const decision = await classifyProbed(relativePath, root, cacheRepo, policies, prober);
+          const classified = await classifyProbed(relativePath, root, cacheRepo, policies, prober);
           const generated = await reconcileProbedSource(
             root,
             mode,
-            decision,
+            classified,
             relativePath,
             generator,
             logger,

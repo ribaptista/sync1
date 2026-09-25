@@ -31,21 +31,71 @@ export interface ProbedVideo {
 
 export type ProbedMedia = ProbedImage | ProbedVideo;
 
-export interface MediaProber {
-  /** `undefined` means "not recognized as thumbnailable media" -- normal, non-fatal. */
-  detectMedia(absolutePath: string): Promise<ProbedMedia | undefined>;
+/**
+ * Neither tool could make sense of the file. Deliberately *not* `undefined`:
+ * this used to be, and an unreadable source was then indistinguishable from
+ * a deliberate 'skip' policy match, so a corrupt original was silently
+ * re-probed on every run forever with no error, count, or log line to show
+ * for it. Carrying a reason -- and a variant every caller must handle --
+ * is what makes that impossible to drop on the floor again.
+ */
+export interface ProbeUnreadable {
+  kind: "unreadable";
+  /** What the tools themselves said, e.g. `identify: Not a JPEG file: starts with 0x00 0x00`. */
+  reason: string;
 }
 
+export type ProbeOutcome = ProbedMedia | ProbeUnreadable;
+
+export interface MediaProber {
+  /** Never throws for an ordinary bad file -- an `unreadable` outcome is normal and non-fatal. */
+  detectMedia(absolutePath: string): Promise<ProbeOutcome>;
+}
+
+/**
+ * `stdout`/`stderr` are attached to the rejection, mirroring
+ * thumbnail-generate.ts's own runner: a nonzero exit does not mean the tool
+ * produced nothing useful. `identify` will report a complete
+ * `%m|%w|%h` line *and* exit 1 over a recoverable warning (an invalid
+ * colormap index, say), and discarding that answer meant refusing to
+ * thumbnail a perfectly readable file.
+ */
 function execFileP(command: string, args: string[]): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
-    execFile(command, args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve({ stdout });
-    });
+    execFile(
+      command,
+      args,
+      { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(Object.assign(error, { stdout, stderr }));
+          return;
+        }
+        resolve({ stdout });
+      },
+    );
   });
+}
+
+/**
+ * The tool's own first line of complaint, with the file path stripped from
+ * both ends of it. Both tools name the file in their message -- ffprobe
+ * prefixes it, ImageMagick suffixes it in backticks -- and the caller
+ * already logs `path` as its own field, so repeating it here would spend
+ * most of the budget restating what's beside it.
+ */
+function toolReason(err: unknown, absolutePath: string): string {
+  const stderr = typeof err === "object" && err !== null ? (err as { stderr?: string }).stderr : "";
+  const firstLine = (stderr ?? "").split("\n")[0]?.trim() ?? "";
+  const withoutSuffix = firstLine.split(" `")[0] ?? firstLine;
+  const withoutPathPrefix = withoutSuffix.startsWith(`${absolutePath}: `)
+    ? withoutSuffix.slice(absolutePath.length + 2)
+    : withoutSuffix;
+  return withoutPathPrefix.replace(/^\w+:\s*/, "").slice(0, 160);
+}
+
+function errorStdout(err: unknown): string {
+  return typeof err === "object" && err !== null ? ((err as { stdout?: string }).stdout ?? "") : "";
 }
 
 function isEnoent(err: unknown): boolean {
@@ -72,13 +122,25 @@ const IMAGE_FORMAT_TO_MIME: Record<string, string> = {
   WEBP: "image/webp",
   HEIC: "image/heic",
   // Canon RAW -- read-only in ImageMagick (`identify -list format` shows
-  // "CR2 DNG r--", no encoder), so a thumbnail generated from one is
-  // always forced to `.jpg` regardless of the source's own extension --
-  // see RAW_IMAGE_MIME_TYPES in src/fs/thumbnail.ts.
+  // "CR2 DNG r--", no encoder). Harmless here: a policy's own required
+  // `output_mime` decides what gets written, so the source never needs an
+  // encoder of its own.
   CR2: "image/x-canon-cr2",
 };
 
-async function probeImage(absolutePath: string): Promise<ProbedImage | undefined> {
+/**
+ * `media` set means success. `reason` set means the tool refused the file
+ * outright. **Neither** means the tool read it fine but reported a format
+ * outside this probe's own table -- not an error, and the signal
+ * `detectMedia` uses to fall through from image to video (identify reports
+ * "MP4" for real videos, so that fall-through is load-bearing).
+ */
+interface ProbeAttempt<T> {
+  media?: T;
+  reason?: string;
+}
+
+async function probeImage(absolutePath: string): Promise<ProbeAttempt<ProbedImage>> {
   let stdout: string;
   try {
     ({ stdout } = await execFileP("identify", [
@@ -93,10 +155,23 @@ async function probeImage(absolutePath: string): Promise<ProbedImage | undefined
         '"identify" (ImageMagick) not found on PATH -- required for thumbnail generation',
       );
     }
-    // Nonzero exit: identify couldn't parse this file as an image at all.
-    return undefined;
+    // A nonzero exit is not proof it produced nothing: identify reports a
+    // complete answer alongside a recoverable warning (an invalid colormap
+    // index, say) and still exits 1. Take the answer when there is one, and
+    // only treat the exit code as a verdict when there isn't.
+    const salvaged = parseIdentifyOutput(errorStdout(err));
+    return salvaged
+      ? { media: salvaged }
+      : { reason: `identify: ${toolReason(err, absolutePath)}` };
   }
 
+  const parsed = parseIdentifyOutput(stdout);
+  // No reason: identify read it, it just isn't a still-image format we
+  // handle -- almost always a video, on its way to probeVideo.
+  return parsed ? { media: parsed } : {};
+}
+
+function parseIdentifyOutput(stdout: string): ProbedImage | undefined {
   const firstLine = stdout.trim().split("\n")[0] ?? "";
   const [format, widthRaw, heightRaw] = firstLine.split("|");
   const mimeType = format ? IMAGE_FORMAT_TO_MIME[format] : undefined;
@@ -122,6 +197,14 @@ const VIDEO_FORMAT_TO_MIME: Record<string, string> = {
   matroska: "video/webm",
   avi: "video/x-msvideo",
   ogg: "video/ogg",
+  // ffprobe names the WMV/ASF container "asf", never "wmv" -- so a real
+  // 1920x1080 WMV probed perfectly and was then discarded for want of a
+  // mime string, even for a policy naming video/x-ms-wmv outright.
+  asf: "video/x-ms-wmv",
+  mpeg: "video/mpeg",
+  mpegvideo: "video/mpeg",
+  // Correct for a transport stream even though no policy has to name it.
+  mpegts: "video/mp2t",
 };
 
 interface FfprobeStream {
@@ -161,7 +244,7 @@ export function rotationSwapsDimensions(degrees: number): boolean {
   return normalized === 90 || normalized === 270;
 }
 
-async function probeVideo(absolutePath: string): Promise<ProbedVideo | undefined> {
+async function probeVideo(absolutePath: string): Promise<ProbeAttempt<ProbedVideo>> {
   let stdout: string;
   try {
     ({ stdout } = await execFileP("ffprobe", [
@@ -187,9 +270,19 @@ async function probeVideo(absolutePath: string): Promise<ProbedVideo | undefined
         '"ffprobe" (ffmpeg) not found on PATH -- required for thumbnail generation',
       );
     }
-    return undefined;
+    // Same salvage rule as probeImage: ffprobe can emit a complete JSON
+    // document and still exit nonzero over a stream it disliked.
+    const salvaged = parseFfprobeOutput(errorStdout(err));
+    return salvaged ? { media: salvaged } : { reason: `ffprobe: ${toolReason(err, absolutePath)}` };
   }
 
+  const parsed = parseFfprobeOutput(stdout);
+  // No reason: ffprobe read it, it just isn't a container we map -- the
+  // same "not my kind of file" signal probeImage uses.
+  return parsed ? { media: parsed } : {};
+}
+
+function parseFfprobeOutput(stdout: string): ProbedVideo | undefined {
   let parsed: FfprobeOutput;
   try {
     parsed = JSON.parse(stdout) as FfprobeOutput;
@@ -247,12 +340,27 @@ async function probeVideo(absolutePath: string): Promise<ProbedVideo | undefined
 }
 
 export const realMediaProber: MediaProber = {
-  async detectMedia(absolutePath: string): Promise<ProbedMedia | undefined> {
+  async detectMedia(absolutePath: string): Promise<ProbeOutcome> {
     const image = await probeImage(absolutePath);
-    if (image) return image;
+    if (image.media) return image.media;
     // Falls through here both when identify failed outright *and* when it
     // succeeded but reported a format outside IMAGE_FORMAT_TO_MIME (e.g. a
     // real video file) -- see probeImage's comment.
-    return probeVideo(absolutePath);
+    const video = await probeVideo(absolutePath);
+    if (video.media) return video.media;
+
+    // Both tools' complaints, not just the last one: for a zero-filled JPEG
+    // identify's "Not a JPEG file: starts with 0x00 0x00" is far more
+    // useful than ffprobe's generic refusal, while for a truncated MP4 it
+    // is the other way round. Picking between them would be a heuristic to
+    // get wrong; whoever reads the log wants whichever applies.
+    const reasons = [image.reason, video.reason].filter((r): r is string => r !== undefined);
+    return {
+      kind: "unreadable",
+      reason:
+        reasons.length > 0
+          ? reasons.join(" | ")
+          : "neither identify nor ffprobe recognized this as a thumbnailable image or video",
+    };
   },
 };

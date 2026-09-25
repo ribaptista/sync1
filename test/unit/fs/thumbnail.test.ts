@@ -15,7 +15,7 @@ import {
   isUnderThumbnailDir,
   type ThumbnailScanStats,
 } from "../../../src/fs/thumbnail.js";
-import type { MediaProber, ProbedMedia } from "../../../src/media/probe.js";
+import type { MediaProber, ProbedMedia, ProbeOutcome } from "../../../src/media/probe.js";
 import {
   ThumbnailGenerationError,
   type ThumbnailGenerator,
@@ -109,10 +109,16 @@ function createSkipPolicy(glob: string, mimeTypes = ["image/jpeg"], name = "skip
   return policiesRepo.create({ name, glob, action: "skip", mimeTypes });
 }
 
+/** A path absent from `entries` probes as unreadable -- what a corrupt or unmappable source does. */
 function fakeProber(entries: Record<string, ProbedMedia>): MediaProber {
-  const detectMedia = vi.fn(async (absolutePath: string): Promise<ProbedMedia | undefined> => {
+  const detectMedia = vi.fn(async (absolutePath: string): Promise<ProbeOutcome> => {
     const relativePath = path.relative(root, absolutePath);
-    return entries[relativePath];
+    return (
+      entries[relativePath] ?? {
+        kind: "unreadable" as const,
+        reason: "identify: simulated refusal",
+      }
+    );
   });
   return { detectMedia };
 }
@@ -312,9 +318,8 @@ describe("scanThumbnails", () => {
     );
 
     expect(stats.errors).toBe(1);
-    expect(stats.failures).toHaveLength(1);
-    expect(stats.failures[0]!.path).toBe(tooLongName);
-    expect(stats.failures[0]!.reason).toMatch(/filesystem rejects|rename the source/);
+    // The path and reason go to the log, not the summary -- the count is
+    // all the summary carries.
     // The healthy source in the same run still published.
     expect(fs.existsSync(path.join(root, `_thumbnail/fine.jpg.${IMAGE_PARAMS}.hash2.jpg`))).toBe(
       true,
@@ -728,12 +733,6 @@ describe("scanThumbnails", () => {
     // writes through is synthesized and names nothing.
     expect(generator.imageCalls[0]!.sourcePath).toBe(path.join(root, "good.jpg"));
     expect(fs.existsSync(path.join(root, `_thumbnail/good.jpg.${IMAGE_PARAMS}.b.jpg`))).toBe(true);
-    // Named, not merely counted -- the per-file warning explaining this
-    // goes to fd 3 while a progress bar owns stderr, so the count alone
-    // leaves the caller with no way to know *which* file failed or why.
-    expect(stats.failures).toEqual([
-      { path: "bad.jpg", reason: expect.stringContaining("simulated failure") as string },
-    ]);
   });
 
   /**
@@ -772,8 +771,6 @@ describe("scanThumbnails", () => {
       // published, and the sick one was tallied rather than thrown.
       expect(stats.errors).toBe(1);
       expect(stats.toGenerate).toBe(2);
-      expect(stats.failures).toHaveLength(1);
-      expect(stats.failures[0]!.path).toBe("bad.jpg");
       expect(fs.existsSync(path.join(root, `_thumbnail/good.jpg.${IMAGE_PARAMS}.b.jpg`))).toBe(
         true,
       );
@@ -1206,5 +1203,56 @@ describe("scanThumbnails", () => {
     expect(fs.existsSync(path.join(root, `_thumbnail/private.jpg.${IMAGE_PARAMS}.abc.jpg`))).toBe(
       false,
     );
+  });
+
+  /**
+   * The gap this split closes. An unreadable source used to be handled in
+   * the same branch as a deliberate 'skip' -- so a corrupt original was
+   * counted as nothing, logged as nothing, and re-probed on every run
+   * forever, while `cleanup` quietly deleted the last viewable copy of the
+   * image it could no longer read.
+   */
+  it("counts a source it cannot read, and leaves that source's thumbnails alone even under cleanup", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile("corrupt.jpg");
+    seedCache("corrupt.jpg", "abc");
+    // Generated back when the file was still readable -- now the only
+    // viewable copy, and unregenerable.
+    writeFile(`_thumbnail/corrupt.jpg.${IMAGE_PARAMS}.abc.jpg`);
+
+    // Absent from the prober's map, so it probes as unreadable.
+    const stats = await run("cleanup", undefined, fakeProber({}), fakeGenerator());
+
+    expect(stats.unreadable).toBe(1);
+    expect(stats.toDelete).toBe(0);
+    expect(stats.errors).toBe(0);
+    expect(fs.existsSync(path.join(root, `_thumbnail/corrupt.jpg.${IMAGE_PARAMS}.abc.jpg`))).toBe(
+      true,
+    );
+  });
+
+  it("still sweeps for a source that reads fine but matches no policy's mime types", async () => {
+    // The other half of the split: content that genuinely matches nothing
+    // should have no thumbnails, so this keeps deleting -- and stays out of
+    // the unreadable count, since nothing failed.
+    createGeneratePolicy("*.jpg"); // mimeTypes: ["image/jpeg"]
+    writeFile("actually-a-png.jpg");
+    seedCache("actually-a-png.jpg", "abc");
+    writeFile(`_thumbnail/actually-a-png.jpg.${IMAGE_PARAMS}.abc.jpg`);
+
+    const stats = await run(
+      "cleanup",
+      undefined,
+      fakeProber({
+        "actually-a-png.jpg": { kind: "image", mimeType: "image/png", width: 10, height: 10 },
+      }),
+      fakeGenerator(),
+    );
+
+    expect(stats.unreadable).toBe(0);
+    expect(stats.toDelete).toBe(1);
+    expect(
+      fs.existsSync(path.join(root, `_thumbnail/actually-a-png.jpg.${IMAGE_PARAMS}.abc.jpg`)),
+    ).toBe(false);
   });
 });
