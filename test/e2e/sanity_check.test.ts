@@ -74,6 +74,7 @@ describe("sanity_check", () => {
       missing_locally: [],
       untracked: [],
       ignored_count: 0,
+      stale_temp_files: [],
     });
 
     fs.rmSync(root, { recursive: true, force: true });

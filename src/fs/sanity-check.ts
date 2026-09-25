@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import PQueue from "p-queue";
 import type { Logger } from "../logger.js";
@@ -48,6 +49,21 @@ export interface SanityCheckResult {
   untracked: string[];
   /** Present locally, not tracked, but excluded because an ignore policy matches -- not a problem. */
   ignoredCount: number;
+  /**
+   * In-tree staging files left by a run that died between writing one and
+   * renaming it into place -- Ctrl+C is a `process.exit()`, which skips
+   * every `catch`/`finally` that would have removed them. Nothing else
+   * ever will: the startup sweep reads only `.sync1/`, and every walk
+   * excludes these by name, so they are invisible dead space (a
+   * partially-decrypted `materialize` temp can be many GB). Reported, not
+   * removed -- this command is read-only.
+   */
+  staleTempFiles: StaleTempFile[];
+}
+
+export interface StaleTempFile {
+  path: string;
+  size: number;
 }
 
 /**
@@ -67,6 +83,7 @@ function emptyResult(): SanityCheckResult {
     missingLocally: [],
     untracked: [],
     ignoredCount: 0,
+    staleTempFiles: [],
   };
 }
 
@@ -182,7 +199,8 @@ export async function performSanityCheck(
   // so it's declared after the call that uses it and reads in the order it
   // runs.
   async function runMergeJoin(): Promise<SanityCheckResult> {
-    const fsIter = walk(root);
+    const staleTempPaths: string[] = [];
+    const fsIter = walk(root, undefined, (relativePath) => staleTempPaths.push(relativePath));
     const entryIter = entriesRepo.iterateAllSortedByPath();
 
     let fsNext = await fsIter.next();
@@ -250,6 +268,22 @@ export async function performSanityCheck(
 
     result.hashMismatch.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     result.missingInS3.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+    // Sized only now, and only for what the walk actually found: these are
+    // rare (one per interrupted write), so the stats cost nothing, and a
+    // byte total is the whole reason to report them -- "some leftovers" is
+    // not actionable, "3.2 GB of leftovers" is. A temp that vanished
+    // between the walk and here is simply not a problem any more.
+    for (const relativePath of staleTempPaths) {
+      try {
+        result.staleTempFiles.push({
+          path: relativePath,
+          size: fs.statSync(path.join(root, relativePath)).size,
+        });
+      } catch {
+        // gone already, or unreadable -- nothing worth reporting
+      }
+    }
 
     return result;
   }

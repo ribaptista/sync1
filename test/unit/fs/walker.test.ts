@@ -111,6 +111,26 @@ describe("walk", () => {
     expect(paths).toEqual([`photo.jpg.sync1-tmp-${hex}.jpg`, `photo.sync1-tmp-${hex}.jpg.backup`]);
   });
 
+  it("notifies onTempFile for each skipped temp, at any depth, while still never yielding one", async () => {
+    // Opt-in: the callback is what lets sanity_check report these without
+    // any walk caller ever being able to mistake one for tracked content.
+    const root = mkTempDir();
+    fs.writeFileSync(path.join(root, "photo.jpg"), "real content");
+    fs.writeFileSync(path.join(root, `.sync1-tmp-${"a1b2c3d4".repeat(4)}`), "half");
+    fs.mkdirSync(path.join(root, "nested"));
+    fs.writeFileSync(path.join(root, "nested", `.sync1-tmp-${"deadbeef".repeat(4)}.mp4`), "half");
+
+    const seen: string[] = [];
+    const paths: string[] = [];
+    for await (const entry of walk(root, undefined, (p) => seen.push(p))) paths.push(entry.path);
+
+    expect(paths).toEqual(["nested", "photo.jpg"]);
+    expect(seen.sort()).toEqual([
+      `.sync1-tmp-${"a1b2c3d4".repeat(4)}`,
+      `nested/.sync1-tmp-${"deadbeef".repeat(4)}.mp4`,
+    ]);
+  });
+
   it("yields nothing for an empty directory", async () => {
     const root = mkTempDir();
     const paths = await collectPaths(root);

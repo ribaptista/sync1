@@ -119,7 +119,29 @@ describe("performSanityCheck", () => {
       missingLocally: [],
       untracked: [],
       ignoredCount: 0,
+      staleTempFiles: [],
     });
+  });
+
+  /**
+   * These are invisible everywhere else: the startup sweep reads only
+   * `.sync1/`, and every walk excludes them by name, so nothing reports or
+   * removes them and a partially-decrypted `materialize` temp can sit
+   * there indefinitely. Reported with a size, never deleted -- this
+   * command is read-only.
+   */
+  it("reports an in-tree temp left by an interrupted run, without mistaking it for untracked content", async () => {
+    const hash = hashBufferHex(Buffer.from("hello"));
+    touch("a.txt", "hello");
+    seedObject(hash, "objects/a", 5);
+    seedEntry("a.txt", hash);
+    touch(`.sync1-tmp-${"f0e1d2c3".repeat(4)}`, "half-downloaded, never renamed");
+
+    const result = await run(alwaysExists);
+    expect(result.untracked).toEqual([]); // never a tracked-content candidate
+    expect(result.staleTempFiles).toEqual([
+      { path: `.sync1-tmp-${"f0e1d2c3".repeat(4)}`, size: 30 },
+    ]);
   });
 
   it("does not check directories any further once both sides agree they exist", async () => {

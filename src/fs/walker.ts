@@ -61,14 +61,25 @@ interface SortItem {
 export async function* walk(
   root: string,
   excludeAtRoot: ReadonlySet<string> = new Set([".sync1"]),
+  onTempFile?: TempFileVisitor,
 ): AsyncGenerator<WalkEntry> {
-  yield* walkDir(root, "", excludeAtRoot);
+  yield* walkDir(root, "", excludeAtRoot, onTempFile);
 }
+
+/**
+ * Notified for each in-tree temp this walk skips, so a caller that wants
+ * to *report* them can. Opt-in, and deliberately a callback rather than a
+ * `WalkEntry` kind: a temp must never be reachable as tracked content, and
+ * keeping it off the yielded type is what makes that structural rather
+ * than a rule every existing caller has to remember.
+ */
+export type TempFileVisitor = (relativePath: string) => void;
 
 async function* walkDir(
   absoluteDir: string,
   relativeDir: string,
   excludeAtRoot: ReadonlySet<string>,
+  onTempFile: TempFileVisitor | undefined,
 ): AsyncGenerator<WalkEntry> {
   const dirents = await fsp.readdir(absoluteDir, { withFileTypes: true });
 
@@ -80,7 +91,10 @@ async function* walkDir(
     // next to its real destination, at whatever depth that is -- one left
     // behind by an interrupted run used to be picked up here as a genuine
     // new file and synced, since only ".sync1" itself was ever excluded.
-    if (!dirent.isDirectory() && isInTreeTempName(dirent.name)) continue;
+    if (!dirent.isDirectory() && isInTreeTempName(dirent.name)) {
+      onTempFile?.(relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name);
+      continue;
+    }
 
     if (!dirent.isDirectory() && dirent.name.endsWith(STUB_SUFFIX)) {
       const logicalName = dirent.name.slice(0, -STUB_SUFFIX.length);
@@ -116,7 +130,7 @@ async function* walkDir(
     const absolutePath = path.join(absoluteDir, item.name);
 
     if (item.isRecurseMarker) {
-      yield* walkDir(absolutePath, relativePath, excludeAtRoot);
+      yield* walkDir(absolutePath, relativePath, excludeAtRoot, onTempFile);
       continue;
     }
 

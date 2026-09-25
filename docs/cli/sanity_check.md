@@ -46,6 +46,12 @@ For every path that's either tracked in `state.db`, present locally, or both:
 - **Present locally, not tracked** → checked against ignore policies; a match is silently excluded (just
   counted, via `ignored_count`), since it isn't a problem — an untracked path that isn't ignored is
   `untracked`.
+- **An in-tree staging file** (`.sync1-tmp-…`, written next to its destination and renamed into place) →
+  `stale_temp_files`. One only exists if a run died between the write and the rename, since Ctrl+C is a
+  `process.exit()` that skips the cleanup. Nothing else ever reports or removes them: the startup sweep
+  reads only `.sync1/`, and every walk excludes them by name — so they are invisible dead space, and a
+  partially-downloaded `materialize` temp can be many GB. Reported with sizes, never deleted; this
+  command is read-only, so removal is yours to do once no sync1 command is running.
 
 Directories are only checked for presence on both sides — there's no content to hash or an S3 object to
 check.
@@ -65,7 +71,8 @@ comparison can't reliably tell "filtered out" apart from "genuinely missing" on 
   "missing_in_s3": [{ "path": "vanishing.txt", "hash": "..." }],
   "missing_locally": ["ghost.txt"],
   "untracked": ["stray.txt"],
-  "ignored_count": 1
+  "ignored_count": 1,
+  "stale_temp_files": [{ "path": "photos/.sync1-tmp-f0e1d2c3...", "size": 41231872 }]
 }
 ```
 

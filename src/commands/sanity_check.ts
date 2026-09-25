@@ -41,7 +41,8 @@ function problemCount(result: SanityCheckResult): number {
     result.stubMismatch.length +
     result.missingInS3.length +
     result.missingLocally.length +
-    result.untracked.length
+    result.untracked.length +
+    result.staleTempFiles.length
   );
 }
 
@@ -84,6 +85,7 @@ export function registerSanityCheckCommand(program: Command): void {
             missing_locally: result.missingLocally,
             untracked: result.untracked,
             ignored_count: result.ignoredCount,
+            stale_temp_files: result.staleTempFiles,
           });
         } else {
           process.stdout.write(
@@ -120,6 +122,15 @@ export function registerSanityCheckCommand(program: Command): void {
           if (result.untracked.length > 0) {
             process.stdout.write("  untracked local files:\n");
             for (const p of result.untracked) process.stdout.write(`    - ${p}\n`);
+          }
+          if (result.staleTempFiles.length > 0) {
+            const total = result.staleTempFiles.reduce((sum, t) => sum + t.size, 0);
+            process.stdout.write(
+              `  stale in-tree temp files (${total} bytes total) -- leftovers from an interrupted run; nothing removes these automatically, so delete them once you're sure no sync1 command is running:\n`,
+            );
+            for (const t of result.staleTempFiles) {
+              process.stdout.write(`    - ${t.path} (${t.size} bytes)\n`);
+            }
           }
         }
 
