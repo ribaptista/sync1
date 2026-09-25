@@ -52,6 +52,13 @@ export interface ProgressSession {
    * is bookkeeping that exists only to be got wrong.
    */
   setOverallProgress(value: number): void;
+  /**
+   * The current per-item activity label (e.g. `{ verb: "generating", path:
+   * "a.jpg" }`), rendered verbatim beside the bar -- the plain item-count
+   * counterpart to `BytesProgressSession`'s own `activity` token (see
+   * `MultiBarByteBar.activityLabel`). `undefined` clears it back to blank.
+   */
+  setActivity(activity: { verb: string; path: string } | undefined): void;
   stop(): void;
 }
 
@@ -59,6 +66,7 @@ class NullProgressSession implements ProgressSession {
   setOverallTotal(): void {}
   advanceOverall(): void {}
   setOverallProgress(): void {}
+  setActivity(): void {}
   stop(): void {}
 }
 
@@ -100,6 +108,7 @@ class MultiBarProgressSession implements ProgressSession {
   // `{totalLabel}` payload and the bar's own arithmetic total can't drift.
   private overallTotal = 1;
   private totalsFinal = false;
+  private activity: { verb: string; path: string } | undefined;
 
   constructor(overallLabel: string, overallUnit: string) {
     this.multibar = new MultiBarCtor(
@@ -113,7 +122,7 @@ class MultiBarProgressSession implements ProgressSession {
         // `{totalLabel}`, not cli-progress's built-in `{total}`: the total
         // needs a "~" prefix while it's still provisional, and only a
         // custom payload token can carry one.
-        format: `${overallLabel} |{bar}| {value}/{totalLabel} ${overallUnit}`,
+        format: `${overallLabel} |{bar}| {value}/{totalLabel} ${overallUnit} {activity}`,
       },
       Presets.shades_classic,
     );
@@ -121,11 +130,21 @@ class MultiBarProgressSession implements ProgressSession {
     // total arrives.
     this.overall = this.multibar.create(this.overallTotal, 0, {
       totalLabel: this.totalLabel(),
+      activity: this.activityLabel(),
     });
   }
 
   private totalLabel(): string {
     return `${this.totalsFinal ? "" : "~"}${this.overallTotal}`;
+  }
+
+  // Same shape as MultiBarByteBar's own activityLabel -- see that one's
+  // doc comment for why the path is truncated (kept-tail) rather than
+  // left to the terminal's own line-wrap.
+  private activityLabel(): string {
+    if (!this.activity) return "";
+    const { verb, path } = this.activity;
+    return `${verb} ${fitPath(path, process.stderr.columns, verb)}...`;
   }
 
   setOverallTotal(total: number, opts?: { final?: boolean }): void {
@@ -136,17 +155,34 @@ class MultiBarProgressSession implements ProgressSession {
       this.overallTotal = total;
     }
     this.overall.setTotal(this.overallTotal);
-    this.overall.update(this.overallValue, { totalLabel: this.totalLabel() });
+    this.overall.update(this.overallValue, {
+      totalLabel: this.totalLabel(),
+      activity: this.activityLabel(),
+    });
   }
 
   advanceOverall(n = 1): void {
     this.overallValue += n;
-    this.overall.update(this.overallValue, { totalLabel: this.totalLabel() });
+    this.overall.update(this.overallValue, {
+      totalLabel: this.totalLabel(),
+      activity: this.activityLabel(),
+    });
   }
 
   setOverallProgress(value: number): void {
     this.overallValue = value;
-    this.overall.update(this.overallValue, { totalLabel: this.totalLabel() });
+    this.overall.update(this.overallValue, {
+      totalLabel: this.totalLabel(),
+      activity: this.activityLabel(),
+    });
+  }
+
+  setActivity(activity: { verb: string; path: string } | undefined): void {
+    this.activity = activity;
+    this.overall.update(this.overallValue, {
+      totalLabel: this.totalLabel(),
+      activity: this.activityLabel(),
+    });
   }
 
   stop(): void {

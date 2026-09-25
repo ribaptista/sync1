@@ -556,10 +556,10 @@ describe("startProgressSession", () => {
     const session = startProgressSession({ show: true, overallLabel: "x", overallUnit: "objects" });
 
     session.setOverallTotal(10);
-    expect(barUpdateMock).toHaveBeenLastCalledWith(0, { totalLabel: "~10" });
+    expect(barUpdateMock).toHaveBeenLastCalledWith(0, { totalLabel: "~10", activity: "" });
 
     session.setOverallTotal(10, { final: true });
-    expect(barUpdateMock).toHaveBeenLastCalledWith(0, { totalLabel: "10" });
+    expect(barUpdateMock).toHaveBeenLastCalledWith(0, { totalLabel: "10", activity: "" });
   });
 
   it("a provisional total only grows, but a final one may correct downward", () => {
@@ -581,6 +581,28 @@ describe("startProgressSession", () => {
     session.setOverallTotal(20, { final: true }); // nonsense -- would render past 100%
 
     expect(barSetTotalMock).toHaveBeenLastCalledWith(80);
+  });
+
+  it("renders activity beside the bar and preserves it across progress updates", () => {
+    const session = startProgressSession({ show: true, overallLabel: "x", overallUnit: "files" });
+
+    session.setActivity({ verb: "generating", path: "a.jpg" });
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      0,
+      expect.objectContaining({ activity: "generating a.jpg..." }),
+    );
+
+    session.setOverallProgress(1);
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ activity: "generating a.jpg..." }),
+    );
+
+    session.setActivity({ verb: "generated", path: "a.jpg" });
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      1,
+      expect.objectContaining({ activity: "generated a.jpg..." }),
+    );
   });
 });
 

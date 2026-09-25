@@ -8,7 +8,7 @@ export function tempSiblingPath(basePath: string, tag: string): string {
 }
 
 const IN_TREE_TEMP_SUFFIX = "sync1-tmp";
-const IN_TREE_TEMP_NAME_RE = /\.sync1-tmp-[0-9a-f]{8}$/;
+const IN_TREE_TEMP_NAME_RE = /\.sync1-tmp-[0-9a-f]{8}(?:\.[^./]+)?$/;
 
 /**
  * A temp path for an atomic write that has to live *in the tracked tree*
@@ -24,6 +24,13 @@ const IN_TREE_TEMP_NAME_RE = /\.sync1-tmp-[0-9a-f]{8}$/;
  */
 export function inTreeTempPath(absolutePath: string): string {
   return `${absolutePath}.${IN_TREE_TEMP_SUFFIX}-${randomBytes(4).toString("hex")}`;
+}
+
+/** An in-tree temp path that retains the destination extension for media tools that infer output format from it. */
+export function inTreeTempPathPreservingExtension(absolutePath: string): string {
+  const extension = path.extname(absolutePath);
+  const stem = extension.length > 0 ? absolutePath.slice(0, -extension.length) : absolutePath;
+  return `${stem}.${IN_TREE_TEMP_SUFFIX}-${randomBytes(4).toString("hex")}${extension}`;
 }
 
 /** True for any name `inTreeTempPath` could have produced -- what the walker excludes so these are never mistaken for tracked content. */

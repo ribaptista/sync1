@@ -168,13 +168,9 @@ measures:
 
 - **`ProgressSession`** (`startProgressSession`) — a plain item-count bar (`{value}/{total} <unit>`),
   used by `gc`, `converge`, `status`, and `thumbnail`. None of those transfer or hash file content, so a
-  byte total wouldn't mean anything for them. `thumbnail state`/`cleanup` drive the bar from a single
-  filesystem-walk callback (`{scanned files}/{scanned files}`, since neither mode does anything besides
-  scan). `thumbnail ensure` is the one command driving the same session from _two independent_ callbacks
-  instead of one: a walk-phase callback it doesn't actually use (see
-  [thumbnails.md](thumbnails.md#parallelism) for why), and a separate generation-phase callback whose
-  total is "thumbnails still pending" and whose value is "thumbnails generated so far" — two units that
-  can't be expressed as one running count, unlike every other `ProgressSession` user in this list.
+  byte total wouldn't mean anything for them. Every thumbnail mode uses one source file as one unit. A
+  concurrent no-probe walk supplies a provisional total, while bounded source jobs publish discovered
+  and completed absolute counts and activity labels; final observed counts replace the estimate.
 - **`BytesProgressSession`** (`startBytesProgressSession`) — used by every command that actually
   hashes, uploads, or downloads file content: `update_cache`, `sync`, `materialize`, `stubify`, and
   `sanity_check`. A single bar shows both a file count and a byte count, but **only bytes ever drive
@@ -393,8 +389,7 @@ explain, and its answer could go stale before the real pass reached it.
 | `update_cache`, `sync` phase 1 | concurrent counting walk (`update-cache-enumerate.ts`)                         | one extra walk |
 | `sanity_check`                 | concurrent counting merge-join (`sanity-check-enumerate.ts`)                   | one extra walk |
 | `stubify`                      | concurrent counting scan over cache rows (`stubify-enumerate.ts`)              | stat only      |
-| `thumbnail state`/`cleanup`    | concurrent counting walk (`thumbnail-enumerate.ts`)                            | one extra walk |
-| `thumbnail ensure`             | exact: every generation candidate is decided before the first is dispatched    | none           |
+| `thumbnail`                    | concurrent glob/hash/expected-path walk; no media probes                       | one extra walk |
 
 The walking/scanning passes run **concurrently** with the real pass, not before it: on an unchanged
 tree the walk _is_ the entire cost of `update_cache`, so a sequential pre-pass would roughly double the

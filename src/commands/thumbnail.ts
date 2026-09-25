@@ -57,15 +57,6 @@ async function runThumbnailMode(
     overallUnit: "files",
   });
 
-  // `ensure` drives the one bar from its generation phase instead of the
-  // scan phase -- see scanThumbnails's own doc comment on
-  // onGenerationProgress for why these are separate callbacks, not one
-  // shared cumulative count. `state`/`cleanup` never generate anything,
-  // so "files scanned" stays their progress unit -- but its denominator
-  // now comes from the concurrent counting walk rather than from the
-  // scanned count standing in for its own total.
-  let lastGenerated = 0;
-
   try {
     return await scanThumbnails(
       root,
@@ -80,29 +71,12 @@ async function runThumbnailMode(
       pools.thumbnail,
       pools.thumbnail.concurrency * 2,
       opts.deleteStaleStubPreviews ?? false,
-      mode === "ensure"
-        ? undefined
-        : (n) => {
-            // setOverallTotal stays as a floor: if the counting walk fails
-            // or falls behind, the bar still can't claim more progress
-            // than total. The real denominator arrives via the
-            // onScanTotalKnown callback below.
-            progress.setOverallTotal(n);
-            progress.advanceOverall(1);
-          },
-      mode === "ensure"
-        ? (total, generated) => {
-            // `final: true` from the very first call: every candidate is
-            // known before the first one is dispatched, so this total is
-            // exact, not a running discovery count.
-            progress.setOverallTotal(total, { final: true });
-            if (generated > lastGenerated) {
-              progress.advanceOverall(generated - lastGenerated);
-              lastGenerated = generated;
-            }
-          }
-        : undefined,
-      mode === "ensure" ? undefined : (total, final) => progress.setOverallTotal(total, { final }),
+      (total) => progress.setOverallTotal(total),
+      (discovered, completed, final) => {
+        progress.setOverallTotal(discovered, { final });
+        progress.setOverallProgress(completed);
+      },
+      (verb, path) => progress.setActivity({ verb, path }),
     );
   } finally {
     progress.stop();

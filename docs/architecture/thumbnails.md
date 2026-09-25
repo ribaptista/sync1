@@ -282,26 +282,24 @@ A stub whose path matches no policy glob at all still correctly falls through to
 sweep and is deleted normally, same as any other unmatched path — glob matching needs no mime type, so
 this doesn't depend on probing either.
 
-## One shared scan, three modes
+## One streaming algorithm, three modes
 
-`state`/`ensure`/`cleanup` (`sync1 thumbnail <mode>`) all share a single classification algorithm
-(`scanThumbnails` in `src/fs/thumbnail.ts`) rather than three separate walks: one filesystem walk both
-collects every existing `_thumbnail/` file (reverse-parsed back to the original it belongs to, including
-its params segment) and classifies every other candidate path into one of two kinds. Before either
+`state`/`ensure`/`cleanup` (`sync1 thumbnail <mode>`) share one streaming classification algorithm
+(`scanThumbnails` in `src/fs/thumbnail.ts`). A fast advisory walk runs concurrently with the real walk.
+It only matches globs, reads a source's cache hash, derives deterministic expected thumbnail paths, and
+checks whether those paths exist; it never calls `identify` or `ffprobe`. Its count is therefore an
+estimate, rendered with `~`, and may include a source the later MIME check rejects.
+
+The real walk repeats the cheap filters and dispatches one bounded job per source. Before either
 classification path, a candidate matching any `ignore_policies` glob (`IgnorePoliciesRepository.listGlobs()`,
 same cheap in-memory pre-filter, same precedent as `update_cache`/`apply-remote-changes.ts` — see
 [ignore-and-storage-policies.md](ignore-and-storage-policies.md#what-matching-actually-gates)) is skipped
-outright, exactly as if it matched no `thumbnail_policy` glob at all — a path explicitly excluded from the
-vault has no business getting a preview generated for it either. A real (or "both",
-real-with-dangling-stub) entry is then dispatched for mime-probing + policy resolution — only for a path
-that already matches at least one policy's glob, a cheap in-memory check with zero I/O, so a path matching
-no policy at all is never probed. A stub entry is classified synchronously instead, with no probing or
-policy resolution at all (see "Stubbed originals" above) — `ProvisionalDecision` is a `"probed"`/`"stub"`
-discriminated union at the type level, so a stub decision is structurally impossible to hand to the
-generation code path.
+outright. A real (or "both", real-with-dangling-stub) entry is then MIME-probed and policy-resolved
+inside its bounded job. That same job streams only the source's sibling `_thumbnail` directory and
+immediately generates, reports, or deletes as the selected mode requires. A stub is reconciled without
+probing. No whole-tree decision, generation-job, or existing-thumbnail collection is retained.
 
-Once the walk (and its dispatched classification jobs) fully settles, every candidate is reconciled
-against the collected existing-thumbnail map. A "both"/real candidate reconciles **once per matching
+A "both"/real candidate reconciles **once per matching
 `generate` policy**, independently — an original matching two policies is decided twice, against the
 same `existing` list, each decision keyed by that one policy's own name (see "Naming convention" above):
 
@@ -324,11 +322,12 @@ same `existing` list, each decision keyed by that one policy's own name (see "Na
   is never a to-generate/to-regenerate candidate.
 
 `state` only tallies, never writes anything. `ensure` dispatches actual generation for to-generate/to-
-regenerate entries (deleting the stale file first, within the same job, when regenerating) back through
-the same named concurrency pool used for classification — never for a stub, which is never a generation
-candidate. `cleanup` synchronously deletes every to-delete file, plus a stale stub preview's thumbnail
+regenerate entries through the same named concurrency pool used for classification — never for a stub.
+On regeneration, the stale file is deleted only after its replacement has been published. `cleanup` deletes every
+to-delete file, plus a stale stub preview's thumbnail
 when `--delete-stale-stub-previews` was passed — deletion is cheap enough not to need its own pool
-dispatch.
+dispatch. After source processing, a final streaming thumbnail walk handles missing originals and
+sources excluded by this run without building an orphan map.
 
 A per-file `ThumbnailGenerationError` (bad/corrupt source, a format the underlying tool can't produce) is
 caught, tallied under `errors`, and never aborts the run; a `MediaToolMissingError` (the `identify`/
@@ -501,30 +500,14 @@ concurrency-and-progress.md's "Progress bars and `--verbose`" section), not the 
 thumbnail generation isn't a byte-transfer/hash operation -- "files processed" is the natural progress
 unit for this command.
 
-`state` and `cleanup` drive that one bar from the filesystem walk (`scanThumbnails`'s `onProgress`
-callback) exactly as any other command would — neither mode ever generates anything, so "files scanned"
-is the only meaningful progress unit for either. Its _denominator_ comes from a separate callback,
-`onScanTotalKnown`, fed by a concurrent counting walk (`thumbnail-enumerate.ts`) that probes and matches
-nothing: the real walk blocks on `waitForRoom` once the probe pool is full, so left to itself it could
-only ever report its own scanned count as its own total — a bar pinned at 100%. The counting walk counts
-every entry, directories included, to match exactly what `onProgress` reports as the numerator, and the
-real walk's own final count is published last, marked final. See concurrency-and-progress.md's
-"Enumeration vs. execution" section. `ensure` used to drive the same bar the same way, which
-meant it filled during the (comparatively fast) walk and then sat static for however long the
-(comparatively slow) actual generation work took — confirmed a genuine gap, not a documented decision:
-the walk's own progress callback fired per row scanned, but the generation dispatch/join round had no
-progress reporting of its own at all.
+All three modes use one source file as the progress unit, even when several policies produce several
+outputs for it. The advisory walk supplies the provisional denominator; the real walk raises that total
+as it discovers work and advances the numerator in each job's `finally`, including MIME/skip rejection
+and handled generation failure. Once all source and orphan work settles, the observed total replaces the
+estimate and the `~` disappears. `processing`/`processed` activity is shown for classification-only work;
+actual generation shows `generating <path>` and `generated <path>` immediately beside the bar.
 
-`ensure` now drives the bar from a _separate_ callback, `onGenerationProgress`, entirely independent of
-the walk's `onProgress` (the two units — "files scanned" and "thumbnails generated" — aren't
-commensurable, so there's no single running count that could serve both): the bar opens on the phase's
-_exact, final_ total and its value advances by one each time a generation attempt completes —
-successfully or not, from a `finally`, so a per-file failure still moves the bar rather than silently
-stalling it. The total is exact because the reconciliation loop runs after the probe pool has gone idle,
-so every candidate is already decided before any is dispatched; `scanThumbnails` collects them as
-`GenerationJob`s and dispatches them in a second loop. (It previously dispatched as it decided, growing
-the total by one per dispatch — and since dispatch blocks on `waitForRoom`, the denominator grew at
-exactly the rate the work finished, which is the failure mode described in concurrency-and-progress.md's
-"Enumeration vs. execution" section.) `ensure`'s own walk phase doesn't drive the bar at all under this scheme; since the
-walk is the fast phase and generation is the slow one, this trades a moving bar during the part that
-barely takes any time for a moving bar during the part that actually does.
+Generation never writes directly to the deterministic thumbnail path. Each image, mosaic, or preview is
+written to an extension-preserving `sync1-tmp` sibling so ImageMagick/ffmpeg still infer the requested
+format, then atomically renamed into place. A failed generation removes its temp file and leaves any stale
+predecessor intact; an abrupt process exit can leave only a temp sibling, which filesystem walks ignore.

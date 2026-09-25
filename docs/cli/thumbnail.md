@@ -16,8 +16,14 @@ read (never written) and only the local filesystem is touched (a `_thumbnail/` f
 | `thumbnail ensure`  | generates missing/stale thumbs | Never deletes an extra thumbnail — see `cleanup` for that.    |
 | `thumbnail cleanup` | deletes extra thumbs           | Never generates anything — only removes what shouldn't exist. |
 
-All three share one classification pass over the tree; `state` is exactly what `ensure`/`cleanup` would
-act on, reported without acting.
+All three share one bounded streaming classifier. A concurrent fast walk estimates work using only
+globs, cache hashes, and expected-thumbnail existence checks; `identify`/`ffprobe` runs only in the real
+per-source jobs. Progress advances once per processed source (including a later MIME/skip rejection),
+and the current `processing`/`generating` path is shown beside the bar.
+
+`ensure` generates into an extension-preserving temporary sibling and atomically renames it into place.
+Stopping the command cannot expose a partially written thumbnail, and a failed regeneration leaves the
+previous stale thumbnail intact.
 
 ## Usage
 

@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   tempSiblingPath,
   inTreeTempPath,
+  inTreeTempPathPreservingExtension,
   isInTreeTempName,
   sweepStaleTempFiles,
 } from "../../../src/fs/temp-path.js";
@@ -47,8 +48,10 @@ describe("inTreeTempPath / isInTreeTempName", () => {
     expect(isInTreeTempName("summer.jpg")).toBe(false);
   });
 
-  it("does not recognize a name that merely contains the shape as a substring, not a suffix", () => {
-    expect(isInTreeTempName("summer.jpg.sync1-tmp-a1b2c3d4.jpg")).toBe(false);
+  it("preserves an extension needed for output format inference and recognizes the result", () => {
+    const result = inTreeTempPathPreservingExtension("/vault/photos/summer.jpg");
+    expect(result).toMatch(/^\/vault\/photos\/summer\.sync1-tmp-[0-9a-f]{8}\.jpg$/);
+    expect(isInTreeTempName(path.basename(result))).toBe(true);
   });
 });
 

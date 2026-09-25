@@ -156,6 +156,10 @@ function fakeGenerator(failFor: Set<string> = new Set()): ThumbnailGenerator & {
   };
 }
 
+function finalPathForStagedThumbnail(stagedPath: string): string {
+  return stagedPath.replace(/\.sync1-tmp-[0-9a-f]{8}(?=\.[^./]+$)/, "");
+}
+
 function run(
   mode: "state" | "ensure" | "cleanup",
   glob: string | undefined,
@@ -225,6 +229,7 @@ describe("scanThumbnails", () => {
 
     expect(stats).toMatchObject({ upToDate: 1, toGenerate: 0, toRegenerate: 0, toDelete: 0 });
     expect(generator.imageCalls).toHaveLength(0);
+    expect(prober.detectMedia).not.toHaveBeenCalled();
   });
 
   it("reports toGenerate for a new candidate with no existing thumbnail, and ensure generates it", async () => {
@@ -241,11 +246,12 @@ describe("scanThumbnails", () => {
     const ensureStats = await run("ensure", undefined, prober, generator);
     expect(ensureStats).toMatchObject({ toGenerate: 1 });
     expect(generator.imageCalls).toHaveLength(1);
-    expect(generator.imageCalls[0]).toMatchObject({
-      destPath: path.join(root, `_thumbnail/new.jpg.${IMAGE_PARAMS}.def456.jpg`),
-      width: 320,
-      height: 240,
-    });
+    expect(generator.imageCalls[0]).toMatchObject({ width: 320, height: 240 });
+    expect(generator.imageCalls[0]!.destPath).toMatch(
+      new RegExp(
+        `^${path.join(root, `_thumbnail/new\\.jpg\\.${IMAGE_PARAMS}\\.def456`)}\\.sync1-tmp-[0-9a-f]{8}\\.jpg$`,
+      ),
+    );
     expect(fs.existsSync(path.join(root, `_thumbnail/new.jpg.${IMAGE_PARAMS}.def456.jpg`))).toBe(
       true,
     );
@@ -268,6 +274,29 @@ describe("scanThumbnails", () => {
     expect(
       fs.existsSync(path.join(root, `_thumbnail/changed.jpg.${IMAGE_PARAMS}.newhash.jpg`)),
     ).toBe(true);
+  });
+
+  it("keeps a stale thumbnail and removes the staged output when regeneration fails", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile("changed.jpg");
+    seedCache("changed.jpg", "newhash");
+    const staleRelativePath = `_thumbnail/changed.jpg.${IMAGE_PARAMS}.oldhash.jpg`;
+    writeFile(staleRelativePath);
+
+    const sourcePath = path.join(root, "changed.jpg");
+    const generator = fakeGenerator(new Set([sourcePath]));
+    const stats = await run(
+      "ensure",
+      undefined,
+      fakeProber({ "changed.jpg": JPEG_IMAGE }),
+      generator,
+    );
+
+    expect(stats).toMatchObject({ toRegenerate: 1, errors: 1 });
+    expect(fs.existsSync(path.join(root, staleRelativePath))).toBe(true);
+    expect(fs.readdirSync(path.join(root, "_thumbnail"))).toEqual([
+      path.basename(staleRelativePath),
+    ]);
   });
 
   it("regenerates when a policy's own configured parameters change, even though the original file's content hash hasn't", async () => {
@@ -409,23 +438,42 @@ describe("scanThumbnails", () => {
 
     const prober = fakeProber({ "both.jpg": JPEG_IMAGE });
     const generator = fakeGenerator();
-    const stats = await run("ensure", undefined, prober, generator);
+    const progress: { discovered: number; completed: number; final: boolean }[] = [];
+    const pool = new PQueue({ concurrency: 4 });
+    const stats = await scanThumbnails(
+      root,
+      "ensure",
+      undefined,
+      cacheRepo,
+      policiesRepo.list(),
+      ignorePoliciesRepo.listGlobs(),
+      prober,
+      generator,
+      silentLogger,
+      pool,
+      8,
+      false,
+      () => {},
+      (discovered, completed, final) => progress.push({ discovered, completed, final }),
+    );
 
     expect(stats).toMatchObject({ toGenerate: 2, toRegenerate: 0, upToDate: 0, toDelete: 0 });
     expect(generator.imageCalls).toHaveLength(2);
+    expect(progress.at(-1)).toEqual({ discovered: 1, completed: 1, final: true });
     const byWidth = new Map(generator.imageCalls.map((c) => [c.width, c]));
     // JPEG_IMAGE is 800x600 (4:3) -- contain-fit into each policy's own box.
     expect(byWidth.get(999)).toMatchObject({
       height: 749,
-      destPath: path.join(root, "_thumbnail/both.jpg.p2-big-iw999-ih999-fmtimage_jpeg-q80.abc.jpg"),
     });
+    expect(finalPathForStagedThumbnail(byWidth.get(999)!.destPath)).toBe(
+      path.join(root, "_thumbnail/both.jpg.p2-big-iw999-ih999-fmtimage_jpeg-q80.abc.jpg"),
+    );
     expect(byWidth.get(100)).toMatchObject({
       height: 75,
-      destPath: path.join(
-        root,
-        "_thumbnail/both.jpg.p2-small-iw100-ih100-fmtimage_jpeg-q80.abc.jpg",
-      ),
     });
+    expect(finalPathForStagedThumbnail(byWidth.get(100)!.destPath)).toBe(
+      path.join(root, "_thumbnail/both.jpg.p2-small-iw100-ih100-fmtimage_jpeg-q80.abc.jpg"),
+    );
 
     // A second run finds both up to date, and deletes neither -- each
     // policy's own output is claimed by that same policy, not treated as
@@ -605,12 +653,12 @@ describe("scanThumbnails", () => {
     expect(stats.errors).toBe(1);
     expect(stats.toGenerate).toBe(2);
     expect(generator.imageCalls).toHaveLength(1);
-    expect(generator.imageCalls[0]).toMatchObject({
-      destPath: path.join(root, `_thumbnail/good.jpg.${IMAGE_PARAMS}.b.jpg`),
-    });
+    expect(generator.imageCalls[0]!.destPath).toMatch(
+      /good\.jpg\..+\.b\.sync1-tmp-[0-9a-f]{8}\.jpg$/,
+    );
   });
 
-  it("opens the generation phase on its exact, final total, and only advances generated as each resolves", async () => {
+  it("starts generation before discovery finalizes and advances once per resolved source", async () => {
     createGeneratePolicy("*.jpg");
     writeFile("a.jpg");
     writeFile("b.jpg");
@@ -636,7 +684,8 @@ describe("scanThumbnails", () => {
       generateVideoPreview: async () => {},
     };
 
-    const updates: { total: number; generated: number }[] = [];
+    const updates: { discovered: number; completed: number; final: boolean }[] = [];
+    const activities: { verb: string; path: string }[] = [];
     const pool = new PQueue({ concurrency: 4 });
     const statsPromise = scanThumbnails(
       root,
@@ -651,34 +700,30 @@ describe("scanThumbnails", () => {
       pool,
       8,
       false,
-      undefined,
-      (total, generated) => updates.push({ total, generated }),
+      () => {},
+      (discovered, completed, final) => updates.push({ discovered, completed, final }),
+      (verb, path) => activities.push({ verb, path }),
     );
-
-    // The denominator is right from the very first report -- not grown to
-    // 2 as the second job is dispatched. Every candidate is decided before
-    // any of them is dispatched, so there is nothing left to discover.
-    await vi.waitFor(() => expect(updates.length).toBeGreaterThan(0));
-    expect(updates[0]).toEqual({ total: 2, generated: 0 });
 
     await vi.waitFor(() => {
       expect(resolveA).toBeDefined();
       expect(resolveB).toBeDefined();
     });
-    // Both dispatched before either generation call's own promise ever
-    // settles -- generated stays 0 the whole time.
-    expect(updates.every((u) => u.generated === 0)).toBe(true);
-    expect(updates.every((u) => u.total === 2)).toBe(true);
+    expect(updates.some((update) => !update.final && update.completed === 0)).toBe(true);
+    expect(activities).toContainEqual({ verb: "generating", path: "a.jpg" });
+    expect(activities).toContainEqual({ verb: "generating", path: "b.jpg" });
 
     resolveA!();
     await vi.waitFor(() => {
-      expect(updates.some((u) => u.generated === 1)).toBe(true);
+      expect(updates.some((update) => update.completed === 1)).toBe(true);
     });
+    expect(activities).toContainEqual({ verb: "generated", path: "a.jpg" });
     resolveB!();
 
     const stats = await statsPromise;
     expect(stats.toGenerate).toBe(2);
-    expect(updates.at(-1)).toEqual({ total: 2, generated: 2 });
+    expect(updates.at(-1)).toEqual({ discovered: 2, completed: 2, final: true });
+    expect(activities.at(-1)).toEqual({ verb: "generated", path: "b.jpg" });
   });
 
   it("advances generation progress even when a per-file generation fails", async () => {
@@ -689,7 +734,7 @@ describe("scanThumbnails", () => {
     const prober = fakeProber({ "bad.jpg": JPEG_IMAGE });
     const generator = fakeGenerator(new Set([path.join(root, "bad.jpg")]));
 
-    const updates: { total: number; generated: number }[] = [];
+    const updates: { discovered: number; completed: number; final: boolean }[] = [];
     const pool = new PQueue({ concurrency: 4 });
     const stats = await scanThumbnails(
       root,
@@ -704,18 +749,15 @@ describe("scanThumbnails", () => {
       pool,
       8,
       false,
-      undefined,
-      (total, generated) => updates.push({ total, generated }),
+      () => {},
+      (discovered, completed, final) => updates.push({ discovered, completed, final }),
     );
 
     expect(stats.errors).toBe(1);
-    expect(updates.at(-1)).toEqual({ total: 1, generated: 1 });
+    expect(updates.at(-1)).toEqual({ discovered: 1, completed: 1, final: true });
   });
 
-  it("reports the walk's entry total ahead of the walk, then finalizes on the real count", async () => {
-    // A denominator for the scan bar that isn't just its own numerator:
-    // three files plus the root's one subdirectory-free walk, counted by
-    // the concurrent pass before the probing walk has finished.
+  it("publishes an approximate work total, then finalizes on observed work", async () => {
     createGeneratePolicy("*.jpg");
     writeFile("a.jpg");
     writeFile("b.jpg");
@@ -724,8 +766,8 @@ describe("scanThumbnails", () => {
     seedCache("b.jpg", "hashb");
 
     const prober = fakeProber({ "a.jpg": JPEG_IMAGE, "b.jpg": JPEG_IMAGE });
-    const scanned: number[] = [];
-    const totals: { total: number; final: boolean }[] = [];
+    const estimates: number[] = [];
+    const updates: { discovered: number; completed: number; final: boolean }[] = [];
     const pool = new PQueue({ concurrency: 4 });
     await scanThumbnails(
       root,
@@ -740,26 +782,23 @@ describe("scanThumbnails", () => {
       pool,
       8,
       false,
-      (n) => scanned.push(n),
-      undefined,
-      (total, final) => totals.push({ total, final }),
+      (total) => estimates.push(total),
+      (discovered, completed, final) => updates.push({ discovered, completed, final }),
     );
 
-    // The last word is the real walk's own count, marked final -- and it
-    // agrees with what the walk actually reported as its numerator.
-    expect(totals.at(-1)).toEqual({ total: scanned.at(-1), final: true });
-    expect(scanned.at(-1)).toBe(3);
-    // Nothing published a total before that one claimed to be final.
-    expect(totals.slice(0, -1).every((t) => !t.final)).toBe(true);
+    expect(estimates.at(-1)).toBe(2);
+    expect(updates.at(-1)).toEqual({ discovered: 2, completed: 2, final: true });
+    expect(updates.slice(0, -1).every((update) => !update.final)).toBe(true);
   });
 
-  it("never fires onGenerationProgress for state or cleanup, which never generate anything", async () => {
+  it("reports progress and processed activity for state without generating", async () => {
     createGeneratePolicy("*.jpg");
     writeFile("new.jpg");
     seedCache("new.jpg", "abc");
 
     const prober = fakeProber({ "new.jpg": JPEG_IMAGE });
-    const updates: unknown[] = [];
+    const updates: { discovered: number; completed: number; final: boolean }[] = [];
+    const activities: { verb: string; path: string }[] = [];
     const pool = new PQueue({ concurrency: 4 });
     await scanThumbnails(
       root,
@@ -774,11 +813,14 @@ describe("scanThumbnails", () => {
       pool,
       8,
       false,
-      undefined,
-      (total, generated) => updates.push({ total, generated }),
+      () => {},
+      (discovered, completed, final) => updates.push({ discovered, completed, final }),
+      (verb, path) => activities.push({ verb, path }),
     );
 
-    expect(updates).toEqual([]);
+    expect(updates.at(-1)).toEqual({ discovered: 1, completed: 1, final: true });
+    expect(activities).toContainEqual({ verb: "processing", path: "new.jpg" });
+    expect(activities.at(-1)).toEqual({ verb: "processed", path: "new.jpg" });
   });
 
   it("generates a video mosaic via generateVideoMosaic, sized from the matching policy's tile settings", async () => {
@@ -812,9 +854,9 @@ describe("scanThumbnails", () => {
 
     expect(stats).toMatchObject({ toGenerate: 1 });
     expect(generator.videoCalls).toHaveLength(1);
-    expect(generator.videoCalls[0]).toMatchObject({
-      destPath: path.join(root, `_thumbnail/clip.mp4.${VIDEO_PARAMS}.vid1.jpg`),
-    });
+    expect(finalPathForStagedThumbnail(generator.videoCalls[0]!.destPath)).toBe(
+      path.join(root, `_thumbnail/clip.mp4.${VIDEO_PARAMS}.vid1.jpg`),
+    );
   });
 
   it("generates via generateVideoPreview for an 'output_type=preview' policy -- .gif extension, no jpegQuality in the params segment", async () => {
@@ -848,12 +890,12 @@ describe("scanThumbnails", () => {
     expect(stats).toMatchObject({ toGenerate: 1 });
     expect(generator.videoCalls).toHaveLength(0); // mosaic generator untouched
     expect(generator.gifCalls).toHaveLength(1);
-    expect(generator.gifCalls[0]).toMatchObject({
-      destPath: path.join(
+    expect(finalPathForStagedThumbnail(generator.gifCalls[0]!.destPath)).toBe(
+      path.join(
         root,
         "_thumbnail/clip.mp4.p2-gifpolicy-ss32-fc6-fd100-fmtimage_gif-mc256-dtsierra2_4a.vid1.gif",
       ),
-    });
+    );
 
     // Up to date on the next run -- the .gif extension round-trips through
     // parseThumbnailEntry/expectedThumbExtension correctly.
@@ -958,8 +1000,10 @@ describe("scanThumbnails", () => {
     expect(generator.imageCalls[0]).toMatchObject({
       width: 133,
       height: 100,
-      destPath: path.join(root, "_thumbnail/photo.jpg.p2-short-ss100-fmtimage_jpeg-q80.abc.jpg"),
     });
+    expect(finalPathForStagedThumbnail(generator.imageCalls[0]!.destPath)).toBe(
+      path.join(root, "_thumbnail/photo.jpg.p2-short-ss100-fmtimage_jpeg-q80.abc.jpg"),
+    );
   });
 
   it("the thumbnail's extension comes from the policy's output_mime alone, never the source's own extension/mime type -- a source ImageMagick can read but not write (e.g. CR2) is no longer special-cased", async () => {

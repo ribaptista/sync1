@@ -3,6 +3,7 @@ import path from "node:path";
 import type PQueue from "p-queue";
 import type { Logger } from "../logger.js";
 import { walk } from "./walker.js";
+import { inTreeTempPathPreservingExtension } from "./temp-path.js";
 import { matchesAnyGlob, literalPrefixOf } from "./glob-match.js";
 import {
   waitForRoom,
@@ -10,7 +11,6 @@ import {
   dispatchTracked,
   throwIfPoolErrored,
 } from "../concurrency/pools.js";
-import { enumerateThumbnailScan } from "./thumbnail-enumerate.js";
 import type { EnumerationControl } from "./update-cache-enumerate.js";
 import type { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
 import type {
@@ -306,14 +306,6 @@ interface ProvisionalDecisionProbed {
   resolution: PolicyResolution;
 }
 
-interface ProvisionalDecisionStub {
-  kind: "stub";
-  relativePath: string;
-  cacheHash: string | null;
-}
-
-type ProvisionalDecision = ProvisionalDecisionProbed | ProvisionalDecisionStub;
-
 /**
  * One thumbnail `ensure` has decided to generate, held until every
  * decision has been made. Reconciliation used to dispatch these as it
@@ -323,12 +315,6 @@ type ProvisionalDecision = ProvisionalDecisionProbed | ProvisionalDecisionStub;
  * the old file is deleted inside the job, and it's also what picks the
  * right word for a failure's log line.
  */
-interface GenerationJob {
-  decision: ProvisionalDecisionProbed;
-  policy: ThumbnailPolicyGenerateRow;
-  staleThumbnail: ExistingThumbnailFile | undefined;
-}
-
 /**
  * A pure map from what the policy declares it will produce to the file
  * extension that names it -- the source's own extension/mime type plays no
@@ -379,14 +365,6 @@ async function classifyProbed(
  * `update-cache.ts` populates a stub's cache row straight from
  * `readStubHash`, exactly as reliable as a real file's hash would be.
  */
-function classifyStub(
-  relativePath: string,
-  cacheRepo: CacheEntriesRepository,
-): ProvisionalDecisionStub {
-  const cacheRow = cacheRepo.get(relativePath);
-  return { kind: "stub", relativePath, cacheHash: cacheRow?.hash ?? null };
-}
-
 function deleteThumbnailFile(root: string, thumb: ExistingThumbnailFile): void {
   const absolutePath = path.join(root, thumb.relativePath);
   if (fs.existsSync(absolutePath)) fs.rmSync(absolutePath);
@@ -418,8 +396,6 @@ async function generateForDecision(
   generator: ThumbnailGenerator,
   logger: Logger,
 ): Promise<void> {
-  if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
-
   const thumbExt = expectedThumbExtension(policy);
   const paramsSegment = expectedParamsSegment(policy);
   const destRelativePath = thumbnailRelativePath(
@@ -430,103 +406,435 @@ async function generateForDecision(
   );
   const destAbsolutePath = path.join(root, destRelativePath);
   fs.mkdirSync(path.dirname(destAbsolutePath), { recursive: true });
+  const tempAbsolutePath = inTreeTempPathPreservingExtension(destAbsolutePath);
   const sourceAbsolutePath = path.join(root, decision.relativePath);
 
-  if (decision.probed.kind === "image") {
-    if (policy.mediaType !== "image") {
-      throw new Error(
-        `internal error: matched policy media type "${policy.mediaType}" doesn't agree with probed kind "image" for "${decision.relativePath}"`,
-      );
-    }
-    const source = { width: decision.probed.width, height: decision.probed.height };
-    const size =
-      policy.resizingStrategy === "fit_to_box"
-        ? computeContainFitSize(source, { width: policy.imageWidth, height: policy.imageHeight })
-        : computeShorterSideFitSize(source, policy.shorterSide);
-    await generator.generateImageThumbnail(
-      {
-        sourcePath: sourceAbsolutePath,
-        destPath: destAbsolutePath,
-        width: size.width,
-        height: size.height,
-        encoding: policy,
-      },
-      logger,
-    );
-  } else {
-    if (policy.mediaType !== "video") {
-      throw new Error(
-        `internal error: matched policy media type "${policy.mediaType}" doesn't agree with probed kind "video" for "${decision.relativePath}"`,
-      );
-    }
-    if (policy.outputType === "mosaic") {
-      await generator.generateVideoMosaic(
+  try {
+    if (decision.probed.kind === "image") {
+      if (policy.mediaType !== "image") {
+        throw new Error(
+          `internal error: matched policy media type "${policy.mediaType}" doesn't agree with probed kind "image" for "${decision.relativePath}"`,
+        );
+      }
+      const source = { width: decision.probed.width, height: decision.probed.height };
+      const size =
+        policy.resizingStrategy === "fit_to_box"
+          ? computeContainFitSize(source, { width: policy.imageWidth, height: policy.imageHeight })
+          : computeShorterSideFitSize(source, policy.shorterSide);
+      await generator.generateImageThumbnail(
         {
           sourcePath: sourceAbsolutePath,
-          destPath: destAbsolutePath,
-          sourceWidth: decision.probed.width,
-          sourceHeight: decision.probed.height,
-          durationSeconds: decision.probed.durationSeconds,
-          tileRowCount: policy.tileRowCount,
-          tileColumnCount: policy.tileColumnCount,
-          shorterSide: policy.shorterSide,
+          destPath: tempAbsolutePath,
+          width: size.width,
+          height: size.height,
           encoding: policy,
         },
         logger,
       );
     } else {
-      await generator.generateVideoPreview(
-        {
-          sourcePath: sourceAbsolutePath,
-          destPath: destAbsolutePath,
-          sourceWidth: decision.probed.width,
-          sourceHeight: decision.probed.height,
-          durationSeconds: decision.probed.durationSeconds,
-          frameCount: policy.frameCount,
-          frameDelayMs: policy.frameDelayMs,
-          shorterSide: policy.shorterSide,
-          encoding: policy,
-        },
-        logger,
+      if (policy.mediaType !== "video") {
+        throw new Error(
+          `internal error: matched policy media type "${policy.mediaType}" doesn't agree with probed kind "video" for "${decision.relativePath}"`,
+        );
+      }
+      if (policy.outputType === "mosaic") {
+        await generator.generateVideoMosaic(
+          {
+            sourcePath: sourceAbsolutePath,
+            destPath: tempAbsolutePath,
+            sourceWidth: decision.probed.width,
+            sourceHeight: decision.probed.height,
+            durationSeconds: decision.probed.durationSeconds,
+            tileRowCount: policy.tileRowCount,
+            tileColumnCount: policy.tileColumnCount,
+            shorterSide: policy.shorterSide,
+            encoding: policy,
+          },
+          logger,
+        );
+      } else {
+        await generator.generateVideoPreview(
+          {
+            sourcePath: sourceAbsolutePath,
+            destPath: tempAbsolutePath,
+            sourceWidth: decision.probed.width,
+            sourceHeight: decision.probed.height,
+            durationSeconds: decision.probed.durationSeconds,
+            frameCount: policy.frameCount,
+            frameDelayMs: policy.frameDelayMs,
+            shorterSide: policy.shorterSide,
+            encoding: policy,
+          },
+          logger,
+        );
+      }
+    }
+    fs.renameSync(tempAbsolutePath, destAbsolutePath);
+    if (staleThumbnail) deleteThumbnailFile(root, staleThumbnail);
+  } catch (error) {
+    fs.rmSync(tempAbsolutePath, { force: true });
+    throw error;
+  }
+}
+
+/** How many candidates between published work estimates. */
+const PUBLISH_ESTIMATE_EVERY_ROWS = 512;
+
+function expectedThumbnailExists(
+  root: string,
+  relativePath: string,
+  hash: string,
+  policy: ThumbnailPolicyGenerateRow,
+): boolean {
+  return fs.existsSync(
+    path.join(
+      root,
+      thumbnailRelativePath(
+        relativePath,
+        expectedParamsSegment(policy),
+        hash,
+        expectedThumbExtension(policy),
+      ),
+    ),
+  );
+}
+
+function matchingGenerateGlobs(
+  relativePath: string,
+  policies: readonly ThumbnailPolicyRow[],
+): ThumbnailPolicyGenerateRow[] {
+  return policies.filter(
+    (policy): policy is ThumbnailPolicyGenerateRow =>
+      policy.action === "generate" && matchesAnyGlob(relativePath, [policy.glob]).matched,
+  );
+}
+
+function hasMatchingSkipGlob(
+  relativePath: string,
+  policies: readonly ThumbnailPolicyRow[],
+): boolean {
+  return policies.some(
+    (policy) => policy.action === "skip" && matchesAnyGlob(relativePath, [policy.glob]).matched,
+  );
+}
+
+function shouldProcessSource(
+  mode: ThumbnailRunMode,
+  root: string,
+  relativePath: string,
+  hash: string | null,
+  policies: readonly ThumbnailPolicyRow[],
+): boolean {
+  if (!anyGlobMatches(relativePath, policies)) return false;
+  if (mode !== "ensure" || hash === null) return true;
+  if (hasMatchingSkipGlob(relativePath, policies)) return true;
+  return matchingGenerateGlobs(relativePath, policies).some(
+    (policy) => !expectedThumbnailExists(root, relativePath, hash, policy),
+  );
+}
+
+async function enumerateThumbnailWork(
+  root: string,
+  walkRoot: string,
+  literalPrefix: string,
+  mode: ThumbnailRunMode,
+  glob: string | undefined,
+  ignoreGlobs: readonly string[],
+  policies: readonly ThumbnailPolicyRow[],
+  cacheRepo: CacheEntriesRepository,
+  onEstimate: ((total: number) => void) | undefined,
+  logger: Logger,
+  control: EnumerationControl,
+): Promise<void> {
+  if (!onEstimate) return;
+
+  const generatePolicies = policies.filter(
+    (p): p is ThumbnailPolicyGenerateRow => p.action === "generate",
+  );
+  let estimated = 0;
+  let sincePublish = 0;
+
+  try {
+    for await (const fsEntry of walk(walkRoot)) {
+      if (control.stop) return;
+      if (fsEntry.type !== "file") continue;
+
+      const relativePath = literalPrefix ? `${literalPrefix}/${fsEntry.path}` : fsEntry.path;
+      if (isUnderThumbnailDir(relativePath)) continue;
+      if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
+      if (matchesAnyGlob(relativePath, ignoreGlobs).matched) continue;
+
+      const cacheRow = cacheRepo.get(relativePath);
+      const hash = cacheRow?.hash ?? null;
+      const relevantPolicies = generatePolicies.filter(
+        (policy) => matchesAnyGlob(relativePath, [policy.glob]).matched,
+      );
+      if (
+        relevantPolicies.length > 0 &&
+        shouldProcessSource(mode, root, relativePath, hash, policies)
+      ) {
+        estimated++;
+      }
+
+      if (++sincePublish >= PUBLISH_ESTIMATE_EVERY_ROWS) {
+        sincePublish = 0;
+        onEstimate(estimated);
+      }
+    }
+    onEstimate(estimated);
+  } catch (err) {
+    // Swallowed on purpose, same contract as every other enumeration pass
+    // in this codebase: this exists only to make the bar useful sooner,
+    // never to be a reason `ensure` itself fails.
+    logger.debug(
+      { err: err instanceof Error ? err.message : String(err) },
+      "thumbnail work estimate failed -- continuing without one",
+    );
+  }
+}
+
+async function forEachThumbnailForOriginal(
+  root: string,
+  originalRelativePath: string,
+  visit: (thumbnail: ExistingThumbnailFile) => void | Promise<void>,
+): Promise<number> {
+  const originalDir = path.dirname(originalRelativePath);
+  const thumbnailDir = path.join(
+    root,
+    originalDir === "." ? THUMBNAIL_DIR_NAME : originalDir,
+    originalDir === "." ? "" : THUMBNAIL_DIR_NAME,
+  );
+
+  let entries: fs.Dir;
+  try {
+    entries = await fs.promises.opendir(thumbnailDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw err;
+  }
+
+  let found = 0;
+  for await (const dirent of entries) {
+    if (!dirent.isFile()) continue;
+    const thumbnailRelativePath =
+      originalDir === "."
+        ? `${THUMBNAIL_DIR_NAME}/${dirent.name}`
+        : `${originalDir}/${THUMBNAIL_DIR_NAME}/${dirent.name}`;
+    const thumbnail = parseThumbnailEntry(thumbnailRelativePath);
+    if (!thumbnail || thumbnail.originalRelativePath !== originalRelativePath) continue;
+    found++;
+    await visit(thumbnail);
+  }
+  return found;
+}
+
+function removeIfCleanup(
+  root: string,
+  mode: ThumbnailRunMode,
+  thumbnail: ExistingThumbnailFile,
+): void {
+  if (mode === "cleanup") deleteThumbnailFile(root, thumbnail);
+}
+
+async function processStubSource(
+  root: string,
+  mode: ThumbnailRunMode,
+  relativePath: string,
+  cacheHash: string | null,
+  stats: ThumbnailScanStats,
+  deleteStaleStubPreviews: boolean,
+): Promise<void> {
+  if (cacheHash === null) {
+    stats.missingCacheEntry++;
+    return;
+  }
+
+  let hasMatchingHash = false;
+  const existingCount = await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
+    if (thumbnail.hash === cacheHash) hasMatchingHash = true;
+  });
+
+  if (hasMatchingHash) {
+    stats.stubbedPreserved++;
+    let keptOne = false;
+    await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
+      if (!keptOne && thumbnail.hash === cacheHash) {
+        keptOne = true;
+        return;
+      }
+      stats.toDelete++;
+      removeIfCleanup(root, mode, thumbnail);
+    });
+    return;
+  }
+
+  if (existingCount === 0) {
+    stats.stubbedOriginal++;
+    return;
+  }
+
+  await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
+    stats.staleStubPreviews.push({
+      path: relativePath,
+      thumbnailPath: thumbnail.relativePath,
+    });
+    if (mode === "cleanup" && deleteStaleStubPreviews) deleteThumbnailFile(root, thumbnail);
+  });
+}
+
+interface PolicyThumbnailState {
+  exact?: ExistingThumbnailFile | undefined;
+  stale?: ExistingThumbnailFile | undefined;
+}
+
+async function reconcileProbedSource(
+  root: string,
+  mode: ThumbnailRunMode,
+  decision: ProvisionalDecisionProbed | undefined,
+  relativePath: string,
+  generator: ThumbnailGenerator,
+  logger: Logger,
+  stats: ThumbnailScanStats,
+  onActivity?: (verb: string, relativePath: string) => void,
+): Promise<boolean> {
+  if (!decision || decision.resolution.action === "skip") {
+    await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
+      stats.toDelete++;
+      removeIfCleanup(root, mode, thumbnail);
+    });
+    return false;
+  }
+
+  if (decision.cacheHash === null) {
+    stats.missingCacheEntry++;
+    return false;
+  }
+
+  const states = new Map<string, PolicyThumbnailState>(
+    decision.resolution.policies.map((policy) => [policy.name, {}]),
+  );
+  const policiesByName = new Map(
+    decision.resolution.policies.map((policy) => [policy.name, policy]),
+  );
+
+  await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
+    const policy = policiesByName.get(thumbnail.policyName);
+    if (!policy) {
+      stats.toDelete++;
+      removeIfCleanup(root, mode, thumbnail);
+      return;
+    }
+
+    const state = states.get(policy.name)!;
+    const exact =
+      thumbnail.hash === decision.cacheHash &&
+      thumbnail.thumbExt === expectedThumbExtension(policy) &&
+      thumbnail.paramsSegment === expectedParamsSegment(policy);
+
+    if (exact && !state.exact) {
+      if (state.stale) {
+        stats.toDelete++;
+        removeIfCleanup(root, mode, state.stale);
+        state.stale = undefined;
+      }
+      state.exact = thumbnail;
+      return;
+    }
+
+    if (!exact && !state.exact && !state.stale) {
+      state.stale = thumbnail;
+      return;
+    }
+
+    stats.toDelete++;
+    removeIfCleanup(root, mode, thumbnail);
+  });
+
+  let generated = false;
+  for (const policy of decision.resolution.policies) {
+    const state = states.get(policy.name)!;
+    if (state.exact) {
+      stats.upToDate++;
+      continue;
+    }
+
+    if (state.stale) stats.toRegenerate++;
+    else stats.toGenerate++;
+    if (mode !== "ensure") continue;
+
+    onActivity?.("generating", relativePath);
+    try {
+      await generateForDecision(root, decision, policy, state.stale, generator, logger);
+      generated = true;
+      onActivity?.("generated", relativePath);
+    } catch (err) {
+      if (!(err instanceof ThumbnailGenerationError)) throw err;
+      stats.errors++;
+      logger.warn(
+        { path: relativePath, err: err.message },
+        state.stale
+          ? "thumbnail regeneration failed -- skipping"
+          : "thumbnail generation failed -- skipping",
       );
     }
+  }
+  return generated;
+}
+
+async function sweepUnprocessedThumbnails(
+  root: string,
+  walkRoot: string,
+  literalPrefix: string,
+  mode: ThumbnailRunMode,
+  glob: string | undefined,
+  ignoreGlobs: readonly string[],
+  policies: readonly ThumbnailPolicyRow[],
+  stats: ThumbnailScanStats,
+  onDiscovered: () => void,
+  onCompleted: () => void,
+  onActivity?: (verb: string, relativePath: string) => void,
+): Promise<void> {
+  for await (const fsEntry of walk(walkRoot)) {
+    if (fsEntry.type !== "file") continue;
+    const relativePath = literalPrefix ? `${literalPrefix}/${fsEntry.path}` : fsEntry.path;
+    const thumbnail = parseThumbnailEntry(relativePath);
+    if (!thumbnail) continue;
+
+    const originalAbsolutePath = path.join(root, thumbnail.originalRelativePath);
+    const originalExists =
+      fs.existsSync(originalAbsolutePath) || fs.existsSync(`${originalAbsolutePath}.stub`);
+    const sourceWasProcessed =
+      originalExists &&
+      (!glob || matchesAnyGlob(thumbnail.originalRelativePath, [glob]).matched) &&
+      !matchesAnyGlob(thumbnail.originalRelativePath, ignoreGlobs).matched &&
+      anyGlobMatches(thumbnail.originalRelativePath, policies);
+    if (sourceWasProcessed) continue;
+
+    onDiscovered();
+    onActivity?.("processing", thumbnail.relativePath);
+    stats.toDelete++;
+    removeIfCleanup(root, mode, thumbnail);
+    onActivity?.("processed", thumbnail.relativePath);
+    onCompleted();
   }
 }
 
 /**
- * Single filesystem walk shared by `state`/`ensure`/`cleanup` (never three
- * separate ones): classifies every candidate original -- against
- * `thumbnail_policies` for a real (or "both") entry, dispatched to `pool`
- * and mime-probed only once its path already matches some policy's glob;
- * or, for a stub, synchronously via a pure cache.db-hash lookup, no
- * probing or policy resolution at all (a stub has no real bytes to probe,
- * and none of that is needed for the only thing a stub decision can ever
- * do here: preserve, flag-stale, or leave-as-orphan an *existing*
- * thumbnail -- see `classifyStub`) -- while separately collecting every
- * existing `_thumbnail/` file it encounters along the way. Once the walk
- * (and its dispatched classification jobs) fully settles, every
- * provisional decision is reconciled against the collected existing-
- * thumbnail map, and whatever's left unclaimed in that map (an original
- * deleted/renamed, or simply outside this run's own `--glob`) becomes an
- * orphan, also counted under `toDelete`.
+ * Two concurrent streaming passes, matching update_cache's
+ * enumeration/execution shape. The advisory pass only walks, matches
+ * globs, reads cache hashes, and checks deterministic thumbnail paths; it
+ * never probes media. The authoritative pass repeats those cheap filters
+ * and dispatches one bounded job per source. That job probes, resolves
+ * MIME/skip policy, reconciles only that source's sibling `_thumbnail`
+ * entries, and immediately generates/reports/deletes as `mode` requires.
+ * No source decisions, generation jobs, or thumbnail paths are retained
+ * across sources.
  *
- * `state` only tallies; `ensure` dispatches actual generation for
- * to-generate/to-regenerate entries back through the same `pool` (deleting
- * the stale file first when regenerating, within that same job) -- never
- * for a stub, which is never a generation candidate; `cleanup`
- * synchronously deletes every `toDelete` file, and additionally a stale
- * stub preview's thumbnail when `deleteStaleStubPreviews` is set. A
- * per-file `ThumbnailGenerationError` is caught, tallied under `errors`,
- * and never aborts the run; anything else (in particular
- * `MediaToolMissingError`) propagates and aborts, since categorically
- * nothing can be thumbnailed at all without the tool.
- *
- * `onProgress` covers the filesystem-walk phase only (every mode).
- * `onGenerationProgress` covers `ensure`'s own generation phase
- * separately -- deliberately not folded into `onProgress`'s own
- * cumulative count, since "files scanned" and "thumbnails generated" are
- * different units caller-side progress reporting needs to track
- * independently (see `runThumbnailMode` in `src/commands/thumbnail.ts`).
+ * Progress is one unit per source, even when several generate policies
+ * produce several outputs. Every dispatched source resolves its unit in a
+ * `finally`, including MIME/skip rejection and handled generation failure.
+ * A final streaming thumbnail sweep handles missing originals and sources
+ * excluded by glob/ignore/policy without building an orphan map.
  *
  * `ignoreGlobs` (`IgnorePoliciesRepository.listGlobs()`, same precedent as
  * `update_cache`/`sanity_check`/`apply-remote-changes`'s own ignore-policy
@@ -563,26 +871,9 @@ export async function scanThumbnails(
    * explicit opt-in at every call site.
    */
   deleteStaleStubPreviews: boolean,
-  onProgress?: (scanned: number) => void,
-  /**
-   * `ensure`-only: fires once as the generation phase opens, then once per
-   * completed generation attempt (success or failure, from a `finally`).
-   * `total` is the *exact, final* number of thumbnails this run will
-   * generate -- every candidate is already known by the time the first one
-   * is dispatched, so it is correct from the very first call and never
-   * revised; `generated` is the running count so far, not a delta. Never
-   * fires at all for `state`/`cleanup`, since neither mode ever generates
-   * anything.
-   */
-  onGenerationProgress?: (total: number, generated: number) => void,
-  /**
-   * Fires with the walk phase's running entry total, then once more with
-   * the real walk's own final count (`final: true`) once the walk has
-   * settled. Pairs with `onProgress`'s numerator -- same unit, every
-   * walked entry -- so the two together make a real ratio rather than a
-   * count standing in for its own total. See thumbnail-enumerate.ts.
-   */
-  onScanTotalKnown?: (total: number, final: boolean) => void,
+  onWorkEstimate?: (total: number) => void,
+  onWorkProgress?: (discovered: number, completed: number, final: boolean) => void,
+  onActivity?: (verb: string, relativePath: string) => void,
 ): Promise<ThumbnailScanStats> {
   const stats: ThumbnailScanStats = {
     upToDate: 0,
@@ -600,243 +891,112 @@ export async function scanThumbnails(
   const walkRoot = literalPrefix ? path.join(root, literalPrefix) : root;
   if (!fs.existsSync(walkRoot)) return stats; // --glob's literal prefix doesn't exist -- nothing to do, not an error
 
-  const existingThumbnails = new Map<string, ExistingThumbnailFile[]>();
-  const decisions: ProvisionalDecision[] = [];
-  // See dispatchTracked's own doc comment (src/concurrency/pools.ts): the
-  // classification pool's own onIdle() alone can't tell this function a
-  // dispatched job threw (in particular, a MediaToolMissingError -- see
-  // this function's own doc comment on why that must abort the whole run),
-  // since a rejection just discarded by `void pool.add(...)` becomes an
-  // unhandled one -- this is what turns that into a real, catchable error
-  // instead. A second, separate box covers the generation phase below --
-  // they read more clearly kept apart, and this one's own check fires
-  // before generation ever starts anyway.
-  const classifyPoolErrors = createPoolErrorBox();
-
-  // Started, deliberately not awaited: it counts the same entries this
-  // walk is about to visit, concurrently, so the denominator is known
-  // within a walk rather than only once the last probe lands.
-  const enumerationControl: EnumerationControl = { stop: false };
-  const enumeration = enumerateThumbnailScan(
+  const poolErrors = createPoolErrorBox();
+  const estimationControl: EnumerationControl = { stop: false };
+  const estimation = enumerateThumbnailWork(
+    root,
     walkRoot,
-    onScanTotalKnown,
+    literalPrefix,
+    mode,
+    glob,
+    ignoreGlobs,
+    policies,
+    cacheRepo,
+    onWorkEstimate,
     logger,
-    enumerationControl,
+    estimationControl,
   );
 
-  let scanned = 0;
+  let discovered = 0;
+  let completed = 0;
+  const discoveredOne = (): void => {
+    discovered++;
+    onWorkProgress?.(discovered, completed, false);
+  };
+  const completedOne = (): void => {
+    completed++;
+    onWorkProgress?.(discovered, completed, false);
+  };
+
   try {
     for await (const fsEntry of walk(walkRoot)) {
-      scanned++;
-      onProgress?.(scanned);
-      if (fsEntry.type === "dir") continue;
+      if (fsEntry.type !== "file") continue;
 
       const relativePath = literalPrefix ? `${literalPrefix}/${fsEntry.path}` : fsEntry.path;
-
-      const thumbnailEntry = parseThumbnailEntry(relativePath);
-      if (thumbnailEntry) {
-        const list = existingThumbnails.get(thumbnailEntry.originalRelativePath) ?? [];
-        list.push(thumbnailEntry);
-        existingThumbnails.set(thumbnailEntry.originalRelativePath, list);
-        continue;
-      }
-
+      if (isUnderThumbnailDir(relativePath)) continue;
       if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
       if (matchesAnyGlob(relativePath, ignoreGlobs).matched) continue;
       if (!anyGlobMatches(relativePath, policies)) continue;
 
+      const cacheHash = cacheRepo.get(relativePath)?.hash ?? null;
+      if (!shouldProcessSource(mode, root, relativePath, cacheHash, policies)) {
+        for (const policy of matchingGenerateGlobs(relativePath, policies)) {
+          if (cacheHash && expectedThumbnailExists(root, relativePath, cacheHash, policy)) {
+            stats.upToDate++;
+          }
+        }
+        continue;
+      }
+
+      discoveredOne();
       if (fsEntry.representation === "stub") {
-        // Synchronous, no subprocess -- no pool dispatch needed.
-        decisions.push(classifyStub(relativePath, cacheRepo));
+        onActivity?.("processing", relativePath);
+        await processStubSource(
+          root,
+          mode,
+          relativePath,
+          cacheHash,
+          stats,
+          deleteStaleStubPreviews,
+        );
+        completedOne();
         continue;
       }
 
       await waitForRoom(pool, poolQueueLimit);
-      dispatchTracked(pool, classifyPoolErrors, async () => {
-        const decision = await classifyProbed(relativePath, root, cacheRepo, policies, prober);
-        if (decision) decisions.push(decision);
+      dispatchTracked(pool, poolErrors, async () => {
+        onActivity?.("processing", relativePath);
+        try {
+          const decision = await classifyProbed(relativePath, root, cacheRepo, policies, prober);
+          const generated = await reconcileProbedSource(
+            root,
+            mode,
+            decision,
+            relativePath,
+            generator,
+            logger,
+            stats,
+            onActivity,
+          );
+          if (!generated) onActivity?.("processed", relativePath);
+        } finally {
+          completedOne();
+        }
         logger.debug({ pool: "thumbnail", inFlight: pool.pending, queued: pool.size }, "completed");
       });
       logger.debug({ pool: "thumbnail", inFlight: pool.pending, queued: pool.size }, "dispatched");
     }
 
     await pool.onIdle();
-    throwIfPoolErrored(classifyPoolErrors);
+    throwIfPoolErrored(poolErrors);
+
+    await sweepUnprocessedThumbnails(
+      root,
+      walkRoot,
+      literalPrefix,
+      mode,
+      glob,
+      ignoreGlobs,
+      policies,
+      stats,
+      discoveredOne,
+      completedOne,
+      onActivity,
+    );
   } finally {
-    // The walk is done (or has thrown), so whatever the counting pass has
-    // left to count is now worthless -- cut it short, join it so it can't
-    // publish after the fact, then publish the real walk's own count as
-    // the final word.
-    enumerationControl.stop = true;
-    await enumeration;
-    onScanTotalKnown?.(scanned, true);
-  }
-
-  const claimedOriginals = new Set<string>();
-  // Collected here, dispatched below: every generation candidate is known
-  // by the time this reconciliation loop ends, so collecting them first
-  // costs nothing and lets the generation phase open with its exact,
-  // final denominator instead of one that grows as jobs are dispatched --
-  // which, throttled by waitForRoom, is exactly as slowly as they finish.
-  const generationJobs: GenerationJob[] = [];
-
-  for (const decision of decisions) {
-    claimedOriginals.add(decision.relativePath);
-    const existing = existingThumbnails.get(decision.relativePath) ?? [];
-
-    if (decision.kind === "stub") {
-      if (decision.cacheHash === null) {
-        stats.missingCacheEntry++;
-        continue;
-      }
-
-      const match = existing.find((t) => t.hash === decision.cacheHash);
-      if (match) {
-        // Preserved -- any *other* existing entries are genuine leftover
-        // duplicates (e.g. from an earlier config change), cleaned up the
-        // same as any other extra, not reported as stale.
-        stats.stubbedPreserved++;
-        for (const thumb of existing) {
-          if (thumb === match) continue;
-          stats.toDelete++;
-          if (mode === "cleanup") deleteThumbnailFile(root, thumb);
-        }
-      } else if (existing.length > 0) {
-        // Stale, not orphaned: the stub's current content hash doesn't
-        // match any existing thumbnail, so none can be trusted as a
-        // preview of the file's actual current content -- but none can be
-        // regenerated either, without materializing the file first.
-        for (const thumb of existing) {
-          stats.staleStubPreviews.push({
-            path: decision.relativePath,
-            thumbnailPath: thumb.relativePath,
-          });
-          if (mode === "cleanup" && deleteStaleStubPreviews) deleteThumbnailFile(root, thumb);
-        }
-      } else {
-        stats.stubbedOriginal++;
-      }
-      continue;
-    }
-
-    if (decision.resolution.action === "skip") {
-      for (const thumb of existing) {
-        stats.toDelete++;
-        if (mode === "cleanup") deleteThumbnailFile(root, thumb);
-      }
-      continue;
-    }
-
-    if (decision.cacheHash === null) {
-      stats.missingCacheEntry++;
-      continue;
-    }
-
-    // An original can now match more than one 'generate' policy at once,
-    // each producing its own thumbnail -- so each policy is reconciled
-    // against `existing` independently, keyed by its own params segment
-    // (which embeds the policy's name, so two policies' outputs for the
-    // same original never collide). `claimedThumbs` tracks which existing
-    // files any policy accounted for; whatever's left over at the end --
-    // an orphan from a deleted/renamed policy, or a leftover duplicate --
-    // is swept the same way a single-policy setup always has been.
-    const claimedThumbs = new Set<ExistingThumbnailFile>();
-
-    for (const policy of decision.resolution.policies) {
-      const expectedExt = expectedThumbExtension(policy);
-      const expectedParams = expectedParamsSegment(policy);
-      const upToDateMatch = existing.find(
-        (t) =>
-          t.hash === decision.cacheHash &&
-          t.thumbExt === expectedExt &&
-          t.paramsSegment === expectedParams,
-      );
-
-      if (upToDateMatch) {
-        stats.upToDate++;
-        claimedThumbs.add(upToDateMatch);
-        continue;
-      }
-
-      // Not up to date for *this* policy specifically -- an existing file
-      // whose params segment names this same policy (by name, regardless
-      // of whether its *other* fields -- a resized box, say -- have since
-      // changed) is this policy's own previous output, safe to delete-
-      // and-regenerate; absent that, this policy has never produced
-      // anything for this original before, so it's a fresh generation,
-      // not a regeneration. Matching by name rather than the whole
-      // segment is what lets an ordinary config edit (not a rename) still
-      // read as "regenerate", exactly as it always has.
-      const staleForThisPolicy = existing.find((t) => t.policyName === policy.name);
-      if (staleForThisPolicy) {
-        stats.toRegenerate++;
-        claimedThumbs.add(staleForThisPolicy);
-        if (mode === "ensure") {
-          generationJobs.push({ decision, policy, staleThumbnail: staleForThisPolicy });
-        }
-      } else {
-        stats.toGenerate++;
-        if (mode === "ensure") {
-          generationJobs.push({ decision, policy, staleThumbnail: undefined });
-        }
-      }
-    }
-
-    for (const thumb of existing) {
-      if (claimedThumbs.has(thumb)) continue;
-      stats.toDelete++;
-      if (mode === "cleanup") deleteThumbnailFile(root, thumb);
-    }
-  }
-
-  if (mode === "ensure") {
-    let completedGeneration = 0;
-    // Published before the first dispatch, and never revised: this is the
-    // whole generation phase's denominator, not a running discovery count.
-    onGenerationProgress?.(generationJobs.length, completedGeneration);
-    // A second, separate box from classifyPoolErrors above -- a
-    // ThumbnailGenerationError is deliberately swallowed below (tallied
-    // under stats.errors, non-fatal), but anything else (in particular
-    // MediaToolMissingError) is rethrown and must still abort the run
-    // cleanly rather than becoming an unhandled rejection.
-    const generatePoolErrors = createPoolErrorBox();
-    for (const job of generationJobs) {
-      await waitForRoom(pool, poolQueueLimit);
-      dispatchTracked(pool, generatePoolErrors, async () => {
-        try {
-          await generateForDecision(
-            root,
-            job.decision,
-            job.policy,
-            job.staleThumbnail,
-            generator,
-            logger,
-          );
-        } catch (err) {
-          if (!(err instanceof ThumbnailGenerationError)) throw err;
-          stats.errors++;
-          logger.warn(
-            { path: job.decision.relativePath, err: err.message },
-            job.staleThumbnail
-              ? "thumbnail regeneration failed -- skipping"
-              : "thumbnail generation failed -- skipping",
-          );
-        } finally {
-          completedGeneration++;
-          onGenerationProgress?.(generationJobs.length, completedGeneration);
-        }
-      });
-    }
-    await pool.onIdle();
-    throwIfPoolErrored(generatePoolErrors);
-  }
-
-  for (const [originalPath, thumbs] of existingThumbnails) {
-    if (claimedOriginals.has(originalPath)) continue;
-    for (const thumb of thumbs) {
-      stats.toDelete++;
-      if (mode === "cleanup") deleteThumbnailFile(root, thumb);
-    }
+    estimationControl.stop = true;
+    await estimation;
+    onWorkProgress?.(discovered, completed, true);
   }
 
   return stats;

@@ -90,20 +90,24 @@ describe("walk", () => {
     fs.mkdirSync(path.join(root, "nested"));
     fs.writeFileSync(path.join(root, "nested", "video.mp4"), "real content");
     fs.writeFileSync(path.join(root, "nested", "video.mp4.sync1-tmp-deadbeef"), "half-written");
+    fs.writeFileSync(path.join(root, "nested", "video.sync1-tmp-cafebabe.mp4"), "half-written");
 
     const paths = await collectPaths(root);
     expect(paths).toEqual(["nested", "nested/video.mp4", "photo.jpg"]);
   });
 
-  it("does not exclude a real file that merely contains the temp-name shape as a substring, not a suffix", async () => {
+  it("does not exclude a real file that contains the temp-name shape away from its final extension", async () => {
     // The regex is suffix-anchored -- a real filename that happens to
     // contain something matching sync1-tmp-XXXXXXXX in the *middle* is
     // not a temp file and must not be excluded.
     const root = mkTempDir();
-    fs.writeFileSync(path.join(root, "photo.jpg.sync1-tmp-a1b2c3d4.jpg"), "real, just an odd name");
+    fs.writeFileSync(
+      path.join(root, "photo.sync1-tmp-a1b2c3d4.jpg.backup"),
+      "real, just an odd name",
+    );
 
     const paths = await collectPaths(root);
-    expect(paths).toEqual(["photo.jpg.sync1-tmp-a1b2c3d4.jpg"]);
+    expect(paths).toEqual(["photo.sync1-tmp-a1b2c3d4.jpg.backup"]);
   });
 
   it("yields nothing for an empty directory", async () => {
