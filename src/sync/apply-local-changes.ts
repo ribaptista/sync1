@@ -352,11 +352,19 @@ export async function applyLocalChangesToCandidate(
         // never had an objects row for this hash at all -- has to be
         // written now, not just the entries row, or a later dedup-attach
         // in this same batch couldn't find it either.
+        //
+        // The checksum comes from the HEAD above rather than being left
+        // NULL: this row is the only one this object will ever get (a
+        // later run takes the objectsRepo.has(hash) shortcut and never
+        // re-upserts), so a NULL here is permanent, and would silently
+        // cost this object the remote content-audit 0006 exists for. Still
+        // tolerates absence -- an object predating checksums has none for
+        // S3 to report, and NULL means "unknown", never "mismatched".
         objectsRepo.upsert({
           hash,
           s3_key: existingKey,
           size: row.size!,
-          ciphertext_checksum: null,
+          ciphertext_checksum: head.checksumCrc64Nvme ?? null,
         });
         entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
         progress.rowResolved();

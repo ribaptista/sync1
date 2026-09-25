@@ -14,7 +14,8 @@ vi.mock("@aws-sdk/lib-storage", () => ({
   }),
 }));
 
-const { putObjectStream, MULTIPART_THRESHOLD_BYTES } = await import("../../../src/s3/client.js");
+const { putObjectStream, headObject, MULTIPART_THRESHOLD_BYTES } =
+  await import("../../../src/s3/client.js");
 
 function makeStream(content: string): Readable {
   return Readable.from([Buffer.from(content)]);
@@ -187,5 +188,50 @@ describe("putObjectStream: checksum verification", () => {
       MULTIPART_THRESHOLD_BYTES,
     );
     expect(result).toBe(REAL_CHECKSUM);
+  });
+});
+
+describe("headObject", () => {
+  /**
+   * S3 omits `ChecksumCRC64NVME` from a HeadObject response entirely unless
+   * the request asks for it, even when the object genuinely has one stored.
+   * That omission is what let the aborted-run recovery path in
+   * apply-local-changes.ts record a NULL `ciphertext_checksum` for an object
+   * S3 could have described -- permanently, since every later run takes the
+   * `objectsRepo.has(hash)` shortcut and never re-upserts that row.
+   */
+  it("asks for the checksum, and surfaces it when S3 reports one", async () => {
+    const send = vi.fn(async (_command: unknown) => ({
+      ETag: '"head-etag"',
+      ChecksumCRC64NVME: "Zm9vYmFyMDA=",
+    }));
+
+    const head = await headObject(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { send } as any,
+      "bucket",
+      "objects/present",
+    );
+
+    const command = send.mock.calls[0]![0] as { input: { ChecksumMode?: string } };
+    expect(command.input.ChecksumMode).toBe("ENABLED");
+    expect(head?.checksumCrc64Nvme).toBe("Zm9vYmFyMDA=");
+  });
+
+  it("leaves the checksum absent when S3 reports none, rather than inventing one", async () => {
+    // An object predating this vault asking for checksums at all has none
+    // for S3 to report -- absent must stay absent, so it lands as a NULL
+    // meaning "unknown", never a wrong value.
+    const send = vi.fn(async (_command: unknown) => ({ ETag: '"head-etag"' }));
+
+    const head = await headObject(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { send } as any,
+      "bucket",
+      "objects/legacy",
+    );
+
+    expect(head?.etag).toBe('"head-etag"');
+    expect(head?.checksumCrc64Nvme).toBeUndefined();
   });
 });

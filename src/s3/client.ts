@@ -236,6 +236,15 @@ export interface HeadResult {
   etag: string;
   storageClass?: string;
   restore?: string;
+  /**
+   * The object's full-object CRC64NVME checksum, base64 -- the exact value
+   * `putObjectStream` computes and returns on upload, and what
+   * `objects.ciphertext_checksum` stores (see src/s3/checksum.ts and
+   * 0006_add_object_ciphertext_checksum.sql). Absent unless S3 actually
+   * has one recorded for the object: an object uploaded before this vault
+   * asked for checksums at all has none to report.
+   */
+  checksumCrc64Nvme?: string;
 }
 
 export async function headObject(
@@ -244,11 +253,22 @@ export async function headObject(
   key: string,
 ): Promise<HeadResult | null> {
   try {
-    const result = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    // ChecksumMode "ENABLED" is required to get `ChecksumCRC64NVME` back at
+    // all -- without it S3 omits the field even for an object that does
+    // have one stored, which is exactly how the aborted-run recovery path
+    // in apply-local-changes.ts ended up recording a NULL checksum for an
+    // object S3 could have told it about. Costs nothing extra: HeadObject
+    // already requires the same s3:GetObject permission either way.
+    const result = await client.send(
+      new HeadObjectCommand({ Bucket: bucket, Key: key, ChecksumMode: "ENABLED" }),
+    );
     if (!result.ETag) throw new Error(`HeadObject for "${key}" did not return an ETag`);
     const head: HeadResult = { etag: result.ETag };
     if (result.StorageClass !== undefined) head.storageClass = result.StorageClass;
     if (result.Restore !== undefined) head.restore = result.Restore;
+    if (result.ChecksumCRC64NVME !== undefined) {
+      head.checksumCrc64Nvme = result.ChecksumCRC64NVME;
+    }
     return head;
   } catch (err) {
     if (err instanceof Error && err.name === "NotFound") return null;

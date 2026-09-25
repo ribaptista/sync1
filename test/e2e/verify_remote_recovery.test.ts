@@ -12,9 +12,11 @@ import {
 import { runCli } from "./helpers/cli.js";
 import { parseManifest, unlockVault } from "../../src/vault/manifest.js";
 import { parseRemoteConfig } from "../../src/vault/remote-config.js";
+import Database from "better-sqlite3";
 import {
   localVaultJsonPath,
   localRemoteConfigPath,
+  localStateDbPath,
   localUploadInProgressMarkerPath,
 } from "../../src/vault/local-dir.js";
 import {
@@ -137,6 +139,26 @@ describe("sync recovers from a prior aborted run's already-uploaded object", () 
     // Cleared on this run's own clean exit -- nothing left for a future
     // run to need recovery protection against.
     expect(fs.existsSync(localUploadInProgressMarkerPath(root))).toBe(false);
+
+    // The recovered object's row carries the checksum S3 already had, not a
+    // NULL. This is the only row this object will ever get: every later run
+    // takes apply-local-changes.ts's `objectsRepo.has(hash)` shortcut, which
+    // returns before the HEAD and never re-upserts -- so a NULL recorded
+    // here is permanent, and silently costs this object the remote
+    // content-audit that 0006_add_object_ciphertext_checksum.sql exists to
+    // make possible. Asserted against what S3 itself reports, so a value
+    // that's merely non-NULL but wrong fails too.
+    const headWithChecksum = await s3.send(
+      new HeadObjectCommand({ Bucket: bucket, Key: key, ChecksumMode: "ENABLED" }),
+    );
+    expect(headWithChecksum.ChecksumCRC64NVME).toEqual(expect.any(String));
+
+    const stateDb = new Database(localStateDbPath(root), { readonly: true });
+    const objectRow = stateDb
+      .prepare("SELECT ciphertext_checksum FROM objects WHERE hash = ?")
+      .get(hash) as { ciphertext_checksum: string | null } | undefined;
+    stateDb.close();
+    expect(objectRow?.ciphertext_checksum).toBe(headWithChecksum.ChecksumCRC64NVME);
 
     // And the path is genuinely, correctly tracked now: a follow-up
     // update_cache sees nothing left dirty.
