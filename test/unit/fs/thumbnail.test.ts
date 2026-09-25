@@ -156,10 +156,6 @@ function fakeGenerator(failFor: Set<string> = new Set()): ThumbnailGenerator & {
   };
 }
 
-function finalPathForStagedThumbnail(stagedPath: string): string {
-  return stagedPath.replace(/\.sync1-tmp-[0-9a-f]{8}(?=\.[^./]+$)/, "");
-}
-
 function run(
   mode: "state" | "ensure" | "cleanup",
   glob: string | undefined,
@@ -247,14 +243,48 @@ describe("scanThumbnails", () => {
     expect(ensureStats).toMatchObject({ toGenerate: 1 });
     expect(generator.imageCalls).toHaveLength(1);
     expect(generator.imageCalls[0]).toMatchObject({ width: 320, height: 240 });
+    // Generation stages into an opaque temp sibling -- named independently
+    // of the destination, so only its directory and extension are its
+    // caller's business. The destination itself is asserted on disk below,
+    // after the rename that publishes it.
     expect(generator.imageCalls[0]!.destPath).toMatch(
-      new RegExp(
-        `^${path.join(root, `_thumbnail/new\\.jpg\\.${IMAGE_PARAMS}\\.def456`)}\\.sync1-tmp-[0-9a-f]{8}\\.jpg$`,
-      ),
+      new RegExp(`^${path.join(root, "_thumbnail")}/\\.sync1-tmp-[0-9a-f]{32}\\.jpg$`),
     );
     expect(fs.existsSync(path.join(root, `_thumbnail/new.jpg.${IMAGE_PARAMS}.def456.jpg`))).toBe(
       true,
     );
+  });
+
+  /**
+   * The regression this file's staging-path shape exists for. A temp name
+   * built by *extending* the destination's own is longer than the
+   * destination, so a source whose final thumbnail name is legal could
+   * still have an illegal staging name -- a real 239-byte thumbnail name
+   * became a 258-byte temp, past the 255-byte filename limit, and that
+   * file could never be generated on any run, ever.
+   */
+  it("generates for a source whose thumbnail name sits just inside the 255-byte filename limit", async () => {
+    // 196 + ".jpg" = a 200-byte source name, so the final thumbnail name
+    // lands at 245 bytes -- legal, but only 10 bytes of headroom.
+    const sourceName = `${"x".repeat(196)}.jpg`;
+    const thumbnailName = `${sourceName}.${IMAGE_PARAMS}.longhash.jpg`;
+    expect(Buffer.byteLength(thumbnailName)).toBeGreaterThan(237);
+    expect(Buffer.byteLength(thumbnailName)).toBeLessThanOrEqual(255);
+
+    createGeneratePolicy("*.jpg");
+    writeFile(sourceName);
+    seedCache(sourceName, "longhash");
+
+    const generator = fakeGenerator();
+    const stats = await run(
+      "ensure",
+      undefined,
+      fakeProber({ [sourceName]: JPEG_IMAGE }),
+      generator,
+    );
+
+    expect(stats).toMatchObject({ toGenerate: 1, errors: 0 });
+    expect(fs.existsSync(path.join(root, "_thumbnail", thumbnailName))).toBe(true);
   });
 
   it("reports toRegenerate for a stale existing thumbnail, and ensure deletes the old one before generating the new one", async () => {
@@ -465,15 +495,22 @@ describe("scanThumbnails", () => {
     expect(byWidth.get(999)).toMatchObject({
       height: 749,
     });
-    expect(finalPathForStagedThumbnail(byWidth.get(999)!.destPath)).toBe(
-      path.join(root, "_thumbnail/both.jpg.p2-big-iw999-ih999-fmtimage_jpeg-q80.abc.jpg"),
-    );
     expect(byWidth.get(100)).toMatchObject({
       height: 75,
     });
-    expect(finalPathForStagedThumbnail(byWidth.get(100)!.destPath)).toBe(
-      path.join(root, "_thumbnail/both.jpg.p2-small-iw100-ih100-fmtimage_jpeg-q80.abc.jpg"),
-    );
+    // Each policy's own output, published under its own params segment --
+    // asserted on disk, since the staging name each was written through
+    // carries nothing identifying back.
+    expect(
+      fs.existsSync(
+        path.join(root, "_thumbnail/both.jpg.p2-big-iw999-ih999-fmtimage_jpeg-q80.abc.jpg"),
+      ),
+    ).toBe(true);
+    expect(
+      fs.existsSync(
+        path.join(root, "_thumbnail/both.jpg.p2-small-iw100-ih100-fmtimage_jpeg-q80.abc.jpg"),
+      ),
+    ).toBe(true);
 
     // A second run finds both up to date, and deletes neither -- each
     // policy's own output is claimed by that same policy, not treated as
@@ -653,9 +690,10 @@ describe("scanThumbnails", () => {
     expect(stats.errors).toBe(1);
     expect(stats.toGenerate).toBe(2);
     expect(generator.imageCalls).toHaveLength(1);
-    expect(generator.imageCalls[0]!.destPath).toMatch(
-      /good\.jpg\..+\.b\.sync1-tmp-[0-9a-f]{8}\.jpg$/,
-    );
+    // The surviving call is identified by its source: the staging path it
+    // writes through is synthesized and names nothing.
+    expect(generator.imageCalls[0]!.sourcePath).toBe(path.join(root, "good.jpg"));
+    expect(fs.existsSync(path.join(root, `_thumbnail/good.jpg.${IMAGE_PARAMS}.b.jpg`))).toBe(true);
   });
 
   it("starts generation before discovery finalizes and advances once per resolved source", async () => {
@@ -854,8 +892,8 @@ describe("scanThumbnails", () => {
 
     expect(stats).toMatchObject({ toGenerate: 1 });
     expect(generator.videoCalls).toHaveLength(1);
-    expect(finalPathForStagedThumbnail(generator.videoCalls[0]!.destPath)).toBe(
-      path.join(root, `_thumbnail/clip.mp4.${VIDEO_PARAMS}.vid1.jpg`),
+    expect(fs.existsSync(path.join(root, `_thumbnail/clip.mp4.${VIDEO_PARAMS}.vid1.jpg`))).toBe(
+      true,
     );
   });
 
@@ -890,12 +928,14 @@ describe("scanThumbnails", () => {
     expect(stats).toMatchObject({ toGenerate: 1 });
     expect(generator.videoCalls).toHaveLength(0); // mosaic generator untouched
     expect(generator.gifCalls).toHaveLength(1);
-    expect(finalPathForStagedThumbnail(generator.gifCalls[0]!.destPath)).toBe(
-      path.join(
-        root,
-        "_thumbnail/clip.mp4.p2-gifpolicy-ss32-fc6-fd100-fmtimage_gif-mc256-dtsierra2_4a.vid1.gif",
+    expect(
+      fs.existsSync(
+        path.join(
+          root,
+          "_thumbnail/clip.mp4.p2-gifpolicy-ss32-fc6-fd100-fmtimage_gif-mc256-dtsierra2_4a.vid1.gif",
+        ),
       ),
-    );
+    ).toBe(true);
 
     // Up to date on the next run -- the .gif extension round-trips through
     // parseThumbnailEntry/expectedThumbExtension correctly.
@@ -1001,9 +1041,11 @@ describe("scanThumbnails", () => {
       width: 133,
       height: 100,
     });
-    expect(finalPathForStagedThumbnail(generator.imageCalls[0]!.destPath)).toBe(
-      path.join(root, "_thumbnail/photo.jpg.p2-short-ss100-fmtimage_jpeg-q80.abc.jpg"),
-    );
+    expect(
+      fs.existsSync(
+        path.join(root, "_thumbnail/photo.jpg.p2-short-ss100-fmtimage_jpeg-q80.abc.jpg"),
+      ),
+    ).toBe(true);
   });
 
   it("the thumbnail's extension comes from the policy's output_mime alone, never the source's own extension/mime type -- a source ImageMagick can read but not write (e.g. CR2) is no longer special-cased", async () => {

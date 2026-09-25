@@ -78,11 +78,9 @@ describe("stale temp files from an interrupted run", () => {
     // Exactly what an interrupted download (apply-remote-changes.ts) or
     // stub write (stub.ts) would have left behind, right next to a real,
     // genuinely-tracked file in the working tree.
+    const inTreeTempName = `.sync1-tmp-${"cafef00d".repeat(4)}`;
     fs.writeFileSync(path.join(root, "photo.jpg"), "real, tracked content");
-    fs.writeFileSync(
-      path.join(root, "photo.jpg.sync1-tmp-cafef00d"),
-      "half-downloaded, never renamed into place",
-    );
+    fs.writeFileSync(path.join(root, inTreeTempName), "half-downloaded, never renamed into place");
 
     const result = await runCli(["update_cache", "--root", root, "--json"]);
     expect(result.exitCode).toBe(0);
@@ -100,7 +98,7 @@ describe("stale temp files from an interrupted run", () => {
     // The in-tree temp file itself is untouched on disk (the walker just
     // never reports it as a tracked path -- sweeping it isn't this fix's
     // job, and it isn't in .sync1/ for the startup sweep to reach either).
-    expect(fs.existsSync(path.join(root, "photo.jpg.sync1-tmp-cafef00d"))).toBe(true);
+    expect(fs.existsSync(path.join(root, inTreeTempName))).toBe(true);
 
     fs.rmSync(root, { recursive: true, force: true });
   });

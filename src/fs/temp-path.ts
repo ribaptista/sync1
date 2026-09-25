@@ -8,32 +8,58 @@ export function tempSiblingPath(basePath: string, tag: string): string {
 }
 
 const IN_TREE_TEMP_SUFFIX = "sync1-tmp";
-const IN_TREE_TEMP_NAME_RE = /\.sync1-tmp-[0-9a-f]{8}(?:\.[^./]+)?$/;
+/**
+ * Anchored to the *whole* basename, not merely its tail. That's only
+ * possible because an in-tree temp name is synthesized end to end (see
+ * `inTreeTempName`) rather than derived from the destination, so nothing
+ * but a name this module itself produced can ever match -- which is what
+ * keeps a real file that merely *ends* in this shape
+ * (`photo.jpg.sync1-tmp-a1b2c3d4.jpg`, say) visible to the walker instead
+ * of silently excluded from the vault.
+ */
+const IN_TREE_TEMP_NAME_RE = /^\.sync1-tmp-[0-9a-f]{32}(?:\.[^./]+)?$/;
+
+/**
+ * Synthesized whole, carrying nothing from the destination: 16 random
+ * bytes (128 bits, so uniqueness within a directory needs no coordination)
+ * plus, where a media tool infers its output format from the extension,
+ * that extension. **Constant length** -- 43 bytes bare, 48 with a
+ * four-character extension -- which is the point: a name built by
+ * *extending* the destination's own is longer than the destination, so a
+ * legal final path could still have an illegal staging path, and did (a
+ * 239-byte thumbnail name became a 258-byte temp, past the 255-byte
+ * filename limit, and generation failed forever for that file). Nothing
+ * anywhere parses these names, so discarding the destination's stem costs
+ * only the ability to tell at a glance which file an orphaned temp
+ * belonged to -- its directory still says where.
+ */
+function inTreeTempName(extension: string): string {
+  return `.${IN_TREE_TEMP_SUFFIX}-${randomBytes(16).toString("hex")}${extension}`;
+}
 
 /**
  * A temp path for an atomic write that has to live *in the tracked tree*
  * itself, right next to the real destination -- a download landing next to
  * the file it will replace, or a stub being written next to the original
  * it stands in for -- rather than off in `.sync1/` the way
- * `tempSiblingPath` above is. The one canonical definition every writer
- * (`apply-remote-changes.ts`, `materialize.ts`, `stub.ts`) uses, so the
- * walker's own matcher below can never silently drift out of sync with
- * what's actually being written -- which is exactly how these used to slip
- * past it and get picked up by the next `update_cache` as genuine new
- * files.
+ * `tempSiblingPath` above is. Sibling, specifically, so the rename that
+ * publishes it can't cross a filesystem boundary and stop being atomic.
+ * The one canonical definition every writer (`apply-remote-changes.ts`,
+ * `materialize.ts`, `stub.ts`) uses, so the walker's own matcher above can
+ * never silently drift out of sync with what's actually being written --
+ * which is exactly how these used to slip past it and get picked up by the
+ * next `update_cache` as genuine new files.
  */
 export function inTreeTempPath(absolutePath: string): string {
-  return `${absolutePath}.${IN_TREE_TEMP_SUFFIX}-${randomBytes(4).toString("hex")}`;
+  return path.join(path.dirname(absolutePath), inTreeTempName(""));
 }
 
 /** An in-tree temp path that retains the destination extension for media tools that infer output format from it. */
 export function inTreeTempPathPreservingExtension(absolutePath: string): string {
-  const extension = path.extname(absolutePath);
-  const stem = extension.length > 0 ? absolutePath.slice(0, -extension.length) : absolutePath;
-  return `${stem}.${IN_TREE_TEMP_SUFFIX}-${randomBytes(4).toString("hex")}${extension}`;
+  return path.join(path.dirname(absolutePath), inTreeTempName(path.extname(absolutePath)));
 }
 
-/** True for any name `inTreeTempPath` could have produced -- what the walker excludes so these are never mistaken for tracked content. */
+/** True for any name `inTreeTempPath`/`inTreeTempPathPreservingExtension` could have produced, and nothing else -- what the walker excludes so these are never mistaken for tracked content. */
 export function isInTreeTempName(name: string): boolean {
   return IN_TREE_TEMP_NAME_RE.test(name);
 }
