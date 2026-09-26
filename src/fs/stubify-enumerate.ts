@@ -6,6 +6,10 @@ import type { Logger } from "../logger.js";
 import type { ProgressTracker } from "../progress-types.js";
 import type { EnumerationControl } from "./update-cache-enumerate.js";
 import { isUnderThumbnailDir } from "./thumbnail.js";
+import { mirrorObjectExists } from "./mirror-sink.js";
+import { mirrorObjectPath } from "../vault/mirror-paths.js";
+import { encryptedSize } from "../crypto/streaming-codec.js";
+import { HASH_BYTES } from "../crypto/hash.js";
 
 /**
  * How many scanned rows between published estimates -- and, since this
@@ -43,6 +47,8 @@ export async function enumerateStubifyWork(
   progress: ProgressTracker,
   logger: Logger,
   control: EnumerationControl,
+  /** Mirrors `stubifyGlob`'s own gate, so the two passes agree on what counts. */
+  mirrorPath?: string,
 ): Promise<void> {
   let files = 0;
   let bytes = 0;
@@ -71,7 +77,11 @@ export async function enumerateStubifyWork(
         row.type === "file" &&
         row.state === "unchanged" &&
         !isUnderThumbnailDir(row.path) &&
-        row.size !== null
+        row.size !== null &&
+        // The mirror gate sits before the mtime fast path in processRow,
+        // so a refused row never rehashes -- counting its bytes here
+        // would leave the bar with a denominator the run can never reach.
+        (mirrorPath === undefined || isMirroredForEstimate(mirrorPath, row))
       ) {
         const absolutePath = path.join(root, row.path);
         // statSync rather than existsSync-then-statSync: one syscall
@@ -103,5 +113,26 @@ export async function enumerateStubifyWork(
       { err: err instanceof Error ? err.message : String(err) },
       "progress enumeration failed -- continuing without an estimated total",
     );
+  }
+}
+
+/**
+ * The estimate's copy of `stubify.ts`'s `isMirrored`, deliberately not
+ * shared: this pass must stay a pure read that never throws, and an
+ * unreachable mirror here should quietly leave the denominator alone
+ * rather than abort an estimate the real pass can still run without.
+ */
+function isMirroredForEstimate(
+  mirrorPath: string,
+  row: { hash: string | null; size: number | null },
+): boolean {
+  if (row.hash === null || row.size === null) return false;
+  try {
+    return mirrorObjectExists(
+      mirrorObjectPath(mirrorPath, row.hash),
+      encryptedSize(row.size, HASH_BYTES),
+    );
+  } catch {
+    return false;
   }
 }

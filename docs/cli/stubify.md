@@ -74,3 +74,24 @@ enumerating one by one. See [thumbnails.md](../architecture/thumbnails.md) for t
 ```bash
 sync1 stubify "photos/2020/*" --root ~/Pictures --json
 ```
+
+## Refuses an unmirrored file
+
+When the vault has a `mirror_path` configured, a file whose content is not on the mirror is **skipped**,
+with `ok: false` and the reason `not yet mirrored`. `--allow-unmirrored` overrides it, and nothing
+changes at all for a vault with no mirror.
+
+The reasoning is the same one that makes this command careful in the first place. Stubbing deletes the
+last _local_ copy of a file's content, on the strength of the remote one. With a mirror configured you
+have arranged for two remote copies; acting as though you had two when you have one is precisely the
+situation worth refusing.
+
+It is mostly redundant by construction, and deliberately so: under the default
+`--on-mirror-max-retries fail`, a mirror write that fails also fails the object, so its cache row never
+reaches `unchanged` and this command would skip it anyway. The gate covers the two cases that escape
+that — content committed before `mirror_path` was configured, and runs made with `--skip-mirror` or
+`--on-mirror-max-retries ignore`.
+
+The check costs one `stat`. It reads `hash` off the cache row this command already has, so
+**stubify still needs neither `state.db` nor the password**. Run
+[`sync1 mirror catchup`](mirror.md) to close the gap, and the skip goes away.

@@ -7,6 +7,10 @@ import {
 } from "../db/repositories/cache-entries-repository.js";
 import { writeStubAtomic, stubPathFor } from "./stub.js";
 import { isUnderThumbnailDir } from "./thumbnail.js";
+import { mirrorObjectExists } from "./mirror-sink.js";
+import { mirrorObjectPath } from "../vault/mirror-paths.js";
+import { encryptedSize } from "../crypto/streaming-codec.js";
+import { HASH_BYTES } from "../crypto/hash.js";
 import { enumerateStubifyWork } from "./stubify-enumerate.js";
 import type { EnumerationControl } from "./update-cache-enumerate.js";
 import { BoundedTaskTracker } from "../concurrency/pools.js";
@@ -69,6 +73,21 @@ export async function stubifyGlob(
   hashRunner: HashRunner,
   maxInFlightHashes: number,
   onProgress?: OnProgress,
+  /**
+   * When set, a file whose content is not on the mirror is refused.
+   *
+   * Mostly redundant by construction: a mirror failure fails the object,
+   * so a row that reached `state = 'unchanged'` was mirrored. It covers
+   * the two cases that escape that -- objects committed before
+   * `mirror_path` was configured, and runs made with `--skip-mirror` or
+   * `--on-mirror-max-retries ignore`. Those are precisely the states in
+   * which stubbing would delete the last local copy of something that
+   * exists in only one place.
+   *
+   * Needs nothing but `row.hash`, already on the cache row, so stubify
+   * keeps its advertised properties: no state.db, no password.
+   */
+  mirrorPath?: string,
 ): Promise<StubifyStats> {
   const stats: StubifyStats = {
     stubified: 0,
@@ -98,6 +117,7 @@ export async function stubifyGlob(
     progress,
     logger,
     enumerationControl,
+    mirrorPath,
   );
 
   try {
@@ -108,7 +128,17 @@ export async function stubifyGlob(
     // cursor, and pagination never leaves one paused between pages.
     for (const row of cacheRepo.iterateByGlobSortedByPath(glob)) {
       progress.rowDiscovered();
-      await processRow(row, root, cacheRepo, logger, hashRunner, hashJobs, stats, progress);
+      await processRow(
+        row,
+        root,
+        mirrorPath,
+        cacheRepo,
+        logger,
+        hashRunner,
+        hashJobs,
+        stats,
+        progress,
+      );
     }
 
     await hashJobs.onIdle();
@@ -141,9 +171,24 @@ export async function stubifyGlob(
  * `thumbnailDirExcluded` too would inflate that number with entries that
  * were never stubify candidates in the first place.
  */
+/**
+ * Whether the mirror holds this row's content, by the same cheap test the
+ * sync path uses: the file exists at the expected size. Size rather than a
+ * checksum keeps this one `stat` -- `mirror verify --checksum` is where
+ * paying to read the bytes belongs.
+ */
+function isMirrored(mirrorPath: string, row: CacheEntryRow): boolean {
+  if (row.hash === null || row.size === null) return false;
+  return mirrorObjectExists(
+    mirrorObjectPath(mirrorPath, row.hash),
+    encryptedSize(row.size, HASH_BYTES),
+  );
+}
+
 async function processRow(
   row: CacheEntryRow,
   root: string,
+  mirrorPath: string | undefined,
   cacheRepo: CacheEntriesRepository,
   logger: Logger,
   hashRunner: HashRunner,
@@ -173,6 +218,18 @@ async function processRow(
     stats.skipped.push({
       path: row.path,
       reason: "not fully committed (has pending local changes)",
+    });
+    progress.rowResolved();
+    return;
+  }
+
+  // Positioned here on purpose: after the commit check, so it only ever
+  // asks about genuinely committed rows, and before the mtime fast path,
+  // so it never pays for a rehash of a file it is about to refuse.
+  if (mirrorPath !== undefined && !isMirrored(mirrorPath, row)) {
+    stats.skipped.push({
+      path: row.path,
+      reason: "not yet mirrored -- run `sync1 mirror catchup` first, or pass --allow-unmirrored",
     });
     progress.rowResolved();
     return;

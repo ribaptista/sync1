@@ -3,6 +3,7 @@ import { emitJson, emitError, exitCodeForError } from "../cli/output.js";
 import { localCacheDbPath } from "../vault/local-dir.js";
 import { openCacheDb } from "../db/connection.js";
 import { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
+import { mirrorPathFor } from "../sync/mirror-metadata.js";
 import { stubifyGlob, type StubifyStats } from "../fs/stubify.js";
 import { createConcurrencyPools } from "../concurrency/pools.js";
 import {
@@ -19,6 +20,7 @@ import { resolveRoot } from "../cli/resolve-root.js";
 
 interface StubifyOptions extends OptionValues {
   root?: string;
+  allowUnmirrored?: boolean;
 }
 
 interface GlobalOptions extends GlobalConcurrencyOptions {
@@ -35,6 +37,10 @@ export function registerStubifyCommand(program: Command): void {
     .option(
       "--root <path>",
       "local directory to operate on (defaults to the nearest ancestor directory with a .sync1/)",
+    )
+    .option(
+      "--allow-unmirrored",
+      "stub files whose content is not on the configured mirror -- by default those are skipped, since stubbing deletes the last local copy of something that then exists in only one place",
     )
     .action(async (glob: string, opts: StubifyOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -98,6 +104,10 @@ async function runStubify(
       pools.hashRunner,
       pools.hash.maxThreads,
       reporterFor(progress),
+      // Skipped entirely under --allow-unmirrored, and a no-op when no
+      // mirror is configured. Read from remote.json rather than requiring
+      // state.db, so stubify keeps needing neither it nor the password.
+      opts.allowUnmirrored ? undefined : mirrorPathFor(root, logger),
     );
   } finally {
     progress.stop();
