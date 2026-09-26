@@ -432,3 +432,29 @@ run ends showing all three, complete, as a summary. Known and accepted: the gap 
 phase 2 — an S3 `getObject` for `/current`, plus downloading and decrypting the whole remote state.db
 when the remote moved — reports nothing. With one bar that read as "frozen"; with three it reads as
 "phase 1 done, phase 2 not started", which is the same reality correctly attributed.
+
+## Per-sink throughput on the upload bar
+
+When a run writes to more than one destination, the byte bar gains a rate per destination:
+
+```
+uploading |████████░░| 4.2 GB/12.1 GB, 812/2104 files -- ETA 00:41:12 [s3 24.1 MB/s, mirror 23.8 MB/s] uploading photo.jpg...
+```
+
+This is the diagnostic that makes the mirror's lockstep tee liveable. Both sinks advance together by
+construction, so **a visible gap between the two rates is what identifies the bottleneck** — a single
+aggregate number could not say which sink is holding the other up, and "the upload is slow" would be as
+much as anyone could tell.
+
+Deliberately separate from `bytesDone`: sink counters measure **ciphertext written**, run larger than the
+plaintext the bar's fill and ETA are computed from, and a file fanned out to two sinks contributes to
+both — so summing them would double-count and overrun the total. They move no total, no ETA and no bar
+fill; they are purely observational.
+
+The rate is measured over the interval since the last flush rather than averaged over the run, because
+the question is "what is happening _now_": a mount that has just stalled should read as stalled at once,
+where an average would take minutes to sag. An EMA keeps a single slow window from making the number
+jitter unreadably.
+
+Sink _names_ come from the producer (`ProgressTracker.sinkAdvance`), never enumerated in progress code —
+the same discipline as `ActivityVerbs`. Every producer that reports none renders exactly as before.

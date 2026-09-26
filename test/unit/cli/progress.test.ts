@@ -275,8 +275,61 @@ describe("startBytesProgressSession", () => {
         sizeDone: prettyBytes(1_000_000),
         sizeTotal: `~${prettyBytes(2_000_000)}`,
         etaPrefix: "~",
+        // Empty unless a producer reported per-sink bytes -- every bar but
+        // sync's upload phase renders exactly as it did before.
+        rates: "",
         activity: "", // no activity reported yet
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * The diagnostic that makes the lockstep tee liveable: S3 and the mirror
+   * advance together by construction, so a visible gap between their rates
+   * is what tells you which sink is the bottleneck. A single aggregate
+   * number could not say that.
+   */
+  it("renders a per-sink rate for each destination a producer reports", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const session = startBytesProgressSession({ show: true, overallLabel: "uploading" });
+      session.setOverallTotals({ bytes: 10_000_000, files: 1, final: true });
+
+      // First sample establishes the baseline; there is no interval yet,
+      // so nothing is claimed about a rate.
+      vi.setSystemTime(Date.now() + 100);
+      session.setOverallProgress({ bytes: 0, sinkBytes: { s3: 0, mirror: 0 } });
+
+      // One second of wall clock, 1 MB to s3 and 500 KB to the mirror.
+      vi.setSystemTime(Date.now() + 1000);
+      session.setOverallProgress({
+        bytes: 1_000_000,
+        sinkBytes: { s3: 1_000_000, mirror: 500_000 },
+      });
+
+      const payload = barUpdateMock.mock.lastCall?.[1] as { rates: string };
+      expect(payload.rates).toMatch(/^ \[s3 .+\/s, mirror .+\/s\]$/);
+      // Named in the order the producer supplied, and distinct -- the
+      // whole point is being able to see one lagging the other.
+      expect(payload.rates.indexOf("s3")).toBeLessThan(payload.rates.indexOf("mirror"));
+      expect(payload.rates).not.toMatch(/s3 (.+)\/s, mirror \1\/s/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("omits the rates segment entirely when no sink bytes are reported", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const session = startBytesProgressSession({ show: true, overallLabel: "hashing" });
+      session.setOverallTotals({ bytes: 1000, files: 1, final: true });
+      vi.setSystemTime(Date.now() + 100);
+      session.setOverallProgress({ bytes: 500 });
+
+      const payload = barUpdateMock.mock.lastCall?.[1] as { rates: string };
+      expect(payload.rates).toBe("");
     } finally {
       vi.useRealTimers();
     }
@@ -299,6 +352,7 @@ describe("startBytesProgressSession", () => {
         sizeDone: prettyBytes(700),
         sizeTotal: `~${prettyBytes(1000)}`,
         etaPrefix: "~",
+        rates: "",
         activity: "",
       });
     } finally {

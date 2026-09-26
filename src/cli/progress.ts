@@ -233,6 +233,12 @@ export interface BytesProgressTarget {
     files?: number;
     bytes?: number;
     activity?: { verb: string; path: string } | undefined;
+    /**
+     * Cumulative bytes per named destination, for the per-sink rates in
+     * the bar's label. Optional throughout: every producer but sync's
+     * upload phase omits it, and those bars render exactly as before.
+     */
+    sinkBytes?: Readonly<Record<string, number>> | undefined;
   }): void;
 }
 
@@ -342,6 +348,16 @@ class MultiBarByteBar implements BytesProgressTarget {
   // `null`, not `0`, so "never flushed yet" can't be confused with "flushed
   // at Date.now() === 0" (a frozen/fake clock in a test, say).
   private lastFlushedAt: number | null = null;
+  /**
+   * Weight given to the newest sample. Low enough that a brief stall
+   * doesn't read as a crash, high enough that a real one shows within a
+   * second or so at the 100ms flush interval.
+   */
+  private static readonly RATE_SMOOTHING = 0.3;
+  private sinkBytes: Readonly<Record<string, number>> | undefined;
+  private readonly lastSinkBytes: Record<string, number> = {};
+  private readonly smoothedRates: Record<string, number> = {};
+  private lastRateSampleAt: number | null = null;
 
   constructor(multibar: MultiBar, label: string) {
     // Seeded to 1 (never 0) to avoid a divide-by-zero before the first real
@@ -362,9 +378,48 @@ class MultiBarByteBar implements BytesProgressTarget {
       // simultaneously done and not started. With bytes first, "0 B/0 B"
       // beside an empty bar reads as exactly what it is: nothing needed
       // transferring. Same payload keys, same values, just reordered.
-      format: `${label} |{bar}| {sizeDone}/{sizeTotal}, {filesDone}/{filesTotal} files -- {etaPrefix}ETA {eta_formatted} {activity}`,
+      format: `${label} |{bar}| {sizeDone}/{sizeTotal}, {filesDone}/{filesTotal} files -- {etaPrefix}ETA {eta_formatted}{rates} {activity}`,
     });
     this.flush(true);
+  }
+
+  /**
+   * Per-destination throughput, e.g. ` [s3 12.4 MB/s, mirror 8.1 MB/s]`.
+   * Empty unless a producer reported sink bytes, so every other bar in the
+   * tool renders exactly as before.
+   *
+   * A rate over the interval since the last flush rather than an all-run
+   * average, because the question it answers is "what is happening *now*"
+   * -- a mount that has just stalled should read as stalled immediately,
+   * where an average would take minutes to sag. Smoothed with an EMA so a
+   * single slow 100ms window doesn't make the number jitter unreadably.
+   *
+   * Sink *names* come from the producer (see ProgressUpdate.sinkBytes);
+   * this renders whatever it is handed, in the order it was handed them.
+   */
+  private ratesLabel(now: number): string {
+    if (this.sinkBytes === undefined) return "";
+    const elapsedMs = this.lastRateSampleAt === null ? 0 : now - this.lastRateSampleAt;
+    const parts: string[] = [];
+
+    for (const [sink, total] of Object.entries(this.sinkBytes)) {
+      const previous = this.lastSinkBytes[sink] ?? 0;
+      if (elapsedMs > 0) {
+        const instant = ((total - previous) * 1000) / elapsedMs;
+        const smoothed = this.smoothedRates[sink];
+        this.smoothedRates[sink] =
+          smoothed === undefined
+            ? instant
+            : smoothed * (1 - MultiBarByteBar.RATE_SMOOTHING) +
+              instant * MultiBarByteBar.RATE_SMOOTHING;
+      }
+      this.lastSinkBytes[sink] = total;
+      const rate = this.smoothedRates[sink];
+      if (rate !== undefined) parts.push(`${sink} ${prettyBytes(Math.round(rate))}/s`);
+    }
+
+    this.lastRateSampleAt = now;
+    return parts.length > 0 ? ` [${parts.join(", ")}]` : "";
   }
 
   // Built fresh on every flush, not cached: `fitPath` reads
@@ -412,6 +467,7 @@ class MultiBarByteBar implements BytesProgressTarget {
       sizeDone: prettyBytes(this.bytesDone),
       sizeTotal: approx + prettyBytes(this.bytesTotal),
       etaPrefix: approx,
+      rates: this.ratesLabel(now),
       activity: this.activityLabel(),
     });
   }
@@ -447,9 +503,11 @@ class MultiBarByteBar implements BytesProgressTarget {
     files?: number;
     bytes?: number;
     activity?: { verb: string; path: string } | undefined;
+    sinkBytes?: Readonly<Record<string, number>> | undefined;
   }): void {
     if (current.files !== undefined) this.filesDone = current.files;
     if (current.bytes !== undefined) this.bytesDone = current.bytes;
+    if (current.sinkBytes !== undefined) this.sinkBytes = current.sinkBytes;
     const isNewActivity = current.activity !== undefined;
     if (isNewActivity) this.activity = current.activity;
     this.flush(isNewActivity);
@@ -496,6 +554,7 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
     files?: number;
     bytes?: number;
     activity?: { verb: string; path: string } | undefined;
+    sinkBytes?: Readonly<Record<string, number>> | undefined;
   }): void {
     this.own().setOverallProgress(current);
   }
@@ -540,6 +599,7 @@ export function reporterFor(session: BytesProgressTarget): OnProgress {
       files: update.filesDone,
       bytes: update.bytesDone,
       activity: update.activity,
+      sinkBytes: update.sinkBytes,
     });
   };
 }

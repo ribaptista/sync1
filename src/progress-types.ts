@@ -47,6 +47,22 @@ export interface ProgressUpdate {
    * this field applies, rather than conditionally spreading it in.
    */
   activity?: { verb: string; path: string } | undefined;
+  /**
+   * Cumulative bytes delivered to each named *destination* this run, for
+   * renderers that want to show throughput per sink rather than one
+   * aggregate.
+   *
+   * Deliberately separate from `bytesDone`, which counts plaintext read
+   * and is what drives the bar and its ETA. These count ciphertext
+   * written, run larger, and a file fanned out to two sinks contributes
+   * to both -- so summing them would double-count and overrun the total.
+   *
+   * Names come from the caller, never enumerated here: this module has no
+   * vocabulary of its own (see `ActivityVerbs`), and a renderer showing
+   * "s3" and "mirror" should not require progress code to know what those
+   * are. Absent when nothing reported any.
+   */
+  sinkBytes?: Readonly<Record<string, number>> | undefined;
 }
 
 export type OnProgress = (update: ProgressUpdate) => void;
@@ -156,6 +172,16 @@ export interface ProgressTracker {
    */
   expectBytes(size: number): void;
   /**
+   * `deltaBytes` more ciphertext reached the destination named `sink`.
+   *
+   * Purely observational -- it moves no total, no ETA and no bar fill,
+   * because the same bytes are already accounted for on the plaintext
+   * side. Its only purpose is making a per-sink rate visible, which is
+   * what turns "the upload is slow" into "the upload is slow *because the
+   * mirror is*".
+   */
+  sinkAdvance(sink: string, deltaBytes: number): void;
+  /**
    * A file's byte work actually started -- emits the caller's first verb
    * (`verbs[0]`) against `path` immediately, which is what keeps the label
    * from sitting empty for the minutes it can take to process the very
@@ -243,6 +269,8 @@ export function createProgressTracker(
   let totalsFinal = false;
   let completedBytes = 0;
   let inFlightBytes = 0;
+  const sinkBytes: Record<string, number> = {};
+  let anySinkReported = false;
 
   function emit(activity?: { verb: string; path: string }): void {
     onProgress?.({
@@ -252,6 +280,7 @@ export function createProgressTracker(
       bytesTotal: Math.max(observedBytes, estimatedBytes),
       totalsFinal,
       activity,
+      sinkBytes: anySinkReported ? sinkBytes : undefined,
     });
   }
 
@@ -267,6 +296,14 @@ export function createProgressTracker(
     expectBytes(size) {
       observedBytes += size;
       emit();
+    },
+    sinkAdvance(sink, deltaBytes) {
+      sinkBytes[sink] = (sinkBytes[sink] ?? 0) + deltaBytes;
+      anySinkReported = true;
+      // No emit(): these arrive per chunk, far more often than anything
+      // else here, and every one would be a full update for a value the
+      // renderer samples on its own clock anyway. The next real event
+      // carries them.
     },
     skipBytes(size) {
       completedBytes += size;
