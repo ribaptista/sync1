@@ -5,7 +5,9 @@ import { emitJson, emitError, exitCodeForError, EXIT_CONFLICT } from "../cli/out
 import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
-import { parseRemoteConfig } from "../vault/remote-config.js";
+import { parseRemoteConfig, type RemoteConfig } from "../vault/remote-config.js";
+import { resolveMirrorPath } from "../vault/mirror-paths.js";
+import type { MirrorOptions } from "../sync/apply-local-changes.js";
 import { localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
 import { resolveRoot } from "../cli/resolve-root.js";
 import { normalizePrefix, type RemoteLocation } from "../vault/paths.js";
@@ -25,7 +27,11 @@ import {
 interface SyncOptions extends OptionValues {
   root?: string;
   verifyRemote?: boolean;
+  skipMirror?: boolean;
+  onMirrorMaxRetries?: string;
 }
+
+type OnMirrorMaxRetriesOption = "fail" | "ignore";
 
 interface GlobalOptions extends GlobalConcurrencyOptions {
   json?: boolean;
@@ -44,6 +50,12 @@ export function registerSyncCommand(program: Command): void {
     .option(
       "--verify-remote",
       "HEAD-check S3 before every upload, even without a prior aborted run's marker present -- slower, but confirms nothing is silently missing",
+    )
+    .option("--skip-mirror", "ignore the configured mirror_path entirely for this run")
+    .option(
+      "--on-mirror-max-retries <fail|ignore>",
+      "what a mirror write that has exhausted its retries means: 'fail' leaves the object uncommitted and its row dirty (default), 'ignore' commits to S3 anyway and leaves the gap for `mirror catchup`",
+      "fail",
     )
     .action(async (opts: SyncOptions, command: Command) => {
       const globalOpts = command.optsWithGlobals<GlobalOptions>();
@@ -67,6 +79,8 @@ export function registerSyncCommand(program: Command): void {
             nothing_to_sync: result.nothingToSync,
             uploaded_objects: result.uploadedObjects,
             deduped_objects: result.dedupedObjects,
+            mirrored_objects: result.mirroredObjects,
+            mirror_failures: result.mirrorFailures,
             local_entries_changed: result.localEntriesChanged,
             remote_created: result.remoteCreated,
             remote_modified: result.remoteModified,
@@ -88,6 +102,14 @@ export function registerSyncCommand(program: Command): void {
           process.stdout.write(
             `sync: version ${result.versionStamp} -- ${result.uploadedObjects} objects uploaded, ${result.dedupedObjects} deduped, ${result.localEntriesChanged} local entries changed, ${result.remoteCreated} remote created, ${result.remoteModified} remote modified, ${result.remoteDeleted} remote deleted\n`,
           );
+          if (result.mirroredObjects > 0 || result.mirrorFailures > 0) {
+            process.stdout.write(
+              `  mirror: ${result.mirroredObjects} object(s) written` +
+                (result.mirrorFailures > 0
+                  ? `, ${result.mirrorFailures} skipped after exhausting retries -- run \`sync1 mirror catchup\`\n`
+                  : "\n"),
+            );
+          }
           if (hasConflicts) {
             process.stdout.write(`${result.conflicts.length} conflict(s) left unresolved:\n`);
             for (const c of result.conflicts) process.stdout.write(`  - ${c.path}: ${c.reason}\n`);
@@ -162,9 +184,30 @@ async function runSync(
       pools,
       (label) => reporterFor(progress.startPhase(label)),
       opts.verifyRemote ?? false,
+      mirrorOptions(opts, remoteConfig, root),
     );
   } finally {
     progress.stop();
     await pools.hash.close();
   }
+}
+
+/**
+ * Resolves what, if anything, this run mirrors to.
+ *
+ * `--skip-mirror` wins over a configured path, and is the deliberate
+ * escape hatch when the drive is away. Note what it leaves behind: objects
+ * committed to S3 with no second copy, which is exactly the state
+ * `stubify`'s mirror gate exists to refuse to act on.
+ */
+function mirrorOptions(opts: SyncOptions, remoteConfig: RemoteConfig, root: string): MirrorOptions {
+  const onMaxRetries = parseOnMirrorMaxRetries(opts.onMirrorMaxRetries);
+  if (opts.skipMirror) return { path: undefined, onMaxRetries };
+  return { path: resolveMirrorPath(remoteConfig, root), onMaxRetries };
+}
+
+function parseOnMirrorMaxRetries(value: string | undefined): OnMirrorMaxRetriesOption {
+  if (value === undefined || value === "fail") return "fail";
+  if (value === "ignore") return "ignore";
+  throw new Error(`--on-mirror-max-retries must be "fail" or "ignore", not "${value}"`);
 }

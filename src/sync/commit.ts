@@ -20,6 +20,8 @@ import { encryptBuffer, decryptBuffer, CryptoAuthError } from "../crypto/chunked
 import { getObject, putObject, CasConflictError } from "../s3/client.js";
 import { withS3Retry, type RetryNotice } from "../s3/retry.js";
 import { commitCurrentPointer } from "./commit-pointer.js";
+import { mirrorStateSnapshot, mirrorCurrentPointer } from "./mirror-metadata.js";
+import type { MirrorOptions } from "./apply-local-changes.js";
 import {
   remoteKey,
   stateSnapshotKey,
@@ -46,6 +48,14 @@ export interface SyncResult {
   nothingToSync: boolean;
   uploadedObjects: number;
   dedupedObjects: number;
+  /** Objects whose ciphertext this run wrote to the configured mirror. */
+  mirroredObjects: number;
+  /**
+   * Objects committed to S3 that the mirror could not be given -- only
+   * possible under `--on-mirror-max-retries ignore`, and informational
+   * rather than a failure: `mirror catchup` closes the gap.
+   */
+  mirrorFailures: number;
   localEntriesChanged: number;
   remoteCreated: number;
   remoteModified: number;
@@ -182,6 +192,13 @@ export async function performSync(
   onPhase?: (label: string) => OnProgress | undefined,
   /** `--verify-remote`: forces the HEAD-before-upload check on even when no marker from a prior aborted run is present. See the marker handling just below. */
   forceVerifyRemote = false,
+  /**
+   * The optional second, offline copy of the encrypted vault. `path:
+   * undefined` -- the default, and what `--skip-mirror` forces -- makes
+   * every mirror step below a no-op, so a vault without one behaves
+   * exactly as it did before.
+   */
+  mirror: MirrorOptions = { path: undefined, onMaxRetries: "fail" },
 ): Promise<SyncResult> {
   const lastSyncedVersion = fs.readFileSync(lastSyncedVersionPath(root), "utf8").trim();
   const cacheDb = openCacheDb(localCacheDbPath(root), logger);
@@ -353,6 +370,7 @@ export async function performSync(
           phaseProgress("uploading"),
           uploadTotals,
           verifyRemote,
+          mirror,
         );
 
         // A version is only worth committing if something *actually*
@@ -415,6 +433,8 @@ export async function performSync(
           nothingToSync,
           uploadedObjects: 0,
           dedupedObjects: 0,
+          mirroredObjects: 0,
+          mirrorFailures: 0,
           localEntriesChanged: localResult.handledPaths.size,
           remoteCreated: remoteResult.created,
           remoteModified: remoteResult.modified,
@@ -441,6 +461,7 @@ export async function performSync(
           ),
         { onRetry: retryLogger(logger, "uploading the state.db snapshot") },
       );
+      await mirrorStateSnapshot(mirror.path, versionStamp, encryptedStateDb, logger);
 
       logger.debug({ versionStamp, ifMatch: current.etag }, "attempting CAS commit of /current");
       try {
@@ -456,6 +477,8 @@ export async function performSync(
       // reconcile the successfully-applied cache rows -- a crash before
       // this point just leaves ignorable stray temp files and an untouched
       // cache.db, safe to retry.
+      await mirrorCurrentPointer(mirror.path, root, versionStamp, logger);
+
       await renameWithRetry(candidatePath, localStateDbPath(root));
       fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
       // Only now: state.db itself now reflects every object this run
@@ -473,6 +496,8 @@ export async function performSync(
         nothingToSync: false,
         uploadedObjects: localResult.uploadedObjects,
         dedupedObjects: localResult.dedupedObjects,
+        mirroredObjects: localResult.mirroredObjects,
+        mirrorFailures: localResult.mirrorFailures,
         localEntriesChanged: localResult.handledPaths.size,
         remoteCreated: remoteResult.created,
         remoteModified: remoteResult.modified,

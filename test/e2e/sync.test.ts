@@ -239,6 +239,11 @@ describe("sync (local-to-remote, single machine)", () => {
       nothing_to_sync: false,
       uploaded_objects: 1,
       deduped_objects: 0,
+      // Present and zero even with no mirror configured: the shape is a
+      // contract, and a field that appears only sometimes is worse for a
+      // consumer than one that is always there.
+      mirrored_objects: 0,
+      mirror_failures: 0,
       local_entries_changed: 2,
       remote_created: 0,
       remote_modified: 0,
@@ -262,6 +267,11 @@ describe("sync (local-to-remote, single machine)", () => {
       nothing_to_sync: false,
       uploaded_objects: 0,
       deduped_objects: 0,
+      // Present and zero even with no mirror configured: the shape is a
+      // contract, and a field that appears only sometimes is worse for a
+      // consumer than one that is always there.
+      mirrored_objects: 0,
+      mirror_failures: 0,
       local_entries_changed: 0,
       remote_created: 1,
       remote_modified: 0,

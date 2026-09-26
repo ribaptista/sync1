@@ -14,8 +14,15 @@ import {
   CURRENT_POINTER_KEY,
   type RemoteLocation,
 } from "../vault/paths.js";
-import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
+import {
+  localStateDbPath,
+  lastSyncedVersionPath,
+  localRemoteConfigPath,
+} from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
+import { mirrorStateSnapshot, mirrorCurrentPointer } from "./mirror-metadata.js";
+import { resolveMirrorPath } from "../vault/mirror-paths.js";
+import { parseRemoteConfig } from "../vault/remote-config.js";
 import { tempSiblingPath } from "../fs/temp-path.js";
 import { copyFileWithRetry } from "../fs/safe-fs.js";
 
@@ -124,6 +131,19 @@ export async function mutateStateDb<T>(
           throw err;
         }
 
+        // Policy edits mint version stamps and write `states/` through
+        // here, not through commit.ts -- so without this, every
+        // `ignore`/`storage_policy`/`thumbnail_policy` change would be a
+        // snapshot the mirror silently never received. Resolved from
+        // remote.json rather than taken as a parameter precisely so a
+        // future caller cannot reintroduce that gap by forgetting to pass
+        // it. Both writes are best-effort: the CAS above already
+        // committed, so failing here would report a successful change as a
+        // failure, after the point of no return.
+        const mirrorPath = mirrorPathFor(root, logger);
+        await mirrorStateSnapshot(mirrorPath, newVersionStamp, encrypted, logger);
+        await mirrorCurrentPointer(mirrorPath, root, newVersionStamp, logger);
+
         await copyFileWithRetry(candidatePath, localStateDbPath(root));
         fs.writeFileSync(lastSyncedVersionPath(root), newVersionStamp, "utf8");
 
@@ -139,4 +159,22 @@ export async function mutateStateDb<T>(
   throw new Error(
     `mutateStateDb: too many concurrent commits (${MAX_CAS_ATTEMPTS} attempts) -- try again`,
   );
+}
+
+/**
+ * The configured mirror, or `undefined` -- never throwing. A malformed
+ * `mirror_path` must not turn an otherwise-valid policy edit into a
+ * failure; `sync` and the `mirror` commands surface that properly, with
+ * room to explain it.
+ */
+function mirrorPathFor(root: string, logger: Logger): string | undefined {
+  try {
+    return resolveMirrorPath(parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root))), root);
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      "ignoring an unusable mirror_path for this state change",
+    );
+    return undefined;
+  }
 }

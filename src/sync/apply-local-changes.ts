@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import type { Readable } from "node:stream";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import type PQueue from "p-queue";
@@ -9,12 +10,22 @@ import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
 import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
+import { HASH_BYTES } from "../crypto/hash.js";
 import { putObjectStream, headObject } from "../s3/client.js";
 import { withS3Retry } from "../s3/retry.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
 import { countingReadable } from "../fs/counting-stream.js";
+import {
+  mirrorObjectExists,
+  writeMirrorStream,
+  teeStream,
+  withMirrorRetry,
+  asMirrorWrite,
+  MirrorWriteError,
+} from "../fs/mirror-sink.js";
+import { mirrorObjectPath } from "../vault/mirror-paths.js";
 import {
   waitForRoom,
   createPoolErrorBox,
@@ -49,6 +60,14 @@ export type HandledPathStamps = ReadonlyMap<string, string | null>;
 export interface ApplyLocalChangesResult {
   uploadedObjects: number;
   dedupedObjects: number;
+  /** Objects whose ciphertext was written to the mirror by this run. */
+  mirroredObjects: number;
+  /**
+   * Objects committed to S3 that the mirror could not be given, only ever
+   * non-zero under `onMaxRetries: "ignore"`. Informational: the run
+   * succeeded, and `mirror catchup` closes the gap.
+   */
+  mirrorFailures: number;
   handledPaths: HandledPathStamps;
   /**
    * Count of rows that caused a *real* entries mutation (as opposed to a
@@ -64,6 +83,31 @@ export interface ApplyLocalChangesResult {
 
 interface InFlightUpload {
   sourceRows: { path: string; type: CacheEntryRow["type"] }[];
+}
+
+/**
+ * What to do when a mirror write has exhausted its retries.
+ *
+ * `fail` (the default) treats it exactly like a failed upload: the object
+ * is not committed, every row riding on it stays dirty, and a later sync
+ * retries the whole thing. Nothing reaches the vault without reaching both
+ * copies, so the mirror can never silently drift behind S3.
+ *
+ * `ignore` commits to S3 anyway and leaves the mirror short by a counted,
+ * warned-about amount for `mirror catchup` to fill in later -- free, since
+ * convergent encryption reproduces the same bytes from local plaintext. It
+ * keeps backups progressing while the drive is detached, at the cost of
+ * committed-but-unmirrored objects being a normal state. That is precisely
+ * what `stubify`'s mirror gate exists to catch: under `fail` an unmirrored
+ * file could never be stubbed anyway (its row never reaches `unchanged`),
+ * so the gate only becomes load-bearing here.
+ */
+export type OnMirrorMaxRetries = "fail" | "ignore";
+
+export interface MirrorOptions {
+  /** Absolute path to the mirror, or undefined for no mirror at all. */
+  path: string | undefined;
+  onMaxRetries: OnMirrorMaxRetries;
 }
 
 /**
@@ -138,6 +182,7 @@ export async function applyLocalChangesToCandidate(
    * aborted run this exists to recover from.
    */
   verifyRemote = false,
+  mirror: MirrorOptions = { path: undefined, onMaxRetries: "fail" },
 ): Promise<ApplyLocalChangesResult> {
   const objectsRepo = new ObjectsRepository(candidateDb);
   const entriesRepo = new EntriesRepository(candidateDb);
@@ -150,6 +195,8 @@ export async function applyLocalChangesToCandidate(
   versionsRepo.insert(versionStamp, new Date().toISOString());
 
   let uploadedObjects = 0;
+  let mirroredObjects = 0;
+  let mirrorFailures = 0;
   let dedupedObjects = 0;
   let appliedCount = 0;
   const handledPaths = new Map<string, string | null>();
@@ -317,7 +364,18 @@ export async function applyLocalChangesToCandidate(
       continue;
     }
 
-    if (objectsRepo.has(hash)) {
+    // Where one question used to decide everything, there are now two:
+    // "does S3 have it" and "does the mirror have it" are independent, and
+    // a skip requires both. Mirroring only the upload path would leave a
+    // hole for every deduped object -- silently, since from sync's point
+    // of view those rows succeeded.
+    const mirrorObjectTarget =
+      mirror.path === undefined ? undefined : mirrorObjectPath(mirror.path, hash);
+    const mirrorNeedsObject =
+      mirrorObjectTarget !== undefined &&
+      !mirrorObjectExists(mirrorObjectTarget, encryptedSize(row.size!, HASH_BYTES));
+
+    if (objectsRepo.has(hash) && !mirrorNeedsObject) {
       dedupedObjects++;
       handledPaths.set(row.path, versionStamp);
       appliedCount++;
@@ -326,6 +384,10 @@ export async function applyLocalChangesToCandidate(
       progress.rowResolved();
       continue;
     }
+    // Known to S3 but absent from the mirror: no upload, but the bytes
+    // still have to be produced locally. Handled by the dispatch below,
+    // which writes only the sinks that are missing.
+    const alreadyOnS3 = objectsRepo.has(hash);
 
     // verifyRemote only: not known to *this* candidate, but a prior run's
     // upload could still have reached S3 before it got aborted -- object
@@ -337,7 +399,11 @@ export async function applyLocalChangesToCandidate(
     // made it. Awaited inline, not dispatched -- this only ever runs
     // during the slow, recovery-mode path, so trading some parallelism for
     // a simpler decide-then-dispatch shape is the right call here.
-    if (verifyRemote) {
+    // Set when S3 is known to hold this object but the local candidate has
+    // no row for it yet -- the verifyRemote recovery case. Distinct from
+    // `alreadyOnS3`, which means the row exists already and needs nothing.
+    let remoteChecksum: string | undefined;
+    if (verifyRemote && !alreadyOnS3) {
       const existingKey = objectKey(hash);
       const head = await headObject(s3.client, s3.bucket, remoteKey(s3.location, existingKey));
       // A checksum is part of the shortcut's price, not a bonus. Taking it
@@ -356,6 +422,12 @@ export async function applyLocalChangesToCandidate(
         );
       }
       if (head?.checksumCrc64Nvme) {
+        // Recorded even when the mirror still needs the object: S3 is
+        // demonstrably holding the right bytes, so the dispatch below has
+        // only the mirror left to write.
+        remoteChecksum = head.checksumCrc64Nvme;
+      }
+      if (head?.checksumCrc64Nvme && !mirrorNeedsObject) {
         dedupedObjects++;
         handledPaths.set(row.path, versionStamp);
         appliedCount++;
@@ -439,6 +511,21 @@ export async function applyLocalChangesToCandidate(
         // makes the non-null requirement 0011 added a type-level fact
         // rather than a `?? null` fallback at the upsert below.
         let ciphertextChecksum: string | undefined;
+        // Which sinks this object still needs. `needsS3` is false exactly
+        // when the object is already remote but absent from the mirror --
+        // the case that would have been a silent hole if mirroring hung
+        // off the upload path alone.
+        const needsS3 = !alreadyOnS3 && remoteChecksum === undefined;
+        // When S3 already holds the object, the checksum comes from
+        // whichever source established that -- the existing row, or the
+        // HEAD that found it. Seeding it here keeps the bookkeeping below
+        // keyed on one thing ("do we have a verified checksum?") rather
+        // than branching on which sink ran.
+        if (!needsS3) {
+          ciphertextChecksum = remoteChecksum ?? objectsRepo.get(hash)?.ciphertext_checksum;
+        }
+        let mirrorTarget = mirrorNeedsObject ? mirrorObjectTarget : undefined;
+        let wroteMirror = false;
         try {
           // The retriable unit is the whole read-encrypt-PUT, not just the
           // PUT: a Readable that has already errored can't be replayed, so
@@ -452,64 +539,129 @@ export async function applyLocalChangesToCandidate(
           // exactly what the next attempt has to re-earn. Leaving it in
           // place would have the new attempt's advance() calls pile onto
           // bytes that no longer exist anywhere.
-          await withS3Retry(
-            async () => {
-              // Cheap guard ahead of the expensive one. `hash` and `size`
-              // both come from the cache row written back in the scanning
-              // phase, while the bytes below are read now -- hours later on
-              // a large vault. A stat costs one syscall and rejects any
-              // edit that moved mtime or size *before* a single byte goes
-              // out, where encryptStream's hash check can only reject after
-              // the body is already in flight. Neither subsumes the other:
-              // this misses a size- and mtime-preserving edit, which is
-              // exactly the silent case the hash catches.
-              const current = fs.statSync(absolutePath);
-              // Rounded to match how the cache stores it (see
-              // `Math.round(fsEntry.mtimeMs)` in update-cache.ts) -- an
-              // unrounded comparison would report a spurious change on any
-              // filesystem with sub-millisecond timestamps.
-              const currentMtime = Math.round(current.mtimeMs);
-              if (current.size !== size || currentMtime !== row.mtime) {
-                throw new Error(
-                  `"${row.path}" changed since it was scanned (size ${size} -> ${current.size}, mtime ${row.mtime} -> ${currentMtime}) -- leaving it dirty for the next sync rather than storing it under a stale hash`,
+          // Nested deliberately, outermost first: the retriable unit is the
+          // whole read-encrypt-write, since a Readable that already errored
+          // cannot be replayed, so recovering from *either* sink means
+          // starting the read over. The budgets stay separate because S3's
+          // is unbounded and its retryable errnos include ETIMEDOUT and
+          // ENETUNREACH -- exactly what a dropped SMB mount throws.
+          const runUnit = (): Promise<void> =>
+            withS3Retry(
+              async () => {
+                // Cheap guard ahead of the expensive one. `hash` and `size`
+                // both come from the cache row written back in the scanning
+                // phase, while the bytes below are read now -- hours later on
+                // a large vault. A stat costs one syscall and rejects any
+                // edit that moved mtime or size *before* a single byte goes
+                // out, where encryptStream's hash check can only reject after
+                // the body is already in flight. Neither subsumes the other:
+                // this misses a size- and mtime-preserving edit, which is
+                // exactly the silent case the hash catches.
+                const current = fs.statSync(absolutePath);
+                // Rounded to match how the cache stores it (see
+                // `Math.round(fsEntry.mtimeMs)` in update-cache.ts) -- an
+                // unrounded comparison would report a spurious change on any
+                // filesystem with sub-millisecond timestamps.
+                const currentMtime = Math.round(current.mtimeMs);
+                if (current.size !== size || currentMtime !== row.mtime) {
+                  throw new Error(
+                    `"${row.path}" changed since it was scanned (size ${size} -> ${current.size}, mtime ${row.mtime} -> ${currentMtime}) -- leaving it dirty for the next sync rather than storing it under a stale hash`,
+                  );
+                }
+                const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
+                  fileTracker.advance(n),
                 );
-              }
-              const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
-                fileTracker.advance(n),
-              );
-              // `expectedHash` is `hash` itself: for a content object the
-              // context *is* the content hash, so this asks the codec to
-              // prove the bytes it is encrypting are the ones that hash
-              // was taken from. See EncryptStreamOptions for why the two
-              // can disagree, and why a mismatch has to abort the stream
-              // rather than be reported afterwards.
-              const encryptedStream = encryptStream(sourceStream, size, masterKey, context, {
-                expectedHash: hash,
-              });
-              ciphertextChecksum = await putObjectStream(
-                s3.client,
-                s3.bucket,
-                remoteKey(s3.location, key),
-                encryptedStream,
-                encryptedSize(size, context.length),
-              );
-            },
-            {
-              onRetry: (notice) => {
-                fileTracker.retrying(notice);
-                logger.warn(
-                  {
-                    path: row.path,
-                    attempt: notice.attempt,
-                    delayMs: notice.delayMs,
-                    err:
-                      notice.error instanceof Error ? notice.error.message : String(notice.error),
-                  },
-                  "transient S3 failure while uploading -- retrying",
-                );
+                // `expectedHash` is `hash` itself: for a content object the
+                // context *is* the content hash, so this asks the codec to
+                // prove the bytes it is encrypting are the ones that hash
+                // was taken from. See EncryptStreamOptions for why the two
+                // can disagree, and why a mismatch has to abort the stream
+                // rather than be reported afterwards.
+                const encryptedStream = encryptStream(sourceStream, size, masterKey, context, {
+                  expectedHash: hash,
+                });
+                const uploadTo = async (stream: Readable): Promise<void> => {
+                  ciphertextChecksum = await putObjectStream(
+                    s3.client,
+                    s3.bucket,
+                    remoteKey(s3.location, key),
+                    stream,
+                    encryptedSize(size, context.length),
+                  );
+                };
+                const mirrorTo = async (stream: Readable): Promise<void> => {
+                  await asMirrorWrite(mirrorTarget!, () =>
+                    writeMirrorStream(mirrorTarget!, stream),
+                  );
+                  wroteMirror = true;
+                };
+
+                if (needsS3 && mirrorTarget !== undefined) {
+                  // One read, one encryption, two sinks advancing in
+                  // lockstep. S3 therefore goes no faster than the mirror --
+                  // accepted deliberately, in exchange for a clean sync
+                  // meaning a complete mirror with no reconciliation pass.
+                  const { primary, secondary } = teeStream(encryptedStream);
+                  await Promise.all([uploadTo(primary), mirrorTo(secondary)]);
+                } else if (needsS3) {
+                  await uploadTo(encryptedStream);
+                } else if (mirrorTarget !== undefined) {
+                  // S3 already holds these exact bytes (a dedup hit, or a
+                  // verifyRemote HEAD): only the mirror is missing, so no
+                  // upload is paid for at all.
+                  await mirrorTo(encryptedStream);
+                } else {
+                  // Reachable only on the `ignore` fallback pass for an
+                  // object S3 already had: both sinks are now satisfied or
+                  // given up on, so there is nothing left to stream. The
+                  // source still has to be drained, or the file handle and
+                  // the progress tracker are both left dangling.
+                  encryptedStream.destroy();
+                }
               },
-            },
-          );
+              {
+                onRetry: (notice) => {
+                  fileTracker.retrying(notice);
+                  logger.warn(
+                    {
+                      path: row.path,
+                      attempt: notice.attempt,
+                      delayMs: notice.delayMs,
+                      err:
+                        notice.error instanceof Error ? notice.error.message : String(notice.error),
+                    },
+                    "transient S3 failure while uploading -- retrying",
+                  );
+                },
+              },
+            );
+
+          try {
+            await withMirrorRetry(runUnit);
+          } catch (err) {
+            if (!(err instanceof MirrorWriteError) || mirror.onMaxRetries === "fail") throw err;
+            // `ignore`: the sync is allowed to progress without the second
+            // copy. Note the retry cannot simply resume -- in lockstep the
+            // mirror's failure tore down the S3 branch too -- so the unit
+            // is run once more with the mirror switched off for this object
+            // only. `mirror catchup` fills the gap later from local
+            // plaintext, free, because encryption is convergent.
+            mirrorFailures++;
+            logger.warn(
+              {
+                paths: job.sourceRows.map((r) => r.path),
+                hash,
+                target: err.target,
+                err: err.cause instanceof Error ? err.cause.message : String(err.cause),
+              },
+              "mirror write failed -- committing to S3 only, run `sync1 mirror catchup` to close the gap",
+            );
+            mirrorTarget = undefined;
+            // Rewinds the bar: the abandoned attempt's bytes reached
+            // neither sink, and the S3-only pass has to re-earn them.
+            fileTracker.retrying({ attempt: 1, delayMs: 0, elapsedMs: 0 });
+            await withMirrorRetry(runUnit);
+          }
         } catch (err) {
           // Deliberately NOT reported as applied: handledPaths/
           // appliedCount/entriesRepo are never touched below when this
@@ -551,13 +703,19 @@ export async function applyLocalChangesToCandidate(
 
         if (ciphertextChecksum === undefined) return;
 
+        if (wroteMirror) mirroredObjects++;
         objectsRepo.upsert({
           hash,
           s3_key: key,
           size,
           ciphertext_checksum: ciphertextChecksum,
         });
-        uploadedObjects++;
+        // Only a real transfer counts. A mirror-only pass moved no bytes
+        // to S3, so reporting it as uploaded would overstate what the run
+        // actually sent -- it is a dedup hit that happened to owe the
+        // mirror a copy.
+        if (needsS3) uploadedObjects++;
+        else dedupedObjects++;
         // Every row riding on this job -- the one that dispatched it, plus
         // any dedup attach that arrived before it settled (job.sourceRows
         // can have grown since dispatch, above) -- is only now genuinely
@@ -611,5 +769,13 @@ export async function applyLocalChangesToCandidate(
   // doesn't consult), so without this the bar would stop short of 100%.
   progress.settle();
 
-  return { uploadedObjects, dedupedObjects, handledPaths, appliedCount, conflicts };
+  return {
+    uploadedObjects,
+    dedupedObjects,
+    mirroredObjects,
+    mirrorFailures,
+    handledPaths,
+    appliedCount,
+    conflicts,
+  };
 }

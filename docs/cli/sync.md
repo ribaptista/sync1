@@ -6,17 +6,19 @@ Internally runs `update_cache` first, so you never need to run that separately b
 ## Usage
 
 ```bash
-sync1 sync [--root <local-path>] [--json] [--verbose] [--hash-parallelism <n>] [--file-stream-parallelism <n>] [--no-progress] [--verify-remote]
+sync1 sync [--root <local-path>] [--json] [--verbose] [--hash-parallelism <n>] [--file-stream-parallelism <n>] [--no-progress] [--verify-remote] [--skip-mirror] [--on-mirror-max-retries <fail|ignore>]
 ```
 
 ## Options
 
-| Flag                            | Required | Description                                                                                                                                                                                                            |
-| ------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--root <path>`                 | no       | Local directory to sync. Must already be initialized (`init_remote`) or attached (`attach_remote`). Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward.           |
-| `--hash-parallelism <n>`        | no       | Max concurrent file-hashing worker threads, used by `sync`'s internal `update_cache` scan. Default: CPU count.                                                                                                         |
-| `--file-stream-parallelism <n>` | no       | Max concurrent encrypt+upload / download+decrypt pipelines, used by the upload and remote-apply passes. Default 4.                                                                                                     |
-| `--verify-remote`               | no       | HEAD-checks S3 for each not-yet-known object before uploading it, even without a prior aborted run's marker present. See **Recovering from an aborted run** below — normally this turns on by itself when it's needed. |
+| Flag                                     | Required | Description                                                                                                                                                                                                            |
+| ---------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--root <path>`                          | no       | Local directory to sync. Must already be initialized (`init_remote`) or attached (`attach_remote`). Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward.           |
+| `--hash-parallelism <n>`                 | no       | Max concurrent file-hashing worker threads, used by `sync`'s internal `update_cache` scan. Default: CPU count.                                                                                                         |
+| `--file-stream-parallelism <n>`          | no       | Max concurrent encrypt+upload / download+decrypt pipelines, used by the upload and remote-apply passes. Default 4.                                                                                                     |
+| `--verify-remote`                        | no       | HEAD-checks S3 for each not-yet-known object before uploading it, even without a prior aborted run's marker present. See **Recovering from an aborted run** below — normally this turns on by itself when it's needed. |
+| `--skip-mirror`                          | no       | Ignore the configured `mirror_path` entirely for this run. Does nothing if no mirror is configured.                                                                                                                    |
+| `--on-mirror-max-retries <fail\|ignore>` | no       | What a mirror write that has exhausted its retries means. `fail` (default) leaves the object uncommitted and its row dirty; `ignore` commits to S3 anyway and leaves the gap for `mirror catchup`.                     |
 
 Bucket/prefix/endpoint/region are read from `.sync1/remote.json`, written by `init_remote`/`attach_remote` — not repeated here. See
 [concurrency-and-progress.md](../architecture/concurrency-and-progress.md) for how `sync`'s three phases (scan, upload, remote-apply) each dispatch their own concurrent work — and get their own progress bar, since a combined denominator across local hashing and network transfer was never a real quantity.
@@ -99,3 +101,24 @@ When there are unresolved conflicts, `ok` is `false` and `conflicts` is a non-em
 ```bash
 SYNC1_PASSWORD='correct horse battery staple' sync1 sync --root ~/Pictures --json
 ```
+
+## Mirroring to a second copy
+
+When `.sync1/remote.json` carries a `mirror_path`, every object this run uploads is also written there,
+in the bucket's own layout, as the same encrypted bytes. The existence check is per sink, so an object
+S3 already has but the mirror lacks is written to the mirror without being re-uploaded.
+
+```json
+{ "bucket": "my-vault", "prefix": "v0", "region": "us-east-1", "mirror_path": "/mnt/backup-drive" }
+```
+
+Two counters join the summary and `--json`: `mirrored_objects` (written this run) and `mirror_failures`
+(committed to S3 but not mirrored, only ever non-zero under `--on-mirror-max-retries ignore`). Neither
+affects `ok` or the exit code — under the default `fail`, a mirror failure is an _object_ failure, and
+reports through the same dirty-row path as any other failed upload.
+
+`--skip-mirror` and `--on-mirror-max-retries ignore` are the two ways to end up with a committed object
+that has no second copy. That is what [`stubify`](stubify.md)'s mirror gate exists to refuse to act on.
+
+See [mirroring.md](../architecture/mirroring.md) for the layout, the ordering rules, the retry budgets,
+and how to restore from the drive.

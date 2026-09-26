@@ -63,3 +63,12 @@ SYNC1_PASSWORD='correct horse battery staple' sync1 gc --root ~/Pictures --json
 # actually reclaim it
 sync1 gc --root ~/Pictures --apply --json
 ```
+
+## The mirror is never touched
+
+`gc` deletes from S3 only. A configured `mirror_path` keeps every object it already holds, including
+ones this command just removed remotely.
+
+That is deliberate: a mirror that shrank in step with `gc` would lose exactly the safety it exists to
+provide — recovering from your own mistaken delete. Reclaiming that space is a separate, opt-in
+decision. See [mirroring.md](../architecture/mirroring.md).
