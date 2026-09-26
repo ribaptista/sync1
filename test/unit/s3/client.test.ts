@@ -2,9 +2,34 @@ import { Readable } from "node:stream";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 
-const doneMock = vi.fn(async (): Promise<{ ETag?: string; ChecksumCRC64NVME?: string }> => ({
-  ETag: '"complete-etag"',
-}));
+// Known-correct pair, cross-checked in checksum.test.ts against a real
+// LocalStack container's own response for this exact buffer -- i.e. "what a
+// real, correctly-behaving S3 reports back". Module-scoped because every
+// fake below has to return it now: since a silent backend is a
+// CorruptionError rather than a tolerated no-op, a mock that answers
+// nothing no longer stands in for "S3 we aren't testing here".
+const CONTENT = "hello crc64";
+const REAL_CHECKSUM = "qVz5kPyaEcE=";
+
+// Drains the body before answering, because a mock that doesn't leaves the
+// tap with the checksum of *nothing* -- which used to pass unnoticed, since
+// a silent backend was tolerated and an empty computed value was never
+// compared to anything. Now that both are errors, every fake has to behave
+// like a real client: read the whole body, then report the value a
+// correctly-behaving S3 would.
+const doneMock = vi.fn(async (): Promise<{ ETag?: string; ChecksumCRC64NVME?: string }> => {
+  await drainLastUploadBody();
+  return { ETag: '"complete-etag"', ChecksumCRC64NVME: REAL_CHECKSUM };
+});
+
+async function drainLastUploadBody(): Promise<void> {
+  const lastCall = uploadCtor.mock.calls[uploadCtor.mock.calls.length - 1] as
+    [{ params: { Body: AsyncIterable<unknown> } }] | undefined;
+  if (!lastCall) return;
+  for await (const _chunk of lastCall[0].params.Body) {
+    // draining is the point
+  }
+}
 const uploadCtor = vi.fn();
 
 vi.mock("@aws-sdk/lib-storage", () => ({
@@ -22,7 +47,16 @@ function makeStream(content: string): Readable {
 }
 
 function fakeClient() {
-  return { send: vi.fn(async (_command: unknown) => ({ ETag: '"put-etag"' })) };
+  return {
+    send: vi.fn(async (command: { input?: { Body?: AsyncIterable<unknown> } }) => {
+      if (command.input?.Body) {
+        for await (const _chunk of command.input.Body) {
+          // see drainLastUploadBody above -- a real client reads the body
+        }
+      }
+      return { ETag: '"put-etag"', ChecksumCRC64NVME: REAL_CHECKSUM };
+    }),
+  };
 }
 
 beforeEach(() => {
@@ -38,7 +72,7 @@ describe("putObjectStream", () => {
       client as any,
       "bucket",
       "objects/small",
-      makeStream("hello"),
+      makeStream(CONTENT),
       MULTIPART_THRESHOLD_BYTES - 1,
     );
 
@@ -54,7 +88,7 @@ describe("putObjectStream", () => {
       client as any,
       "bucket",
       "objects/large",
-      makeStream("not actually large, but contentLength says so"),
+      makeStream(CONTENT),
       MULTIPART_THRESHOLD_BYTES,
     );
 
@@ -76,7 +110,7 @@ describe("putObjectStream", () => {
       client as any,
       "bucket",
       "objects/small",
-      makeStream("hi"),
+      makeStream(CONTENT),
       MULTIPART_THRESHOLD_BYTES - 1,
     );
     const putCommand = client.send.mock.calls[0]![0] as { input: { ChecksumAlgorithm?: string } };
@@ -87,7 +121,7 @@ describe("putObjectStream", () => {
       client as any,
       "bucket",
       "objects/large",
-      makeStream("hi"),
+      makeStream(CONTENT),
       MULTIPART_THRESHOLD_BYTES,
     );
     const [{ params }] = uploadCtor.mock.calls[uploadCtor.mock.calls.length - 1] as [
@@ -98,21 +132,13 @@ describe("putObjectStream", () => {
 });
 
 /**
- * The two tests above only check *wiring* -- that a PutObjectCommand or
- * Upload gets constructed with the right args. Neither mock ever drains
- * the tapped body or returns a Checksum* field, so verifyStoredChecksum's
- * comparison silently no-ops (an S3-compatible backend that doesn't
- * implement checksums is explicitly not a failure -- see client.ts). These
- * tests drain the body themselves, the way a real client actually would,
- * so the comparison logic genuinely runs.
+ * The tests above only check *wiring* -- that a PutObjectCommand or Upload
+ * gets constructed with the right args -- and their mocks return
+ * `REAL_CHECKSUM` purely so the verification they aren't testing doesn't
+ * reject. These drain the body themselves, the way a real client does, so
+ * the comparison logic genuinely runs against a checksum the tap computed.
  */
 describe("putObjectStream: checksum verification", () => {
-  // Same known-correct value checksum.test.ts cross-checks against a real
-  // LocalStack container's own response for this exact buffer -- reused
-  // here as "what a real, correctly-behaving S3 would report back".
-  const CONTENT = "hello crc64";
-  const REAL_CHECKSUM = "qVz5kPyaEcE=";
-
   async function drainingClient(reportedChecksum: string | undefined) {
     return {
       send: vi.fn(async (command: { input: { Body: AsyncIterable<unknown> } }) => {
@@ -153,29 +179,47 @@ describe("putObjectStream: checksum verification", () => {
     );
   });
 
-  it("does not throw when S3 reports no checksum at all -- an unsupported backend, not a mismatch", async () => {
-    const client = await drainingClient(undefined);
-    const result = await putObjectStream(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      client as any,
-      "bucket",
-      "objects/small",
-      makeStream(CONTENT),
-      MULTIPART_THRESHOLD_BYTES - 1,
-    );
-    // Still returns our own computed value -- it's stored regardless of
-    // whether this particular backend could confirm it.
-    expect(result).toBe(REAL_CHECKSUM);
-  });
+  /**
+   * Silence used to return early here, on the reasoning that a backend
+   * without checksums isn't a mismatch. That was the bug: this function
+   * exists to make an upload prove itself rather than trust its 200, and a
+   * backend that reports nothing has proved nothing -- so the early return
+   * reopened exactly the window the checksum work closed, silently, and
+   * `objects.ciphertext_checksum` (NOT NULL since 0011) would have nothing
+   * truthful to record. Substituting a locally computed value is not the
+   * remedy either: convergent encryption means we could derive the same
+   * number without a download, but storing it would make an uncorroborated
+   * upload indistinguishable from a verified one.
+   *
+   * Both empty-ish shapes are asserted because they arrive by different
+   * routes -- an absent field versus a present-but-blank header -- and an
+   * `if (!reported)` rewrite that drops one would restore the old hole.
+   */
+  it.each([
+    ["no checksum field at all", undefined],
+    ["an empty checksum string", ""],
+  ])(
+    "throws CorruptionError when S3 reports %s -- silence is a failed proof",
+    async (_label, reported) => {
+      const client = await drainingClient(reported);
+      await expect(
+        putObjectStream(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          client as any,
+          "bucket",
+          "objects/small",
+          makeStream(CONTENT),
+          MULTIPART_THRESHOLD_BYTES - 1,
+        ),
+      ).rejects.toThrow(
+        `S3 accepted "objects/small" but reported no CRC64NVME checksum, so the upload was never verified against the ${REAL_CHECKSUM} we computed`,
+      );
+    },
+  );
 
   it("verifies multipart the same way, draining Body via the mocked Upload before resolving", async () => {
     doneMock.mockImplementationOnce(async () => {
-      const lastCall = uploadCtor.mock.calls[uploadCtor.mock.calls.length - 1] as [
-        { params: { Body: AsyncIterable<unknown> } },
-      ];
-      for await (const _chunk of lastCall[0].params.Body) {
-        // draining is the point
-      }
+      await drainLastUploadBody();
       return { ChecksumCRC64NVME: REAL_CHECKSUM };
     });
 

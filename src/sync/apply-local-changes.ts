@@ -340,7 +340,22 @@ export async function applyLocalChangesToCandidate(
     if (verifyRemote) {
       const existingKey = objectKey(hash);
       const head = await headObject(s3.client, s3.bucket, remoteKey(s3.location, existingKey));
-      if (head) {
+      // A checksum is part of the shortcut's price, not a bonus. Taking it
+      // writes the only `objects` row this hash will ever get -- every
+      // later run hits the objectsRepo.has() branch above and never
+      // re-upserts -- so a checksum missing here would be missing forever,
+      // and 0011 requires one. Rather than fail the run or invent a value,
+      // decline the shortcut and let the normal upload path below produce
+      // a properly corroborated one. Costs one re-upload of an object that
+      // is already there, self-heals permanently, and can now only happen
+      // for an object predating the checksum column at all.
+      if (head && !head.checksumCrc64Nvme) {
+        logger.debug(
+          { path: row.path, hash },
+          "content present in S3 but with no recorded checksum -- re-uploading rather than adopting an unverified object",
+        );
+      }
+      if (head?.checksumCrc64Nvme) {
         dedupedObjects++;
         handledPaths.set(row.path, versionStamp);
         appliedCount++;
@@ -353,18 +368,18 @@ export async function applyLocalChangesToCandidate(
         // written now, not just the entries row, or a later dedup-attach
         // in this same batch couldn't find it either.
         //
-        // The checksum comes from the HEAD above rather than being left
-        // NULL: this row is the only one this object will ever get (a
-        // later run takes the objectsRepo.has(hash) shortcut and never
-        // re-upserts), so a NULL here is permanent, and would silently
-        // cost this object the remote content-audit 0006 exists for. Still
-        // tolerates absence -- an object predating checksums has none for
-        // S3 to report, and NULL means "unknown", never "mismatched".
+        // The checksum comes from the HEAD above, and is trustworthy for a
+        // specific reason: an object only reached S3 through
+        // `putObjectStream`, which refuses to return without S3's own
+        // value matching the client's. So S3's stored number was already
+        // corroborated -- by the very run that crashed before recording
+        // it. Adopting it here is reading back a proof, not assuming one.
+        // The guard above guarantees it is present.
         objectsRepo.upsert({
           hash,
           s3_key: existingKey,
           size: row.size!,
-          ciphertext_checksum: head.checksumCrc64Nvme ?? null,
+          ciphertext_checksum: head.checksumCrc64Nvme,
         });
         entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
         progress.rowResolved();
@@ -417,8 +432,13 @@ export async function applyLocalChangesToCandidate(
         // must not be silently swallowed the same way. Left to propagate
         // out of this whole dispatched job uncaught, it's exactly what the
         // stream pool's own error capture exists to catch properly.
+        // The checksum doubles as the success flag: `putObjectStream`
+        // resolves only once S3's own CRC64NVME matched the client's, so a
+        // value here *is* proof the upload landed and was verified, and a
+        // separate boolean could only ever disagree with it. That also
+        // makes the non-null requirement 0011 added a type-level fact
+        // rather than a `?? null` fallback at the upsert below.
         let ciphertextChecksum: string | undefined;
-        let uploadSucceeded = false;
         try {
           // The retriable unit is the whole read-encrypt-PUT, not just the
           // PUT: a Readable that has already errored can't be replayed, so
@@ -462,7 +482,6 @@ export async function applyLocalChangesToCandidate(
               },
             },
           );
-          uploadSucceeded = true;
         } catch (err) {
           // Deliberately NOT reported as applied: handledPaths/
           // appliedCount/entriesRepo are never touched below when this
@@ -502,13 +521,13 @@ export async function applyLocalChangesToCandidate(
           );
         }
 
-        if (!uploadSucceeded) return;
+        if (ciphertextChecksum === undefined) return;
 
         objectsRepo.upsert({
           hash,
           s3_key: key,
           size,
-          ciphertext_checksum: ciphertextChecksum ?? null,
+          ciphertext_checksum: ciphertextChecksum,
         });
         uploadedObjects++;
         // Every row riding on this job -- the one that dispatched it, plus

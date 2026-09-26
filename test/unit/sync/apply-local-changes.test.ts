@@ -61,6 +61,7 @@ describe("applyLocalChangesToCandidate: case-insensitive collision (sync-time)",
       hash: "a".repeat(64),
       s3_key: `objects/${"a".repeat(64)}`,
       size: 1,
+      ciphertext_checksum: "crc-test",
     });
     new EntriesRepository(candidateDb).upsert({
       path: "photo.jpg",
@@ -117,6 +118,7 @@ describe("applyLocalChangesToCandidate: case-insensitive collision (sync-time)",
       hash: "a".repeat(64),
       s3_key: `objects/${"a".repeat(64)}`,
       size: 1,
+      ciphertext_checksum: "crc-test",
     });
     new EntriesRepository(candidateDb).upsert({
       path: "photo.jpg",
@@ -165,7 +167,12 @@ describe("applyLocalChangesToCandidate: reported baseline stamps", () => {
     // another path's commit.
     versions.insert("v0", new Date().toISOString());
     versions.insert("v5", new Date().toISOString());
-    new ObjectsRepository(candidateDb).upsert({ hash: HASH, s3_key: `objects/${HASH}`, size: 1 });
+    new ObjectsRepository(candidateDb).upsert({
+      hash: HASH,
+      s3_key: `objects/${HASH}`,
+      size: 1,
+      ciphertext_checksum: "crc-test",
+    });
     new EntriesRepository(candidateDb).upsert({
       path: "photo.jpg",
       type: "file",
@@ -535,6 +542,7 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
       hash: "a".repeat(64),
       s3_key: `objects/${"a".repeat(64)}`,
       size: 5,
+      ciphertext_checksum: "crc-test",
     });
     new EntriesRepository(candidateDb).upsert({
       path: "a.txt",
@@ -1043,13 +1051,79 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
     candidateDb.close();
   });
 
+  /**
+   * The shortcut's price is a checksum. Taking it writes the only
+   * `objects` row this hash will ever get -- every later run hits the
+   * objectsRepo.has() branch and never re-upserts -- so a checksum absent
+   * here would be absent permanently, and 0011 requires one.
+   *
+   * Declining is deliberately preferred over the two alternatives:
+   * failing the run punishes the user for a legacy object, and computing
+   * a substitute locally (which convergent encryption makes possible
+   * without a download) would record a number nothing corroborated while
+   * making it look verified. Re-uploading costs bandwidth once and
+   * self-heals permanently.
+   */
+  it("declines verifyRemote's shortcut and re-uploads when the HEAD reports no checksum", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "present remotely, but from before checksums existed";
+    const hash = hashBufferHex(Buffer.from(content));
+    touch("legacy.txt", content);
+    headObjectMock.mockResolvedValue({ etag: '"deadbeef"' });
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [
+        {
+          path: "legacy.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash,
+          size: content.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+      ],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      undefined,
+      undefined,
+      true, // verifyRemote
+    );
+
+    expect(headObjectMock).toHaveBeenCalledTimes(1);
+    // The object was found, yet the upload still ran -- that is the point.
+    expect(putObjectStreamMock).toHaveBeenCalledTimes(1);
+    expect(result.uploadedObjects).toBe(1);
+    expect(result.dedupedObjects).toBe(0);
+    expect(result.appliedCount).toBe(1);
+
+    // And the row that resulted carries a real, verified checksum rather
+    // than the nothing the HEAD offered.
+    const objectsRepo = new ObjectsRepository(candidateDb);
+    expect(objectsRepo.get(hash)?.ciphertext_checksum).toBeTruthy();
+
+    candidateDb.close();
+  });
+
   it("skips the upload and records the row when verifyRemote's HEAD check finds the object already on S3", async () => {
     const candidateDb = openStateDb(":memory:");
     new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
     const content = "already uploaded by a prior aborted run";
     const hash = hashBufferHex(Buffer.from(content));
     touch("recovered.txt", content);
-    headObjectMock.mockResolvedValue({ etag: '"deadbeef"' });
+    headObjectMock.mockResolvedValue({
+      etag: '"deadbeef"',
+      // The shortcut requires one: this HEAD writes the only objects row
+      // the hash will ever get, and 0011 made the column NOT NULL.
+      checksumCrc64Nvme: "crc-from-head",
+    });
 
     const result = await applyLocalChangesToCandidate(
       candidateDb,
@@ -1091,7 +1165,14 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
     // objects row for this hash at all before -- verifyRemote has to write
     // one itself, or a same-batch dedup attach couldn't find it either.
     const objectsRepo = new ObjectsRepository(candidateDb);
-    expect(objectsRepo.get(hash)).toMatchObject({ hash, size: content.length });
+    expect(objectsRepo.get(hash)).toMatchObject({
+      hash,
+      size: content.length,
+      // Adopted from the HEAD rather than recomputed: the run that put the
+      // object there already had S3 confirm this value, so reading it back
+      // is reading a proof, not assuming one.
+      ciphertext_checksum: "crc-from-head",
+    });
 
     candidateDb.close();
   });
@@ -1143,7 +1224,12 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
     const hash = hashBufferHex(Buffer.from(content));
     touch("a.txt", content);
     touch("b.txt", content);
-    headObjectMock.mockResolvedValue({ etag: '"deadbeef"' });
+    headObjectMock.mockResolvedValue({
+      etag: '"deadbeef"',
+      // The shortcut requires one: this HEAD writes the only objects row
+      // the hash will ever get, and 0011 made the column NOT NULL.
+      checksumCrc64Nvme: "crc-from-head",
+    });
 
     const dirtyRows = [
       {

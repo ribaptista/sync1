@@ -45,7 +45,12 @@ describe("applyRemoteChangesToLocal: parent_state_version bookkeeping", () => {
     // path) that never rewrote this entry's row.
     versions.insert("v1", new Date().toISOString());
     versions.insert("v2", new Date().toISOString());
-    new ObjectsRepository(candidateDb).upsert({ hash: HASH, s3_key: `objects/${HASH}`, size: 7 });
+    new ObjectsRepository(candidateDb).upsert({
+      hash: HASH,
+      s3_key: `objects/${HASH}`,
+      size: 7,
+      ciphertext_checksum: "crc-test",
+    });
     new EntriesRepository(candidateDb).upsert({
       path: "photo.jpg",
       type: "file",
@@ -127,7 +132,12 @@ describe("applyRemoteChangesToLocal: download failure", () => {
   it("propagates a download failure cleanly instead of an unhandled rejection, and never marks the row materialized", async () => {
     const candidateDb = openStateDb(":memory:");
     new VersionsRepository(candidateDb).insert("v1", new Date().toISOString());
-    new ObjectsRepository(candidateDb).upsert({ hash: HASH, s3_key: `objects/${HASH}`, size: 100 });
+    new ObjectsRepository(candidateDb).upsert({
+      hash: HASH,
+      s3_key: `objects/${HASH}`,
+      size: 100,
+      ciphertext_checksum: "crc-test",
+    });
     new EntriesRepository(candidateDb).upsert({
       path: "photo.jpg",
       type: "file",

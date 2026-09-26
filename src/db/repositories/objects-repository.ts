@@ -6,14 +6,27 @@ export interface ObjectRow {
   s3_key: string;
   size: number;
   /**
-   * CRC64NVME checksum of the *ciphertext*, base64, as S3 reported it — see
+   * CRC64NVME checksum of the *ciphertext*, base64 — see
    * 0006_add_object_ciphertext_checksum.sql. Distinct from `hash` in both
    * algorithm and input: that one is BLAKE2b over the plaintext, this is
    * what S3 sees. Always the true full-object value, single PUT or
-   * multipart alike. `null` means "never recorded", never "mismatched".
+   * multipart alike.
+   *
+   * **Mandatory since 0011.** It records that the client's own computation
+   * and S3's independently agreed, so its presence *is* the proof the
+   * upload landed intact; a missing one would mean that comparison never
+   * happened. Every write path now raises rather than recording one it
+   * could not corroborate.
    */
-  ciphertext_checksum?: string | null;
+  ciphertext_checksum: string;
 }
+
+/**
+ * What `gc`'s staged-orphan table actually holds — no checksum, because
+ * deleting an object needs only its key. Narrower than `ObjectRow` on
+ * purpose: widening it would force a column the temp table never carries.
+ */
+export type StagedOrphanRow = Pick<ObjectRow, "hash" | "s3_key" | "size">;
 
 interface CountRow {
   c: number;
@@ -32,17 +45,18 @@ export class ObjectsRepository {
 
   upsert(row: ObjectRow): void {
     this.db
-      .prepare<[string, string, number, string | null]>(
+      .prepare<[string, string, number, string]>(
         `INSERT INTO objects (hash, s3_key, size, ciphertext_checksum) VALUES (?, ?, ?, ?)
          ON CONFLICT(hash) DO UPDATE SET
            s3_key = excluded.s3_key,
            size = excluded.size,
-           -- COALESCE, not a plain overwrite: a re-upsert that doesn't know
-           -- the checksum (an older path, or a dedup attach) must not erase
-           -- one already recorded.
-           ciphertext_checksum = COALESCE(excluded.ciphertext_checksum, objects.ciphertext_checksum)`,
+           -- A plain overwrite, not the COALESCE this used to need: 0011
+           -- made the column NOT NULL, so the excluded value can never be
+           -- null and the guard it provided is unreachable. Every caller
+           -- now has a corroborated checksum or has already raised.
+           ciphertext_checksum = excluded.ciphertext_checksum`,
       )
-      .run(row.hash, row.s3_key, row.size, row.ciphertext_checksum ?? null);
+      .run(row.hash, row.s3_key, row.size, row.ciphertext_checksum);
   }
 
   delete(hash: string): void {
@@ -112,11 +126,11 @@ export class ObjectsRepository {
    * `gc_pending_deletes`' own `PRIMARY KEY`, already indexed. See
    * src/db/keyset-pagination.ts.
    */
-  iterateStagedOrphans(): IterableIterator<ObjectRow> {
-    return paginateKeyset<ObjectRow, string>(
+  iterateStagedOrphans(): IterableIterator<StagedOrphanRow> {
+    return paginateKeyset<StagedOrphanRow, string>(
       (after, limit) =>
         this.db
-          .prepare<[string, number], ObjectRow>(
+          .prepare<[string, number], StagedOrphanRow>(
             "SELECT hash, s3_key, size FROM gc_pending_deletes WHERE hash > ? ORDER BY hash ASC LIMIT ?",
           )
           .all(after ?? "", limit),

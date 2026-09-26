@@ -95,7 +95,7 @@ function touch(relPath: string, content: string): void {
 }
 
 function seedObject(hash: string, s3Key: string, size: number, present = true): void {
-  objectsRepo.upsert({ hash, s3_key: s3Key, size });
+  objectsRepo.upsert({ hash, s3_key: s3Key, size, ciphertext_checksum: "crc-test" });
   if (present) existingS3Keys.add(s3Key);
 }
 

@@ -147,11 +147,24 @@ export const MULTIPART_THRESHOLD_BYTES = 32 * 1024 * 1024;
  * full-object comparison for one and a composite comparison for the other.
  */
 function verifyStoredChecksum(key: string, expected: string, reported: string | undefined): void {
-  // A backend that doesn't implement checksums at all reports nothing.
-  // Silence isn't a mismatch, and failing the run over it would make this
-  // a compatibility break rather than an integrity check.
-  if (reported === undefined || reported === "") return;
   if (reported === expected) return;
+  // Silence is a failure, not a compatibility affordance. This function
+  // exists to make an upload prove itself rather than trust its 200, and a
+  // backend that reports nothing has proved nothing -- returning early here
+  // would reopen the exact window described above, silently, for the
+  // objects least likely to be noticed. The remedy is never to substitute
+  // a locally computed value: convergent encryption means we could derive
+  // the same number without a download, but recording it would make an
+  // uncorroborated upload indistinguishable from a verified one, which is
+  // worse than having no record at all. So a backend that does not
+  // implement CRC64NVME is unsupported for writing -- already true in
+  // practice (see the version pin in test/e2e/helpers/localstack.ts), now
+  // enforced rather than assumed.
+  if (reported === undefined || reported === "") {
+    throw new CorruptionError(
+      `S3 accepted "${key}" but reported no CRC64NVME checksum, so the upload was never verified against the ${expected} we computed -- this backend does not support the integrity guarantee sync1 requires for writes`,
+    );
+  }
   throw new CorruptionError(
     `S3 stored "${key}" with a CRC64NVME checksum of ${reported}, but the bytes we sent checksum to ${expected} -- the upload was corrupted in transit or at rest`,
   );

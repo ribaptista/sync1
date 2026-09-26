@@ -94,3 +94,42 @@ exact same plaintext, encrypted the exact same way, already made it.
 Deliberately conditional rather than always-on: a HEAD per uploaded file is a real, measurable cost on a
 many-small-files sync, and an ordinary clean run (no prior abort, no `--verify-remote`) pays zero extra
 round trips for a recovery mechanism it will never need.
+
+## Every object carries a proof that S3 stored it correctly
+
+`objects.ciphertext_checksum` is **`NOT NULL`**, and that is a correctness property rather than a
+schema preference.
+
+The value is CRC64NVME over the _ciphertext_, base64. It is computed **client-side**, by
+`UploadChecksumTap` (`src/s3/checksum.ts`), as the encrypted bytes stream past on their way to S3 — and
+S3 computes the same thing independently and reports it back. `verifyStoredChecksum`
+(`src/s3/client.ts`) compares the two and refuses to return unless they match. So the recorded value is
+not a copy of something S3 said; it is the residue of an agreement between two independent
+computations. Storing it is what makes a later audit — `mirror verify`, a remote content check —
+meaningful without a download, a decryption, or the master key.
+
+That matters most where it is least visible. Without a write-time check an upload trusts its `200`, so
+an object S3 stored wrongly would surface only on a much later `materialize` — quite possibly after
+`stubify` had already removed the last local copy, on the strength of that upload.
+
+Three consequences follow, and they are easy to erode one at a time:
+
+- **A backend that reports no checksum is a failure, not a tolerated quirk.** Silence means the
+  comparison never happened, so nothing proved the upload landed. `verifyStoredChecksum` raises
+  `CorruptionError` rather than returning early. **An S3-compatible backend that does not implement
+  CRC64NVME is therefore unsupported for writing** — already true in practice, since the e2e harness
+  pins a LocalStack version chosen for exactly this (see `test/e2e/helpers/localstack.ts`).
+- **A locally computed substitute is never acceptable.** Convergent encryption means the same number
+  could be re-derived from local plaintext with no download at all. Recording that would write a value
+  nothing corroborated while making it indistinguishable from a verified one — an unverified upload
+  laundered into an apparently-verified row, which is worse than having no row.
+- **The `verifyRemote` HEAD shortcut declines itself when the HEAD reports no checksum**, falling
+  through to a normal upload instead. That branch writes the only `objects` row its hash will ever get
+  (every later run takes the local `objects` lookup and never re-upserts), so a gap there would be
+  permanent. Re-uploading costs bandwidth once for an object predating the column, and self-heals.
+
+Migration `0011` closed the door behind those callers. Because SQLite cannot add a column constraint in
+place, it rebuilds `objects` — which only works with foreign key enforcement suspended, since
+`entries.hash` references it; `runMigrations` handles that for the whole pass and runs a
+`foreign_key_check` inside each migration's own transaction. Its comment records why the two obvious
+alternatives silently do not work.

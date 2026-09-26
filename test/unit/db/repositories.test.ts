@@ -36,43 +36,22 @@ describe("ObjectsRepository", () => {
     const db = openStateDb(":memory:");
     const repo = new ObjectsRepository(db);
 
-    repo.upsert({ hash: "aaa", s3_key: "objects/aaa", size: 100 });
+    repo.upsert({ hash: "aaa", s3_key: "objects/aaa", size: 100, ciphertext_checksum: "crc1" });
     expect(repo.has("aaa")).toBe(true);
     expect(repo.get("aaa")).toEqual({
       hash: "aaa",
       s3_key: "objects/aaa",
       size: 100,
-      ciphertext_checksum: null,
+      ciphertext_checksum: "crc1",
     });
 
     // upsert on conflict updates fields
-    repo.upsert({ hash: "aaa", s3_key: "objects/aaa-moved", size: 200 });
-    expect(repo.get("aaa")).toEqual({
+    repo.upsert({
       hash: "aaa",
       s3_key: "objects/aaa-moved",
       size: 200,
-      ciphertext_checksum: null,
+      ciphertext_checksum: "crc1",
     });
-
-    repo.upsert({ hash: "bbb", s3_key: "objects/bbb", size: 50 });
-    expect(repo.count()).toBe(2);
-
-    repo.delete("aaa");
-    expect(repo.has("aaa")).toBe(false);
-    expect(repo.count()).toBe(1);
-  });
-
-  it("records ciphertext_checksum on upsert, and a later upsert that doesn't know it never erases it", () => {
-    const db = openStateDb(":memory:");
-    const repo = new ObjectsRepository(db);
-
-    repo.upsert({ hash: "aaa", s3_key: "objects/aaa", size: 100, ciphertext_checksum: "crc1" });
-    expect(repo.get("aaa")?.ciphertext_checksum).toBe("crc1");
-
-    // A re-upsert that doesn't pass a checksum at all -- an older call
-    // site, or a dedup attach re-writing s3_key/size -- must not clobber
-    // one already recorded.
-    repo.upsert({ hash: "aaa", s3_key: "objects/aaa-moved", size: 200 });
     expect(repo.get("aaa")).toEqual({
       hash: "aaa",
       s3_key: "objects/aaa-moved",
@@ -80,14 +59,43 @@ describe("ObjectsRepository", () => {
       ciphertext_checksum: "crc1",
     });
 
-    // A later upsert *can* still overwrite it with a new value.
-    repo.upsert({
-      hash: "aaa",
-      s3_key: "objects/aaa-moved",
-      size: 200,
-      ciphertext_checksum: "crc2",
-    });
+    repo.upsert({ hash: "bbb", s3_key: "objects/bbb", size: 50, ciphertext_checksum: "crc-test" });
+    expect(repo.count()).toBe(2);
+
+    repo.delete("aaa");
+    expect(repo.has("aaa")).toBe(false);
+    expect(repo.count()).toBe(1);
+  });
+
+  /**
+   * This used to assert the opposite -- that a re-upsert *without* a
+   * checksum preserved one already recorded, via COALESCE. 0011 removed
+   * the premise: the column is NOT NULL, so there is no such call, and the
+   * guard was unreachable. What matters now is the inverse property, that
+   * a re-upsert always carries a real value through rather than a stale
+   * one surviving a genuine change.
+   */
+  it("overwrites ciphertext_checksum on re-upsert, and rejects a row without one", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ObjectsRepository(db);
+
+    repo.upsert({ hash: "aaa", s3_key: "objects/aaa", size: 100, ciphertext_checksum: "crc1" });
+    expect(repo.get("aaa")?.ciphertext_checksum).toBe("crc1");
+
+    repo.upsert({ hash: "aaa", s3_key: "objects/aaa", size: 100, ciphertext_checksum: "crc2" });
     expect(repo.get("aaa")?.ciphertext_checksum).toBe("crc2");
+
+    // The schema, not just the type, is what enforces this -- a caller
+    // reaching the DB with a null (from JS, or from an older build) must
+    // be rejected rather than recording an object nothing can verify.
+    expect(() =>
+      repo.upsert({
+        hash: "bbb",
+        s3_key: "objects/bbb",
+        size: 1,
+        ciphertext_checksum: null as unknown as string,
+      }),
+    ).toThrow(/NOT NULL constraint failed: objects.ciphertext_checksum/);
   });
 
   it("computes orphan count/size via an anti-join against entries, entirely in SQL", () => {
@@ -96,9 +104,24 @@ describe("ObjectsRepository", () => {
     const objectsRepo = new ObjectsRepository(db);
     const entriesRepo = new EntriesRepository(db);
 
-    objectsRepo.upsert({ hash: "referenced", s3_key: "objects/referenced", size: 10 });
-    objectsRepo.upsert({ hash: "orphan1", s3_key: "objects/orphan1", size: 20 });
-    objectsRepo.upsert({ hash: "orphan2", s3_key: "objects/orphan2", size: 30 });
+    objectsRepo.upsert({
+      hash: "referenced",
+      s3_key: "objects/referenced",
+      size: 10,
+      ciphertext_checksum: "crc-test",
+    });
+    objectsRepo.upsert({
+      hash: "orphan1",
+      s3_key: "objects/orphan1",
+      size: 20,
+      ciphertext_checksum: "crc-test",
+    });
+    objectsRepo.upsert({
+      hash: "orphan2",
+      s3_key: "objects/orphan2",
+      size: 30,
+      ciphertext_checksum: "crc-test",
+    });
     entriesRepo.upsert({ path: "a.txt", type: "file", hash: "referenced", state_version: "v0" });
 
     const { count, totalSize } = objectsRepo.countOrphaned();
@@ -112,8 +135,18 @@ describe("ObjectsRepository", () => {
     const objectsRepo = new ObjectsRepository(db);
     const entriesRepo = new EntriesRepository(db);
 
-    objectsRepo.upsert({ hash: "referenced", s3_key: "objects/referenced", size: 10 });
-    objectsRepo.upsert({ hash: "orphan1", s3_key: "objects/orphan1", size: 20 });
+    objectsRepo.upsert({
+      hash: "referenced",
+      s3_key: "objects/referenced",
+      size: 10,
+      ciphertext_checksum: "crc-test",
+    });
+    objectsRepo.upsert({
+      hash: "orphan1",
+      s3_key: "objects/orphan1",
+      size: 20,
+      ciphertext_checksum: "crc-test",
+    });
     entriesRepo.upsert({ path: "a.txt", type: "file", hash: "referenced", state_version: "v0" });
 
     objectsRepo.stageOrphansForDeletion();
@@ -142,7 +175,12 @@ describe("ObjectsRepository", () => {
     const objectsRepo = new ObjectsRepository(db);
     const entriesRepo = new EntriesRepository(db);
 
-    objectsRepo.upsert({ hash: "gone", s3_key: "objects/gone", size: 20 });
+    objectsRepo.upsert({
+      hash: "gone",
+      s3_key: "objects/gone",
+      size: 20,
+      ciphertext_checksum: "crc-test",
+    });
     const entry = { path: "a.txt", type: "file" as const, hash: "gone", state_version: "v0" };
     entriesRepo.upsert(entry);
     entriesRepo.deleteWithHistory(entry, "v1");
@@ -170,7 +208,12 @@ describe("EntriesRepository (state.db)", () => {
   it("upserts entries referencing a committed version and object", () => {
     const db = openStateDb(":memory:");
     new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
-    new ObjectsRepository(db).upsert({ hash: "h1", s3_key: "objects/h1", size: 10 });
+    new ObjectsRepository(db).upsert({
+      hash: "h1",
+      s3_key: "objects/h1",
+      size: 10,
+      ciphertext_checksum: "crc-test",
+    });
     const repo = new EntriesRepository(db);
 
     repo.upsert({ path: "photos/a.jpg", type: "file", hash: "h1", state_version: "v0" });
@@ -198,7 +241,12 @@ describe("EntriesRepository (state.db)", () => {
       const db = openStateDb(":memory:");
       new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
       new VersionsRepository(db).insert("v1", "2026-01-02T00:00:00.000Z");
-      new ObjectsRepository(db).upsert({ hash: "h1", s3_key: "objects/h1", size: 10 });
+      new ObjectsRepository(db).upsert({
+        hash: "h1",
+        s3_key: "objects/h1",
+        size: 10,
+        ciphertext_checksum: "crc-test",
+      });
       const repo = new EntriesRepository(db);
       const entry = {
         path: "photos/a.jpg",
@@ -319,8 +367,18 @@ describe("EntriesRepository (state.db)", () => {
     it("yields a hash exactly once even when only some of its several paths match the glob", () => {
       const db = openStateDb(":memory:");
       new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
-      new ObjectsRepository(db).upsert({ hash: "h1", s3_key: "objects/h1", size: 1 });
-      new ObjectsRepository(db).upsert({ hash: "h2", s3_key: "objects/h2", size: 1 });
+      new ObjectsRepository(db).upsert({
+        hash: "h1",
+        s3_key: "objects/h1",
+        size: 1,
+        ciphertext_checksum: "crc-test",
+      });
+      new ObjectsRepository(db).upsert({
+        hash: "h2",
+        s3_key: "objects/h2",
+        size: 1,
+        ciphertext_checksum: "crc-test",
+      });
       const repo = new EntriesRepository(db);
       // Same content, dedup'd, referenced by both a matching and a
       // non-matching path.
@@ -340,8 +398,18 @@ describe("EntriesRepository (state.db)", () => {
       const db = openStateDb(":memory:");
       new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
       const objects = new ObjectsRepository(db);
-      objects.upsert({ hash: "h1", s3_key: "objects/h1", size: 1 });
-      objects.upsert({ hash: "h2", s3_key: "objects/h2", size: 1 });
+      objects.upsert({
+        hash: "h1",
+        s3_key: "objects/h1",
+        size: 1,
+        ciphertext_checksum: "crc-test",
+      });
+      objects.upsert({
+        hash: "h2",
+        s3_key: "objects/h2",
+        size: 1,
+        ciphertext_checksum: "crc-test",
+      });
       const repo = new EntriesRepository(db);
       repo.upsert({ path: "photos/a.jpg", type: "file", hash: "h1", state_version: "v0" });
       repo.upsert({ path: "archive/a.jpg", type: "file", hash: "h1", state_version: "v0" });

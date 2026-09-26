@@ -484,7 +484,12 @@ describe("performUpdateCache: ignore policies", () => {
 describe("performUpdateCache: stub files", () => {
   it("treats a legitimate new stub as a normal creation, without hashing its (contentless) bytes", async () => {
     const knownHash = hashBufferHex(Buffer.from("this content already lives in the vault"));
-    objectsRepo.upsert({ hash: knownHash, s3_key: `objects/${knownHash}`, size: 42 });
+    objectsRepo.upsert({
+      hash: knownHash,
+      s3_key: `objects/${knownHash}`,
+      size: 42,
+      ciphertext_checksum: "crc-test",
+    });
     writeStubAtomic(path.join(root, "img.jpg.stub"), knownHash);
 
     const repo = makeRepo();
@@ -540,7 +545,12 @@ describe("performUpdateCache: stub files", () => {
 
   it("does not re-validate a steady-state stub whose mtime hasn't changed", async () => {
     const knownHash = hashBufferHex(Buffer.from("steady content"));
-    objectsRepo.upsert({ hash: knownHash, s3_key: `objects/${knownHash}`, size: 1 });
+    objectsRepo.upsert({
+      hash: knownHash,
+      s3_key: `objects/${knownHash}`,
+      size: 1,
+      ciphertext_checksum: "crc-test",
+    });
     const stubPath = path.join(root, "img.jpg.stub");
     writeStubAtomic(stubPath, knownHash);
     const stubMtime = Math.round(fs.statSync(stubPath).mtimeMs);
@@ -901,7 +911,12 @@ describe("performUpdateCache: byte progress", () => {
 
   it("an already-resolved stub contributes 0 bytes (never hashed)", async () => {
     const knownHash = hashBufferHex(Buffer.from("stub content"));
-    objectsRepo.upsert({ hash: knownHash, s3_key: `objects/${knownHash}`, size: 12 });
+    objectsRepo.upsert({
+      hash: knownHash,
+      s3_key: `objects/${knownHash}`,
+      size: 12,
+      ciphertext_checksum: "crc-test",
+    });
     writeStubAtomic(path.join(root, "img.jpg.stub"), knownHash);
     const repo = makeRepo();
 
