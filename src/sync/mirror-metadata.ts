@@ -5,8 +5,10 @@ import {
   mirrorStateSnapshotPath,
   mirrorCurrentPointerPath,
   mirrorVaultManifestPath,
+  resolveMirrorPath,
 } from "../vault/mirror-paths.js";
-import { localVaultJsonPath } from "../vault/local-dir.js";
+import { localVaultJsonPath, localRemoteConfigPath } from "../vault/local-dir.js";
+import { parseRemoteConfig } from "../vault/remote-config.js";
 
 /**
  * Mirroring of the three small keys that are not content objects:
@@ -84,5 +86,31 @@ async function mirrorQuietly(
       { ...context, what, err: cause instanceof Error ? cause.message : String(cause) },
       "could not mirror -- the commit itself succeeded; run `sync1 mirror catchup` to close the gap",
     );
+  }
+}
+
+/**
+ * The configured mirror, or `undefined` -- never throwing. A malformed
+ * `mirror_path` must not turn an otherwise-valid state change into a
+ * failure; `sync` and the `mirror` commands surface that properly, with
+ * room to explain it.
+ *
+ * Shared by the **three** paths that commit a version -- `commit.ts`,
+ * `mutateStateDb` (policy edits) and `gc` -- and resolved here rather than
+ * passed in, so a fourth cannot quietly skip the mirror by forgetting a
+ * parameter. Missing one is not a small gap: `verify` judges completeness
+ * against the mirror's *own* snapshot, so a stale snapshot keeps vouching
+ * for a drive that is drifting further behind with every commit it never
+ * saw.
+ */
+export function mirrorPathFor(root: string, logger: Logger): string | undefined {
+  try {
+    return resolveMirrorPath(parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root))), root);
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      "ignoring an unusable mirror_path for this state change",
+    );
+    return undefined;
   }
 }

@@ -161,20 +161,39 @@ export async function writeMirrorFile(absolutePath: string, bytes: Buffer): Prom
 }
 
 /**
- * Splits one source stream into two consumers that advance in lockstep,
- * so a single read and a single encryption feed both S3 and the mirror.
+ * What a failure of the *secondary* branch should do to the primary.
+ *
+ * `abort-both` is right when the object will not be committed without both
+ * sinks: finishing an upload that is about to be discarded and retried
+ * sends gigabytes for nothing.
+ *
+ * `detach-secondary` is right when the primary's result is worth keeping
+ * on its own. The source feeds both branches at once, so at the moment the
+ * mirror dies the primary has already received everything up to that byte
+ * -- letting the source keep flowing to it alone yields a **complete**
+ * object with no re-read, no re-encryption and no re-upload. The declared
+ * ContentLength is still met, and `encryptStream`'s hash check still runs,
+ * because it lives in the source generator rather than in a branch.
+ */
+export type TeeFailureMode = "abort-both" | "detach-secondary";
+
+/**
+ * Splits one source stream into two consumers that advance in lockstep, so
+ * a single read and a single encryption feed both S3 and the mirror.
  *
  * Lockstep is the deliberate trade: S3 goes no faster than the mirror
  * does, in exchange for "a clean sync means a complete mirror" with no
  * reconciliation pass and no partially-mirrored commit to reason about.
- * Node's own backpressure provides it -- `PassThrough` pairs with a small
- * highWaterMark mean the source cannot outrun the slower branch.
+ * Node's own backpressure provides it -- the source cannot outrun the
+ * slower branch.
  *
- * Errors propagate both ways on purpose. The whole read-encrypt-write is
- * one retriable unit, so either sink failing must abandon the other rather
- * than leave a half-written object anywhere.
+ * A source failure always kills both: neither sink should publish content
+ * that was never fully produced.
  */
-export function teeStream(source: Readable): { primary: Readable; secondary: Readable } {
+export function teeStream(
+  source: Readable,
+  onSecondaryFailure: TeeFailureMode = "abort-both",
+): { primary: Readable; secondary: Readable } {
   const primary = new PassThrough();
   const secondary = new PassThrough();
 
@@ -182,8 +201,22 @@ export function teeStream(source: Readable): { primary: Readable; secondary: Rea
     primary.destroy(err);
     secondary.destroy(err);
   });
-  primary.on("error", () => secondary.destroy());
-  secondary.on("error", () => primary.destroy());
+
+  // The primary is the one whose result is being kept, so its failure
+  // always ends the secondary -- there is nothing left for the mirror's
+  // copy to accompany.
+  primary.on("error", () => {
+    source.unpipe(secondary);
+    secondary.destroy();
+  });
+
+  secondary.on("error", () => {
+    // `pipe()` does NOT unpipe on a destination error, so without this the
+    // source stalls forever waiting for a destroyed stream to drain -- the
+    // upload would hang rather than finish.
+    source.unpipe(secondary);
+    if (onSecondaryFailure === "abort-both") primary.destroy();
+  });
 
   source.pipe(primary);
   source.pipe(secondary);

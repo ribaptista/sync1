@@ -120,6 +120,27 @@ export class ObjectsRepository {
   }
 
   /**
+   * Every object row, keyset-paginated. `hash` is the table's own PRIMARY
+   * KEY, so the ordering index already exists and no migration is needed.
+   *
+   * Keyset rather than `.iterate()` for the usual reason (AGENTS.md): the
+   * mirror commands feed this into bounded pools doing filesystem and
+   * network work, and a blocking cursor held open across that would pin
+   * the connection for the whole run.
+   */
+  iterateAll(): IterableIterator<ObjectRow> {
+    return paginateKeyset<ObjectRow, string>(
+      (after, limit) =>
+        this.db
+          .prepare<[string, number], ObjectRow>(
+            "SELECT hash, s3_key, size, ciphertext_checksum FROM objects WHERE hash > ? ORDER BY hash ASC LIMIT ?",
+          )
+          .all(after ?? "", limit),
+      (row) => row.hash,
+    );
+  }
+
+  /**
    * Keyset-paginated (not `.iterate()`) -- `gc --apply`'s delete loop feeds
    * this into a bounded concurrency pool, so nothing may hold this
    * connection's statement open across concurrent work. `hash` is

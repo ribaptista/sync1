@@ -23,6 +23,7 @@ import {
 } from "../vault/paths.js";
 import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
+import { mirrorStateSnapshot, mirrorCurrentPointer, mirrorPathFor } from "./mirror-metadata.js";
 import { tempSiblingPath } from "../fs/temp-path.js";
 import { copyFileWithRetry } from "../fs/safe-fs.js";
 import {
@@ -173,6 +174,21 @@ export async function performGc(
           }
           throw err;
         }
+
+        // The third commit path, after commit.ts and mutateStateDb. Missing
+        // it would leave the mirror pinned at whatever version preceded a
+        // gc forever -- and since `verify` judges completeness against the
+        // mirror's *own* snapshot, that stale snapshot would keep claiming
+        // objects gc had deliberately removed, so the drive would look
+        // healthy while drifting further behind with every collection.
+        //
+        // Note this does **not** remove anything from the mirror: gc's
+        // scope is S3. Keeping what it deleted is the mirror's value as a
+        // safety net against a mistaken delete, and `mirror prune` is the
+        // separate, opt-in way to reclaim that space.
+        const mirrorPath = mirrorPathFor(root, logger);
+        await mirrorStateSnapshot(mirrorPath, newVersionStamp, encrypted, logger);
+        await mirrorCurrentPointer(mirrorPath, root, newVersionStamp, logger);
 
         // Only now, after the CAS succeeded, is it safe to delete the
         // actual object bytes -- any future commit referencing one of

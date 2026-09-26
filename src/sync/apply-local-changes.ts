@@ -524,7 +524,7 @@ export async function applyLocalChangesToCandidate(
         if (!needsS3) {
           ciphertextChecksum = remoteChecksum ?? objectsRepo.get(hash)?.ciphertext_checksum;
         }
-        let mirrorTarget = mirrorNeedsObject ? mirrorObjectTarget : undefined;
+        const mirrorTarget = mirrorNeedsObject ? mirrorObjectTarget : undefined;
         let wroteMirror = false;
         try {
           // The retriable unit is the whole read-encrypt-PUT, not just the
@@ -640,12 +640,17 @@ export async function applyLocalChangesToCandidate(
             await withMirrorRetry(runUnit);
           } catch (err) {
             if (!(err instanceof MirrorWriteError) || mirror.onMaxRetries === "fail") throw err;
-            // `ignore`: the sync is allowed to progress without the second
-            // copy. Note the retry cannot simply resume -- in lockstep the
-            // mirror's failure tore down the S3 branch too -- so the unit
-            // is run once more with the mirror switched off for this object
-            // only. `mirror catchup` fills the gap later from local
-            // plaintext, free, because encryption is convergent.
+            // `ignore`: the sync progresses without the second copy.
+            //
+            // Nothing is re-run. Because the tee detached rather than
+            // aborting, the upload this same attempt started went on to
+            // complete -- so the object is already on S3, verified, with
+            // its checksum in hand. There is no retry to attempt either:
+            // a one-shot stream cannot be replayed mid-flight, and the
+            // bytes are long gone. `mirror catchup` closes the gap later
+            // from local plaintext, free, because encryption is
+            // convergent.
+            if (ciphertextChecksum === undefined) throw err;
             mirrorFailures++;
             logger.warn(
               {
@@ -654,13 +659,8 @@ export async function applyLocalChangesToCandidate(
                 target: err.target,
                 err: err.cause instanceof Error ? err.cause.message : String(err.cause),
               },
-              "mirror write failed -- committing to S3 only, run `sync1 mirror catchup` to close the gap",
+              "mirror write failed -- the object is committed to S3, run `sync1 mirror catchup` to close the gap",
             );
-            mirrorTarget = undefined;
-            // Rewinds the bar: the abandoned attempt's bytes reached
-            // neither sink, and the S3-only pass has to re-earn them.
-            fileTracker.retrying({ attempt: 1, delayMs: 0, elapsedMs: 0 });
-            await withMirrorRetry(runUnit);
           }
         } catch (err) {
           // Deliberately NOT reported as applied: handledPaths/

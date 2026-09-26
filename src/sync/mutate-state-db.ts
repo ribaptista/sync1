@@ -14,15 +14,9 @@ import {
   CURRENT_POINTER_KEY,
   type RemoteLocation,
 } from "../vault/paths.js";
-import {
-  localStateDbPath,
-  lastSyncedVersionPath,
-  localRemoteConfigPath,
-} from "../vault/local-dir.js";
+import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
-import { mirrorStateSnapshot, mirrorCurrentPointer } from "./mirror-metadata.js";
-import { resolveMirrorPath } from "../vault/mirror-paths.js";
-import { parseRemoteConfig } from "../vault/remote-config.js";
+import { mirrorStateSnapshot, mirrorCurrentPointer, mirrorPathFor } from "./mirror-metadata.js";
 import { tempSiblingPath } from "../fs/temp-path.js";
 import { copyFileWithRetry } from "../fs/safe-fs.js";
 
@@ -159,22 +153,4 @@ export async function mutateStateDb<T>(
   throw new Error(
     `mutateStateDb: too many concurrent commits (${MAX_CAS_ATTEMPTS} attempts) -- try again`,
   );
-}
-
-/**
- * The configured mirror, or `undefined` -- never throwing. A malformed
- * `mirror_path` must not turn an otherwise-valid policy edit into a
- * failure; `sync` and the `mirror` commands surface that properly, with
- * room to explain it.
- */
-function mirrorPathFor(root: string, logger: Logger): string | undefined {
-  try {
-    return resolveMirrorPath(parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root))), root);
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      "ignoring an unusable mirror_path for this state change",
-    );
-    return undefined;
-  }
 }
