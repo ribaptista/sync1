@@ -454,10 +454,38 @@ export async function applyLocalChangesToCandidate(
           // bytes that no longer exist anywhere.
           await withS3Retry(
             async () => {
+              // Cheap guard ahead of the expensive one. `hash` and `size`
+              // both come from the cache row written back in the scanning
+              // phase, while the bytes below are read now -- hours later on
+              // a large vault. A stat costs one syscall and rejects any
+              // edit that moved mtime or size *before* a single byte goes
+              // out, where encryptStream's hash check can only reject after
+              // the body is already in flight. Neither subsumes the other:
+              // this misses a size- and mtime-preserving edit, which is
+              // exactly the silent case the hash catches.
+              const current = fs.statSync(absolutePath);
+              // Rounded to match how the cache stores it (see
+              // `Math.round(fsEntry.mtimeMs)` in update-cache.ts) -- an
+              // unrounded comparison would report a spurious change on any
+              // filesystem with sub-millisecond timestamps.
+              const currentMtime = Math.round(current.mtimeMs);
+              if (current.size !== size || currentMtime !== row.mtime) {
+                throw new Error(
+                  `"${row.path}" changed since it was scanned (size ${size} -> ${current.size}, mtime ${row.mtime} -> ${currentMtime}) -- leaving it dirty for the next sync rather than storing it under a stale hash`,
+                );
+              }
               const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
                 fileTracker.advance(n),
               );
-              const encryptedStream = encryptStream(sourceStream, size, masterKey, context);
+              // `expectedHash` is `hash` itself: for a content object the
+              // context *is* the content hash, so this asks the codec to
+              // prove the bytes it is encrypting are the ones that hash
+              // was taken from. See EncryptStreamOptions for why the two
+              // can disagree, and why a mismatch has to abort the stream
+              // rather than be reported afterwards.
+              const encryptedStream = encryptStream(sourceStream, size, masterKey, context, {
+                expectedHash: hash,
+              });
               ciphertextChecksum = await putObjectStream(
                 s3.client,
                 s3.bucket,

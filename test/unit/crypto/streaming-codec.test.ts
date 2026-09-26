@@ -48,13 +48,9 @@ describe("streaming codec", () => {
     // Deliberately misaligned source chunking (3 bytes at a time), to exercise
     // the internal re-buffering rather than happening to align with chunkSize.
     const streamed = await collect(
-      encryptStream(
-        chunkyReadable(plaintext, 3),
-        plaintext.length,
-        masterKey,
-        context,
-        TEST_CHUNK_SIZE,
-      ),
+      encryptStream(chunkyReadable(plaintext, 3), plaintext.length, masterKey, context, {
+        chunkSize: TEST_CHUNK_SIZE,
+      }),
     );
 
     expect(streamed.equals(whole)).toBe(true);
@@ -76,13 +72,9 @@ describe("streaming codec", () => {
     const context = contentHashContext(plaintext);
 
     const encoded = await collect(
-      encryptStream(
-        chunkyReadable(plaintext, 7),
-        plaintext.length,
-        masterKey,
-        context,
-        TEST_CHUNK_SIZE,
-      ),
+      encryptStream(chunkyReadable(plaintext, 7), plaintext.length, masterKey, context, {
+        chunkSize: TEST_CHUNK_SIZE,
+      }),
     );
     const decrypted = await collect(decryptStream(chunkyReadable(encoded, 9), masterKey));
 
@@ -95,7 +87,9 @@ describe("streaming codec", () => {
     const context = contentHashContext(plaintext);
 
     const encoded = await collect(
-      encryptStream(chunkyReadable(plaintext, 4), 0, masterKey, context, TEST_CHUNK_SIZE),
+      encryptStream(chunkyReadable(plaintext, 4), 0, masterKey, context, {
+        chunkSize: TEST_CHUNK_SIZE,
+      }),
     );
     const decrypted = await collect(decryptStream(chunkyReadable(encoded, 4), masterKey));
     expect(decrypted).toHaveLength(0);
@@ -123,5 +117,101 @@ describe("streaming codec", () => {
     const encoded = encryptBuffer(plaintext, masterKey, context, TEST_CHUNK_SIZE);
 
     expect(encryptedSize(plaintext.length, context.length, TEST_CHUNK_SIZE)).toBe(encoded.length);
+  });
+
+  /**
+   * The guarantee these pin down is that a mismatch makes the object
+   * *never exist remotely*, rather than existing briefly and being cleaned
+   * up. That only holds because the check sits between the last
+   * `readExact` and the last `yield`: the hash is complete, the final
+   * ciphertext chunk is not yet emitted, so the body ends short of the
+   * `encryptedSize` the caller declared as ContentLength and S3 discards
+   * an incomplete PUT. Move the check anywhere else -- upstream, or after
+   * the loop -- and the seam is gone.
+   */
+  describe("encryptStream: expectedHash", () => {
+    const masterKey = randomMasterKey();
+
+    it("streams normally when the plaintext hashes to expectedHash", async () => {
+      const plaintext = Buffer.from("content that is exactly what it claims to be");
+      const context = contentHashContext(plaintext);
+      const withCheck = await collect(
+        encryptStream(chunkyReadable(plaintext, 5), plaintext.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          expectedHash: context.toString("hex"),
+        }),
+      );
+      const withoutCheck = await collect(
+        encryptStream(chunkyReadable(plaintext, 5), plaintext.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+        }),
+      );
+      // Byte-identical: the check observes, it never alters the output.
+      expect(withCheck.equals(withoutCheck)).toBe(true);
+    });
+
+    it("errors the stream, short of the declared size, when the plaintext disagrees", async () => {
+      // The silent case: the bytes changed but the length did not, so
+      // ContentLength still matches and the ciphertext checksum both ends
+      // compute still agree. Nothing but the plaintext hash can tell.
+      const scanned = Buffer.from("the content that was hashed at scan time..");
+      const actual = Buffer.from("the content that is on disk at upload time");
+      expect(actual.length).toBe(scanned.length);
+
+      const context = contentHashContext(scanned);
+      const stream = encryptStream(chunkyReadable(actual, 5), actual.length, masterKey, context, {
+        chunkSize: TEST_CHUNK_SIZE,
+        expectedHash: context.toString("hex"),
+      });
+
+      const emitted: Buffer[] = [];
+      await expect(
+        (async () => {
+          for await (const chunk of stream) emitted.push(chunk as Buffer);
+        })(),
+      ).rejects.toThrow(/does not match the expected/);
+
+      // The property the whole abort depends on: fewer bytes reached the
+      // consumer than the ContentLength the upload declared, so the
+      // request cannot complete and S3 stores nothing.
+      const declared = encryptedSize(actual.length, context.length, TEST_CHUNK_SIZE);
+      expect(Buffer.concat(emitted).length).toBeLessThan(declared);
+    });
+
+    it("rejects a zero-byte plaintext before even the header escapes", async () => {
+      // totalChunks is 0, so the loop never runs and the header alone is
+      // the entire body -- checking after it were yielded would leave
+      // nothing to withhold, and the upload would complete successfully.
+      const context = contentHashContext(Buffer.from("not empty at scan time"));
+      const stream = encryptStream(chunkyReadable(Buffer.alloc(0), 4), 0, masterKey, context, {
+        chunkSize: TEST_CHUNK_SIZE,
+        expectedHash: context.toString("hex"),
+      });
+
+      const emitted: Buffer[] = [];
+      await expect(
+        (async () => {
+          for await (const chunk of stream) emitted.push(chunk as Buffer);
+        })(),
+      ).rejects.toThrow(/does not match the expected/);
+      expect(Buffer.concat(emitted).length).toBe(0);
+    });
+
+    it("still catches a size change through readExact, with its own message", async () => {
+      // The pre-existing half of the guard, kept honest: a shorter file
+      // fails before the hash comparison is ever reached.
+      const context = contentHashContext(Buffer.from("declared as longer than it is"));
+      const stream = encryptStream(
+        chunkyReadable(Buffer.from("short"), 5),
+        40,
+        masterKey,
+        context,
+        {
+          chunkSize: TEST_CHUNK_SIZE,
+          expectedHash: context.toString("hex"),
+        },
+      );
+      await expect(collect(stream)).rejects.toThrow(/source file changed size during read/);
+    });
   });
 });

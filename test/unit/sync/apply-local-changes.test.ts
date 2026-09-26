@@ -302,8 +302,15 @@ describe("applyLocalChangesToCandidate: same-batch dedup and collision (Pass 2)"
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  function touch(relPath: string, content: string): void {
-    fs.writeFileSync(path.join(root, relPath), content);
+  function touch(relPath: string, content: string, mtime = 1): void {
+    const absolute = path.join(root, relPath);
+    fs.writeFileSync(absolute, content);
+    // The rows below declare `mtime: 1`, and the upload path re-stats the
+    // file to confirm it hasn't changed since the scan that hashed it. A
+    // fixture whose file and row disagree would be rejected for a reason
+    // the test isn't about, so make them agree rather than loosening the
+    // check.
+    fs.utimesSync(absolute, new Date(mtime), new Date(mtime));
   }
 
   it("uploads once and attaches a second same-batch row sharing identical content", async () => {
@@ -426,8 +433,15 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  function touch(relPath: string, content: string): void {
-    fs.writeFileSync(path.join(root, relPath), content);
+  function touch(relPath: string, content: string, mtime = 1): void {
+    const absolute = path.join(root, relPath);
+    fs.writeFileSync(absolute, content);
+    // The rows below declare `mtime: 1`, and the upload path re-stats the
+    // file to confirm it hasn't changed since the scan that hashed it. A
+    // fixture whose file and row disagree would be rejected for a reason
+    // the test isn't about, so make them agree rather than loosening the
+    // check.
+    fs.utimesSync(absolute, new Date(mtime), new Date(mtime));
   }
 
   it("dispatch grows bytesTotal before completion advances bytesDone, for a genuine upload", async () => {
@@ -776,8 +790,15 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  function touch(relPath: string, content: string): void {
-    fs.writeFileSync(path.join(root, relPath), content);
+  function touch(relPath: string, content: string, mtime = 1): void {
+    const absolute = path.join(root, relPath);
+    fs.writeFileSync(absolute, content);
+    // The rows below declare `mtime: 1`, and the upload path re-stats the
+    // file to confirm it hasn't changed since the scan that hashed it. A
+    // fixture whose file and row disagree would be rejected for a reason
+    // the test isn't about, so make them agree rather than loosening the
+    // check.
+    fs.utimesSync(absolute, new Date(mtime), new Date(mtime));
   }
 
   it("leaves a failed upload's path dirty, with no entry written, while an unrelated success still lands", async () => {
@@ -865,6 +886,54 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     const entriesRepo = new EntriesRepository(candidateDb);
     expect(entriesRepo.get("bad.txt")).toBeUndefined();
     expect(entriesRepo.get("good.txt")?.hash).toEqual(expect.any(String));
+
+    candidateDb.close();
+  });
+
+  /**
+   * The cheap half of the stale-content guard. `encryptStream`'s
+   * `expectedHash` catches everything this does and more -- but only after
+   * the body is already in flight, which on a multi-GB file means sending
+   * the whole thing before rejecting it. A stat costs one syscall and
+   * rejects before the first byte, so both exist.
+   */
+  it("re-stats before uploading, rejecting a file that changed since it was scanned", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const scanned = "content as it was when update_cache hashed it";
+    touch("moved-on.txt", scanned);
+    // Same content, but the timestamp no longer matches the row -- the
+    // cheapest possible signal that a scan's conclusions are stale.
+    fs.utimesSync(path.join(root, "moved-on.txt"), new Date(5000), new Date(5000));
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [
+        {
+          path: "moved-on.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash: hashBufferHex(Buffer.from(scanned)),
+          size: scanned.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+      ],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+    );
+
+    // Nothing was sent at all -- that is the whole value over the hash
+    // check, which would have had to stream the file first.
+    expect(putObjectStreamMock).not.toHaveBeenCalled();
+    expect(result.uploadedObjects).toBe(0);
+    expect(result.handledPaths.has("moved-on.txt")).toBe(false);
+    expect(new EntriesRepository(candidateDb).get("moved-on.txt")).toBeUndefined();
 
     candidateDb.close();
   });
@@ -1009,8 +1078,15 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  function touch(relPath: string, content: string): void {
-    fs.writeFileSync(path.join(root, relPath), content);
+  function touch(relPath: string, content: string, mtime = 1): void {
+    const absolute = path.join(root, relPath);
+    fs.writeFileSync(absolute, content);
+    // The rows below declare `mtime: 1`, and the upload path re-stats the
+    // file to confirm it hasn't changed since the scan that hashed it. A
+    // fixture whose file and row disagree would be rejected for a reason
+    // the test isn't about, so make them agree rather than loosening the
+    // check.
+    fs.utimesSync(absolute, new Date(mtime), new Date(mtime));
   }
 
   it("never calls headObject when verifyRemote is left off (the default, ordinary-run shape)", async () => {

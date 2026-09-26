@@ -133,3 +133,43 @@ place, it rebuilds `objects` — which only works with foreign key enforcement s
 `entries.hash` references it; `runMigrations` handles that for the whole pass and runs a
 `foreign_key_check` inside each migration's own transaction. Its comment records why the two obvious
 alternatives silently do not work.
+
+## The invariant is enforced at write time, not merely assumed
+
+"An object at key H decrypts to content whose hash is H" is what makes all three shortcuts above sound
+— the local `objects` lookup, the `verifyRemote` HEAD check, and (for anyone mirroring) skip-if-exists.
+It used to be checked only at _read_ time, by `materialize` verifying decrypted content against the
+recorded hash, and merely assumed when writing.
+
+The gap is real and it is wide. `hash` and `size` come from the cache row `update_cache` wrote during
+sync's **scanning** phase; the bytes are read from disk during the **uploading** phase, which on a
+large vault is hours later. A file edited in between would be encrypted under the _old_ hash's context
+and stored at the old hash's key.
+
+A size change was already caught, by `readExact` in `encryptStream` running out of bytes. The dangerous
+case is a **size-preserving** edit: the byte count is right, so `ContentLength` matches and the
+CRC64NVME both ends compute agree on the bytes actually sent. Nothing else in the pipeline can tell.
+It would surface only on a much later `materialize` — quite possibly after `stubify` had removed the
+last local copy on the strength of that very upload.
+
+Two guards now close it, and neither subsumes the other:
+
+- **A re-stat before the first byte.** One syscall comparing mtime and size against the cache row.
+  Rejects the common case without sending anything, which on a multi-GB file is the difference between
+  wasting an upload and not starting one.
+- **`encryptStream`'s `expectedHash`.** The plaintext is hashed as it is read and compared _between
+  the last `readExact` and the last `yield`_ — the hash is complete, the final ciphertext chunk is not
+  yet emitted. Throwing there leaves the body short of the declared `ContentLength`, so the SDK aborts
+  the request mid-body and S3 discards an incomplete PUT; above the multipart threshold,
+  `CompleteMultipartUpload` is simply never called.
+
+That seam is what makes the object **never exist remotely**, rather than existing briefly and being
+deleted afterwards. The difference matters: a compensating delete leaves a window in which another
+machine's `verifyRemote` HEAD could adopt the bad object, and a failed cleanup would poison a
+content-addressed key permanently. Move the comparison anywhere else — upstream of the codec, or after
+the loop — and the seam is gone, which is why it lives inside the generator rather than around it.
+
+`putObjectStream` also aborts the in-flight request when the body fails. Rejecting the caller's promise
+only settles _our_ side; the SDK would keep waiting on a body that will never produce another byte, and
+Node would not exit until the socket timed out — around a minute per failed object, long after the
+failure was logged and moved past.

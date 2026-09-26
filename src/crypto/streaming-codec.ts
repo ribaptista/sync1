@@ -10,6 +10,7 @@ import {
   AEAD_TAG_BYTES,
   DEFAULT_CHUNK_SIZE,
 } from "./chunked-codec.js";
+import { StreamingHasher } from "./hash.js";
 
 /**
  * Streaming counterparts to chunked-codec.ts's whole-buffer encryptBuffer/
@@ -58,6 +59,33 @@ export function encryptedSize(
   return headerSize + totalPlaintextSize + totalChunks * AEAD_TAG_BYTES;
 }
 
+export interface EncryptStreamOptions {
+  chunkSize?: number;
+  /**
+   * BLAKE2b hex of the plaintext this stream is *supposed* to carry. When
+   * given, the plaintext is hashed as it is read and the stream errors
+   * rather than emitting its final chunk if the two disagree.
+   *
+   * Exists because the hash and the bytes are read at different times. A
+   * content object's `context` is its own content hash, computed during
+   * `update_cache` at the start of a sync; the bytes are read from disk
+   * during the upload phase, potentially hours later on a large vault. A
+   * file edited in between would be encrypted under the *old* hash's
+   * context and stored at the old hash's key — breaking the invariant that
+   * an object at key H decrypts to content hashing to H, which local
+   * dedup, the `verifyRemote` HEAD shortcut, and the mirror's
+   * skip-if-exists all rely on.
+   *
+   * The size-changing case is already caught by `readExact` below. This
+   * covers the silent one: a same-size edit produces a correct byte count,
+   * a matching `ContentLength`, and a checksum both ends agree on, so
+   * nothing else in the pipeline can tell. It would surface only on a much
+   * later `materialize`, which does verify decrypted content against the
+   * recorded hash — quite possibly after `stubify` removed the local copy.
+   */
+  expectedHash?: string;
+}
+
 /**
  * Encrypts a plaintext stream chunk-by-chunk. `totalPlaintextSize` must be
  * known upfront (a `fs.statSync` away for a caller reading from a file) --
@@ -72,13 +100,23 @@ export function encryptStream(
   totalPlaintextSize: number,
   masterKey: Buffer,
   context: Buffer,
-  chunkSize: number = DEFAULT_CHUNK_SIZE,
+  options: EncryptStreamOptions = {},
 ): Readable {
+  const { chunkSize = DEFAULT_CHUNK_SIZE, expectedHash } = options;
   const objectKey = deriveObjectKey(masterKey, context);
   const header = encodeHeader(context, chunkSize, totalPlaintextSize);
   const totalChunks = Math.ceil(totalPlaintextSize / chunkSize);
 
   async function* generate(): AsyncGenerator<Buffer> {
+    const hasher = expectedHash === undefined ? undefined : new StreamingHasher();
+
+    // A zero-byte plaintext never enters the loop below, so the header *is*
+    // the whole body and there would be nothing left to withhold once it
+    // has been yielded. Its hash is knowable immediately, so check first.
+    if (hasher && expectedHash !== undefined && totalChunks === 0) {
+      assertPlaintextHash(hasher, expectedHash);
+    }
+
     yield header;
     const reader = new StreamByteReader(sourceStream);
     for (let i = 0; i < totalChunks; i++) {
@@ -89,11 +127,33 @@ export function encryptStream(
           `chunk ${i}: expected ${len} plaintext bytes, got ${chunk?.length ?? 0} (source file changed size during read?)`,
         );
       }
+      hasher?.update(chunk);
+      // The seam this whole mechanism turns on: the final plaintext chunk
+      // is in hand, so the hash is complete -- and its ciphertext has not
+      // been emitted yet. Throwing here leaves the body short of the
+      // ContentLength the caller declared, so the SDK aborts the request
+      // mid-body and S3 discards an incomplete PUT (or, above the
+      // multipart threshold, never calls CompleteMultipartUpload). The
+      // object is therefore never created, rather than created and then
+      // cleaned up -- no window in which another machine's verifyRemote
+      // HEAD could adopt it, and no poisoned content key if the cleanup
+      // itself failed.
+      if (hasher && expectedHash !== undefined && i === totalChunks - 1) {
+        assertPlaintextHash(hasher, expectedHash);
+      }
       yield encryptChunk(chunk, objectKey, i);
     }
   }
 
   return Readable.from(generate());
+}
+
+function assertPlaintextHash(hasher: StreamingHasher, expectedHash: string): void {
+  const actual = hasher.digestHex();
+  if (actual === expectedHash) return;
+  throw new Error(
+    `plaintext hash ${actual} does not match the expected ${expectedHash} -- the file changed after it was hashed, so encrypting it under that hash's context would store the wrong content at a content-addressed key`,
+  );
 }
 
 /** Decrypts an encoded object stream chunk-by-chunk, verifying each chunk's AEAD tag as it goes. */

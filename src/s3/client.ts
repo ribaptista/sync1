@@ -178,30 +178,92 @@ export async function putObjectStream(
   contentLength: number,
 ): Promise<string> {
   const tap = new UploadChecksumTap();
+  const tapped = tap.tap(body);
+  // Aborting is not tidiness. Winning the race below only settles *our*
+  // promise; the SDK's request keeps waiting on a body that will never
+  // produce another byte, and Node will not exit until its socket times
+  // out -- around a minute per failed object, after the failure has already
+  // been logged and moved past. The signal collapses that to immediate.
+  const aborter = new AbortController();
+  const bodyFailed = firstBodyError(tapped, aborter);
 
-  if (contentLength < MULTIPART_THRESHOLD_BYTES) {
-    const result = await client.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: tap.tap(body),
-        ContentLength: contentLength,
-        ChecksumAlgorithm: "CRC64NVME",
-      }),
-    );
+  try {
+    if (contentLength < MULTIPART_THRESHOLD_BYTES) {
+      const result = await Promise.race([
+        client.send(
+          new PutObjectCommand({
+            Bucket: bucket,
+            Key: key,
+            Body: tapped,
+            ContentLength: contentLength,
+            ChecksumAlgorithm: "CRC64NVME",
+          }),
+          { abortSignal: aborter.signal },
+        ),
+        bodyFailed.promise,
+      ]);
+      const expected = await tap.checksum();
+      verifyStoredChecksum(key, expected, result.ChecksumCRC64NVME);
+      return expected;
+    }
+
+    const upload = new Upload({
+      client,
+      params: { Bucket: bucket, Key: key, Body: tapped, ChecksumAlgorithm: "CRC64NVME" },
+      // Also reaches CreateMultipartUpload/UploadPart in flight, and lets
+      // lib-storage run its own AbortMultipartUpload rather than leaving
+      // parts behind for S3 to keep billing for.
+      abortController: aborter,
+    });
+    const result = (await Promise.race([upload.done(), bodyFailed.promise])) as {
+      ChecksumCRC64NVME?: string;
+    };
     const expected = await tap.checksum();
     verifyStoredChecksum(key, expected, result.ChecksumCRC64NVME);
     return expected;
+  } finally {
+    bodyFailed.dispose();
   }
+}
 
-  const upload = new Upload({
-    client,
-    params: { Bucket: bucket, Key: key, Body: tap.tap(body), ChecksumAlgorithm: "CRC64NVME" },
+/**
+ * Turns a body-stream failure into a rejected promise the caller can await,
+ * instead of an unhandled `'error'` event that takes the process down.
+ *
+ * The body can fail for reasons that are the *point*, not accidents:
+ * `encryptStream` aborts mid-stream when the source file changed size, or
+ * when its plaintext stops matching the hash it is being stored under (see
+ * `EncryptStreamOptions`). Both must surface as a normal rejection, so the
+ * upload is abandoned and its row left dirty for the next sync — which is
+ * only true if someone is listening. Without this, a small-file PUT dies
+ * with `Unhandled 'error' event` before the caller's own try/catch can see
+ * anything, and the run's `--json` summary never gets written at all.
+ *
+ * Raced rather than merely observed, because the SDK may keep waiting on a
+ * body that will never produce another byte.
+ */
+function firstBodyError(
+  stream: Readable,
+  aborter: AbortController,
+): { promise: Promise<never>; dispose: () => void } {
+  let onError: ((err: Error) => void) | undefined;
+  const promise = new Promise<never>((_resolve, reject) => {
+    onError = (err: Error) => {
+      aborter.abort();
+      reject(err);
+    };
+    stream.once("error", onError);
   });
-  const result = (await upload.done()) as { ChecksumCRC64NVME?: string };
-  const expected = await tap.checksum();
-  verifyStoredChecksum(key, expected, result.ChecksumCRC64NVME);
-  return expected;
+  // An unsettled rejection handler on a stream that never errors would
+  // otherwise be reported as an unhandled rejection when the race is won by
+  // the upload instead.
+  promise.catch(() => undefined);
+  return {
+    promise,
+    dispose: () => {
+      if (onError) stream.off("error", onError);
+    },
+  };
 }
 
 export async function getObject(
