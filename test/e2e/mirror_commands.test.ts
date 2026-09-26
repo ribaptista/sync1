@@ -370,6 +370,77 @@ describe("mirror verify / catchup / prune", () => {
     fs.rmSync(mirror, { recursive: true, force: true });
   });
 
+  /**
+   * The last rung of catchup's ladder, and the only one that costs egress
+   * -- which is why it is behind a flag rather than a silent fallback.
+   * Reached by making every local source unusable: stubify removes the
+   * plaintext, so nothing but S3 can supply the bytes.
+   */
+  it("downloads from S3 only when asked, and verifies before publishing", async () => {
+    const { root, mirror } = await vaultWithMirror(1);
+    const objects = mirrorObjectFiles(mirror);
+    const original = fs.readFileSync(objects[0]!);
+
+    // Remove the local plaintext, so no local source remains.
+    const stubbed = await runCli(["stubify", "file-0.txt", "--root", root, "--json"]);
+    expect((JSON.parse(stubbed.stdout) as { stubified: number }).stubified).toBe(1);
+    fs.rmSync(objects[0]!);
+
+    // Without the flag: reported honestly, and the flag is named.
+    const refused = await runCli(["mirror", "catchup", "--root", root, "--json"], { env });
+    expect(refused.exitCode).not.toBe(0);
+    expect(
+      JSON.parse(refused.stdout) as {
+        recovered: number;
+        downloaded: number;
+        unrecoverable_locally: number;
+      },
+    ).toMatchObject({ recovered: 0, downloaded: 0, unrecoverable_locally: 1 });
+    expect(fs.existsSync(objects[0]!)).toBe(false);
+
+    // With it: fetched, checksum-verified, and byte-identical -- the same
+    // bytes S3 holds, not a re-encryption.
+    const downloaded = await runCli(
+      ["mirror", "catchup", "--allow-download", "--root", root, "--json"],
+      { env },
+    );
+    expect(downloaded.exitCode).toBe(0);
+    expect(
+      JSON.parse(downloaded.stdout) as { downloaded: number; unrecoverable_locally: number },
+    ).toMatchObject({ downloaded: 1, unrecoverable_locally: 0 });
+    expect(fs.readFileSync(objects[0]!).equals(original)).toBe(true);
+
+    const healed = await runCli(["mirror", "verify", "--checksum", "--root", root, "--json"], {
+      env,
+    });
+    expect(JSON.parse(healed.stdout) as VerifyJson).toMatchObject({ ok: true, missing: 0 });
+
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(mirror, { recursive: true, force: true });
+  });
+
+  /**
+   * Local plaintext must still win when both are available: it is free and
+   * instant where a download costs egress, and once archives are involved
+   * the difference is hours or days rather than milliseconds.
+   */
+  it("prefers local plaintext over downloading, even with --allow-download", async () => {
+    const { root, mirror } = await vaultWithMirror(1);
+    fs.rmSync(mirrorObjectFiles(mirror)[0]!);
+
+    const caught = await runCli(
+      ["mirror", "catchup", "--allow-download", "--root", root, "--json"],
+      { env },
+    );
+    expect(JSON.parse(caught.stdout) as { recovered: number; downloaded: number }).toMatchObject({
+      recovered: 1,
+      downloaded: 0,
+    });
+
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(mirror, { recursive: true, force: true });
+  });
+
   it("errors rather than reporting a clean zero when the mirror is unreachable", async () => {
     const { root, mirror } = await vaultWithMirror(1);
     fs.rmSync(mirror, { recursive: true, force: true });

@@ -15,7 +15,7 @@ import {
   mirrorVaultManifestPath,
 } from "../vault/mirror-paths.js";
 import { localVaultJsonPath } from "../vault/local-dir.js";
-import { Readable } from "node:stream";
+import type { Readable } from "node:stream";
 
 /**
  * How far a check reads. `presence` stats each object and compares size --
@@ -323,6 +323,45 @@ function removeQuietly(tempPath: string): void {
   } catch {
     // The reason the caller needs is the original failure, not this one.
   }
+}
+
+/**
+ * Downloads an object's ciphertext from S3 straight onto the mirror.
+ *
+ * The last resort in catchup's ladder, and the only step that costs
+ * egress -- which is why it is gated behind an explicit flag. Nothing is
+ * re-encrypted here: S3 already holds the exact bytes the mirror wants, so
+ * they are streamed through unchanged.
+ *
+ * Verified before publication all the same, against the same
+ * S3-corroborated checksum the local path uses. A download can be
+ * truncated or corrupted in transit, and a mirror is precisely the place
+ * where nobody would notice for years.
+ */
+export async function downloadObjectToMirror(
+  mirrorPath: string,
+  row: ObjectRow,
+  body: Readable,
+): Promise<boolean> {
+  const target = mirrorObjectPath(mirrorPath, row.hash);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tempPath = inTreeTempPath(target);
+
+  const tap = new UploadChecksumTap();
+  try {
+    await pipeline(tap.tap(body), fs.createWriteStream(tempPath));
+  } catch {
+    removeQuietly(tempPath);
+    throw new Error(`download of object ${row.hash} failed partway`);
+  }
+
+  if ((await tap.checksum()) !== row.ciphertext_checksum) {
+    removeQuietly(tempPath);
+    return false;
+  }
+
+  await renameWithRetry(tempPath, target);
+  return true;
 }
 
 export type { ObjectRow };

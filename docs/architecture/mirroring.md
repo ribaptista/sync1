@@ -131,6 +131,14 @@ the snapshot and the CAS is done, so the vault is committed whatever happens loc
 report a successful sync as a failure, _after_ the point of no return, leaving the caller nothing useful
 to retry.
 
+## Sequencing against an archive storage policy
+
+Worth repeating where it bites: a complete mirror makes `DEEP_ARCHIVE` attractive, because S3 stops
+being read for ordinary access and its latency stops mattering. But **complete the mirror first**. Once
+objects are archived, a gap can only be filled by `mirror catchup --allow-download --request-retrieval`,
+which means retrieval fees and a wait of hours to days per batch — where the same gap, filled while the
+plaintext is still local, costs nothing and finishes at disk speed.
+
 ## Restoring from it
 
 The mirror is a bucket in every respect but the protocol, so give it one:

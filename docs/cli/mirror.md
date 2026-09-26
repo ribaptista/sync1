@@ -11,7 +11,7 @@ the way it is. This page is about reading it back.
 
 ```bash
 sync1 mirror verify  [--root <path>] [--quick] [--checksum] [--offline] [--json]
-sync1 mirror catchup [--root <path>] [--allow-download] [--json]
+sync1 mirror catchup [--root <path>] [--allow-download] [--request-retrieval] [--json]
 sync1 mirror prune   [--root <path>] [--apply] [--json]
 ```
 
@@ -116,7 +116,31 @@ Either fails and nothing is published. Without that, catchup would be a silent-c
 `objects` has no path column, so a source is found through `entries.hash`, and that path may no longer
 hold the content the object was made from.
 
-An object with no usable local source is reported as `unrecoverable_locally` rather than guessed at.
+### When no local source exists
+
+Only then does S3 come into it, and only with `--allow-download` — the one step that costs egress, so it
+is an explicit choice rather than a silent fallback. The ciphertext is streamed straight onto the
+mirror without re-encryption (S3 already holds exactly the right bytes) but is still checked against the
+recorded checksum before publication: a download can be truncated in transit, and a mirror is precisely
+where nobody would notice for years.
+
+Archived objects reuse [`materialize`](materialize.md)'s four-state flow rather than inventing one:
+
+| Object state                             | Without `--request-retrieval`    | With it                    |
+| ---------------------------------------- | -------------------------------- | -------------------------- |
+| readable, or a restore already completed | downloaded                       | downloaded                 |
+| archived, nothing requested              | counted `archived_not_requested` | restore requested, counted |
+| restore already in flight                | counted `restore_pending`        | counted `restore_pending`  |
+
+A restore takes hours on `GLACIER` and up to two days on `DEEP_ARCHIVE`, and carries retrieval fees, so
+requesting one is opt-in and the honest answer is "run this again once they are ready". Neither a
+pending nor an unrequested restore makes the run fail; only an object nothing can supply does.
+
+This is also why the local-plaintext-first ladder matters more once archives are involved, not less: a
+local source is free and instant where S3 would be billable and measured in days.
+
+Without `--allow-download`, an object with no usable local source is reported as
+`unrecoverable_locally`, naming the flag — never guessed at.
 
 ---
 

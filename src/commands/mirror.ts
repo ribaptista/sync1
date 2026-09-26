@@ -12,7 +12,14 @@ import {
 } from "../vault/local-dir.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
 import { resolveMirrorPath, mirrorStateSnapshotPath } from "../vault/mirror-paths.js";
-import { createS3Client, getObject } from "../s3/client.js";
+import {
+  createS3Client,
+  getObject,
+  getObjectStream,
+  headObject,
+  restoreObject,
+} from "../s3/client.js";
+import { classifyArchiveStatus } from "../s3/archive-status.js";
 import {
   remoteKey,
   normalizePrefix,
@@ -36,6 +43,7 @@ import {
   findExtraMirrorObjects,
   walkMirrorTemps,
   writeVerifiedMirrorObject,
+  downloadObjectToMirror,
   MirrorCheckError,
   type MirrorVerifyDepth,
 } from "../fs/mirror-ops.js";
@@ -49,12 +57,22 @@ import { encryptedSize } from "../crypto/streaming-codec.js";
 import { HASH_BYTES } from "../crypto/hash.js";
 import type { Logger } from "../logger.js";
 
+/**
+ * Matched to `materialize`'s own values, deliberately: a restore requested
+ * by one command and consumed by the other should last the same length of
+ * time, and Standard tier is the sane default for a backup nobody is
+ * waiting on in real time.
+ */
+const RESTORE_DAYS = 7;
+const RESTORE_TIER = "Standard" as const;
+
 interface MirrorOptions extends OptionValues {
   root?: string;
   quick?: boolean;
   checksum?: boolean;
   offline?: boolean;
   allowDownload?: boolean;
+  requestRetrieval?: boolean;
   apply?: boolean;
 }
 
@@ -289,6 +307,10 @@ async function runCatchup(
   let recovered = 0;
   let alreadyPresent = 0;
   let unrecoverableLocally = 0;
+  let downloaded = 0;
+  let restoreRequested = 0;
+  let restorePending = 0;
+  let archivedNotRequested = 0;
 
   try {
     const objectsRepo = new ObjectsRepository(snapshot.db);
@@ -308,13 +330,67 @@ async function runCatchup(
         continue;
       }
 
-      unrecoverableLocally++;
-      logger.warn(
-        { hash: row.hash },
-        opts.allowDownload
-          ? "object has no usable local source and downloading is not implemented yet"
-          : "object has no usable local source -- every path referencing it is missing, stubbed, or edited",
-      );
+      // No local source: S3 is the only remaining option, and the only
+      // step that costs egress -- hence the explicit flag rather than a
+      // silent fallback that would reintroduce the cost this whole
+      // feature exists to avoid.
+      if (!opts.allowDownload) {
+        unrecoverableLocally++;
+        logger.warn(
+          { hash: row.hash },
+          "object has no usable local source -- every path referencing it is missing, stubbed, or edited; pass --allow-download to fetch it from S3",
+        );
+        continue;
+      }
+
+      const key = remoteKey(location, row.s3_key);
+      const head = await headObject(client, remoteConfig.bucket, key);
+      if (!head) {
+        unrecoverableLocally++;
+        logger.warn({ hash: row.hash }, "object has no local source and is missing in S3 too");
+        continue;
+      }
+
+      const status = classifyArchiveStatus(head);
+      if (status === "immediate" || status === "restore-ready") {
+        const stream = await getObjectStream(client, remoteConfig.bucket, key);
+        if (!stream || !(await downloadObjectToMirror(mirrorPath, row, stream.body))) {
+          unrecoverableLocally++;
+          logger.warn(
+            { hash: row.hash },
+            "downloaded object did not match its recorded checksum -- discarded rather than mirrored",
+          );
+          continue;
+        }
+        downloaded++;
+        logger.debug({ hash: row.hash }, "object downloaded from S3 to the mirror");
+        continue;
+      }
+
+      // Archived. Reuses materialize's own four-state flow rather than
+      // inventing one: a restore takes hours on Glacier and up to two days
+      // on Deep Archive, so the honest answer is to request it (when asked
+      // to) and have the user run this again later.
+      if (status === "restore-ongoing") {
+        restorePending++;
+        logger.debug({ hash: row.hash }, "a restore is already in flight for this object");
+        continue;
+      }
+
+      if (opts.requestRetrieval) {
+        await restoreObject(client, remoteConfig.bucket, key, {
+          days: RESTORE_DAYS,
+          tier: RESTORE_TIER,
+        });
+        restoreRequested++;
+        logger.debug({ hash: row.hash }, "requested a temporary restore");
+      } else {
+        archivedNotRequested++;
+        logger.warn(
+          { hash: row.hash, status },
+          "object is archived and no restore has been requested -- pass --request-retrieval to start one",
+        );
+      }
     }
 
     return {
@@ -323,8 +399,15 @@ async function runCatchup(
         metadata_fetched: metadataFetched,
         already_present: alreadyPresent,
         recovered,
+        downloaded,
+        restore_requested: restoreRequested,
+        restore_pending: restorePending,
+        archived_not_requested: archivedNotRequested,
         unrecoverable_locally: unrecoverableLocally,
       },
+      // A pending or unrequested restore is "come back later", not a
+      // failure -- the same reading materialize gives it. Only an object
+      // nothing can supply makes the run non-ok.
       ok: unrecoverableLocally === 0,
     };
   } finally {
@@ -448,6 +531,10 @@ export function registerMirrorCommand(program: Command): void {
       .option(
         "--allow-download",
         "permit fetching object content from S3 when no local source can supply it (costs egress)",
+      )
+      .option(
+        "--request-retrieval",
+        "with --allow-download, request a temporary restore for archived (GLACIER/DEEP_ARCHIVE) objects, which costs retrieval fees and takes hours to days",
       ),
   ).action(async (opts: MirrorOptions, command: Command) => {
     await runSubcommand("mirror_catchup", opts, command, runCatchup, summarizeCatchup);
@@ -511,13 +598,25 @@ function summarizeVerify(stats: Record<string, unknown>): string {
 }
 
 function summarizeCatchup(stats: Record<string, unknown>): string {
-  return (
+  let out =
     `mirror catchup: version ${String(stats.version_stamp)} -- ` +
     `${String(stats.metadata_fetched)} metadata file(s) fetched, ` +
-    `${String(stats.recovered)} object(s) recovered, ` +
+    `${String(stats.recovered)} recovered locally, ` +
+    `${String(stats.downloaded)} downloaded, ` +
     `${String(stats.already_present)} already present, ` +
-    `${String(stats.unrecoverable_locally)} with no usable local source\n`
-  );
+    `${String(stats.unrecoverable_locally)} with no usable source\n`;
+  const archived =
+    Number(stats.restore_requested) +
+    Number(stats.restore_pending) +
+    Number(stats.archived_not_requested);
+  if (archived > 0) {
+    out +=
+      `  archived: ${String(stats.restore_requested)} restore(s) requested, ` +
+      `${String(stats.restore_pending)} already in flight, ` +
+      `${String(stats.archived_not_requested)} not requested -- ` +
+      `run this again once they are ready\n`;
+  }
+  return out;
 }
 
 function summarizePrune(stats: Record<string, unknown>): string {
