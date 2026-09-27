@@ -3,6 +3,8 @@
 Downloads and materializes stub files matching a glob pattern — the counterpart to `stubify`, and how
 you get real content back after a stub-only restore (`attach_remote` + `sync`).
 
+> Full sequence-diagram trace: [materialize.md](../sequences/materialize.md).
+
 ## Usage
 
 ```bash

@@ -55,6 +55,15 @@ on a first sync, where every path in the vault is `created`.
   to read, and answering "0 changes" would say "nothing changed" when the truth is "nothing was looked
   at").
 
+## Flow
+
+After the ordinary lock/root-resolution preamble (see
+[flow-preamble.md](../sequences/flow-preamble.md)), this is one function: open `cache.db` read-only,
+call `CacheEntriesRepository.iterateDirty()` (keyset-paginated — deletions first, then everything else,
+each group path-sorted), filter by `--glob` in-memory as rows stream past, and emit + tally each
+surviving row as it arrives. Nothing is buffered, and nothing outside `cache.db` is ever touched — no
+diagram earns its place for a single paginated read.
+
 ## Example
 
 ```bash

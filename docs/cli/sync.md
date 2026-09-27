@@ -3,6 +3,8 @@
 The core command: reconciles local changes with the remote vault, in both directions, in one run.
 Internally runs `update_cache` first, so you never need to run that separately before `sync`.
 
+> Full sequence-diagram trace: [sync.md](../sequences/sync.md).
+
 ## Usage
 
 ```bash

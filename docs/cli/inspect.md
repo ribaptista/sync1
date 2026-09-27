@@ -61,6 +61,22 @@ downstream needs them, and there's no reason to hand that detail to arbitrary to
 - `0` — success (regardless of how many/few results were found).
 - `1` — the root isn't initialized/attached, or a filesystem/database error.
 
+## Flow
+
+After the ordinary lock/root-resolution preamble (see
+[flow-preamble.md](../sequences/flow-preamble.md)), an exact path is looked up directly on both sides
+(`cacheRepo.get`, `entriesRepo.get`); a glob instead unions every matching path from **both**
+`cache.db` and `state.db` into one sorted set first, then looks each one up the same way. A `state`
+result's `sequence` comes from a second lookup into `versions` by the entry's own `state_version`, and
+its `size` from a third into `objects` by hash — three small point lookups per result, never a join.
+
+Worth knowing when reading the source: `inspect` opens `cache.db` via `openCacheDb` (the read-write
+opener, which also runs migrations and creates the file if absent) rather than the read-only variant
+`diff`/`sanity_check`/`thumbnail` use — a write-shaped side effect in a command otherwise documented as
+purely read-only. It never issues a write statement of its own; the effect is limited to a fresh
+`cache.db` coming into existence (schema-migrated, no rows) the first time `inspect` is run before
+`update_cache` ever has been.
+
 ## Example
 
 ```bash

@@ -46,6 +46,14 @@ There's no SQL `GLOB` involved anywhere -- every match happens in memory, whethe
 from a database scan or directly from a filesystem walk. See
 [ignore-and-storage-policies.md](architecture/ignore-and-storage-policies.md) for why.
 
+## Command sequences
+
+For what actually happens, in what order, and what runs concurrently with what — as opposed to what a
+flag does (above) or why the design is what it is (below) — see
+[sequences/README.md](sequences/README.md): deep, code-derived sequence diagrams for the commands where a
+diagram earns its place, plus a set of reusable "flow" diagrams (locking, CAS commits, the mirror,
+pool-dispatch idioms, etc.) that those commands compose.
+
 ## Architecture
 
 | Doc                                                                                           | Covers                                                                                                                                                                                                         |

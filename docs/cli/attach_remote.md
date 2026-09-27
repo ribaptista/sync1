@@ -5,6 +5,8 @@ a backup already created with `init_remote`. This is also the entry point for "r
 onto a new machine: after attaching, running `sync` materializes the tree (as stub files by default,
 so nothing downloads until you ask for it via `materialize`).
 
+> Full sequence-diagram trace: [init_attach.md](../sequences/init_attach.md).
+
 ## Usage
 
 ```bash

@@ -5,6 +5,8 @@ storage after deleting files. Scoped to the **current** state only; see
 [garbage-collection-scope.md](../architecture/garbage-collection-scope.md) for the tradeoff this
 implies for old, retained `/states/<version>` snapshots.
 
+> Full sequence-diagram trace: [gc.md](../sequences/gc.md).
+
 ## Usage
 
 ```bash

@@ -7,6 +7,8 @@ it, every subcommand here errors rather than reporting a comforting zero.
 See [mirroring.md](../architecture/mirroring.md) for how the mirror is written and why it is laid out
 the way it is. This page is about reading it back.
 
+> Full sequence-diagram trace: [mirror.md](../sequences/mirror.md).
+
 ## Usage
 
 ```bash

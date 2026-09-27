@@ -21,7 +21,9 @@ themselves.
 
 `list` reads the already-locally-synced (decrypted) copy of `state.db` directly, so it needs no password.
 `create`/`edit`/`delete` mutate shared state, so each is a real commit (new state.db version, uploaded,
-CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactive prompt).
+CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactive prompt). See
+[policy_edit.md](../sequences/policy_edit.md) for that shared commit flow; `list` is a single read-only
+query with no diagram of its own.
 
 ## Two independent axes: sizing and encoding
 

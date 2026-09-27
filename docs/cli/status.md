@@ -4,6 +4,8 @@ A read-only report comparing every tracked object's actual S3 storage class agai
 `storage_policy` implies it should be. `converge` (a later command) applies the same evaluation instead
 of just counting it — `status` is the count-only, always-safe-to-run half.
 
+> Full sequence-diagram trace: [converge_status.md](../sequences/converge_status.md).
+
 ## Usage
 
 ```bash

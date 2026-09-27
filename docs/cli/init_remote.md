@@ -4,6 +4,8 @@ Creates a brand-new backup vault in S3 for a local root directory. Run this once
 first machine. To back up an _additional_ machine to a vault that already exists, use `attach_remote`
 instead (not yet implemented) — `init_remote` refuses to run against a non-empty S3 location.
 
+> Full sequence-diagram trace: [init_attach.md](../sequences/init_attach.md).
+
 ## Usage
 
 ```bash

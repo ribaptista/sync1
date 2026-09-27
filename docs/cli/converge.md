@@ -6,6 +6,8 @@ policies imply. Shares the exact same iteration/evaluation as [`status`](status.
 warmer one). No password needed — changing storage-class metadata or requesting a restore never reads
 or writes encrypted object content.
 
+> Full sequence-diagram trace: [converge_status.md](../sequences/converge_status.md).
+
 ## Usage
 
 ```bash

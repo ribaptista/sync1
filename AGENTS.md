@@ -82,3 +82,12 @@ LIMIT N`, never `OFFSET`) for SQLite queries that scan a table, not `.iterate()`
 Each task in the project plan names specific `docs/cli/*.md` (user-facing command docs) and
 `docs/architecture/*.md` (design-decision docs) files it must produce or update before it's done. See
 the plan file for the full list per task.
+
+`docs/sequences/*.md` holds sequence-diagram traces of command internals, strictly derived from the code
+(never inferred or idealized) — see [docs/sequences/README.md](docs/sequences/README.md) for the
+command-file/flow-file split. There is no automated check that these stay current; the only guard is
+manual. Every file names its `Derived from:` source files at the top, and every flow file also names its
+`Used by:` parents — when you change a source file named in a `Derived from:` line,
+`grep -rl "<that file>" docs/sequences/` finds every diagram that needs re-checking against it, and when
+you change a flow file's own behavior, its `Used by:` list names every command diagram whose composed
+step summary may now be stale too.

@@ -3,6 +3,8 @@
 Replaces fully-committed real files matching a glob pattern with stubs — freeing up local disk space
 for content you don't need materialized right now. The counterpart to `materialize`.
 
+> Full sequence-diagram trace: [stubify.md](../sequences/stubify.md).
+
 ## Usage
 
 ```bash

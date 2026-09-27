@@ -7,6 +7,8 @@ password (cache.db is unencrypted, see
 fine). `sync` runs this internally before doing anything else, but it's also useful standalone to see
 what's changed without pushing anything.
 
+> Full sequence-diagram trace: [update_cache.md](../sequences/update_cache.md).
+
 ## Usage
 
 ```bash

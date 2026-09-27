@@ -16,7 +16,9 @@ backing up the same vault agrees on the same rules. See
 
 `list` reads the already-locally-synced (decrypted) copy of `state.db` directly, so it needs no
 password. `create`/`edit`/`delete` mutate shared state, so each is a real commit (new state.db version,
-uploaded, CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactive prompt).
+uploaded, CAS'd against `/current`) and needs `SYNC1_PASSWORD` (or an interactive prompt). See
+[policy_edit.md](../sequences/policy_edit.md) for the shared commit flow `storage_policy`/
+`thumbnail_policy` reuse identically; `list` is a single read-only query with no diagram of its own.
 
 ## Usage
 

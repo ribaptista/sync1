@@ -9,6 +9,8 @@ rehashing local plaintext both need no decryption. See
 [ignore-and-storage-policies.md](../architecture/ignore-and-storage-policies.md) for how ignore-policy
 matching fits in.
 
+> Full sequence-diagram trace: [sanity_check.md](../sequences/sanity_check.md).
+
 ## Usage
 
 ```bash

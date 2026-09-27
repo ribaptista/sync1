@@ -8,6 +8,8 @@ materializing full-size originals. See [thumbnails.md](../architecture/thumbnail
 Local-only, same as `update_cache`/`sanity_check`: no password, no S3 client. `cache.db`/`state.db` are
 read (never written) and only the local filesystem is touched (a `_thumbnail/` file written or deleted).
 
+> Full sequence-diagram trace: [thumbnail.md](../sequences/thumbnail.md).
+
 ## Subcommands
 
 | Subcommand          | Writes anything?               | Description                                                   |
