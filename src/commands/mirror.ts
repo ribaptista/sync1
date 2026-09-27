@@ -11,7 +11,6 @@ import {
   localStateDbPath,
 } from "../vault/local-dir.js";
 import { parseRemoteConfig } from "../vault/remote-config.js";
-import { resolveMirrorPath, mirrorStateSnapshotPath } from "../vault/mirror-paths.js";
 import {
   createS3Client,
   getObject,
@@ -44,13 +43,15 @@ import {
   walkMirrorTemps,
   writeVerifiedMirrorObject,
   downloadObjectToMirror,
-  MirrorCheckError,
   type MirrorVerifyDepth,
 } from "../fs/mirror-ops.js";
 import {
   mirrorObjectPath,
+  mirrorStateSnapshotPath,
   mirrorCurrentPointerPath,
   mirrorVaultManifestPath,
+  requireReachableMirror,
+  MirrorCheckError,
 } from "../vault/mirror-paths.js";
 import { mirrorObjectExists } from "../fs/mirror-sink.js";
 import { encryptedSize } from "../crypto/streaming-codec.js";
@@ -95,17 +96,7 @@ function resolveMirror(root: string): {
   remoteConfig: ReturnType<typeof parseRemoteConfig>;
 } {
   const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
-  const mirrorPath = resolveMirrorPath(remoteConfig, root);
-  if (mirrorPath === undefined) {
-    throw new MirrorCheckError(
-      `no mirror_path configured in "${localRemoteConfigPath(root)}" -- add one to enable the mirror`,
-    );
-  }
-  if (!fs.existsSync(mirrorPath)) {
-    throw new MirrorCheckError(
-      `the configured mirror_path "${mirrorPath}" does not exist or is not reachable -- if it is a removable or network drive, mount it first`,
-    );
-  }
+  const mirrorPath = requireReachableMirror(remoteConfig, root, localRemoteConfigPath(root));
   return { mirrorPath, remoteConfig };
 }
 

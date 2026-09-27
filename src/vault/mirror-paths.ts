@@ -1,6 +1,15 @@
+import fs from "node:fs";
 import path from "node:path";
 import { objectKey, stateSnapshotKey, CURRENT_POINTER_KEY, VAULT_MANIFEST_KEY } from "./paths.js";
 import type { RemoteConfig } from "./remote-config.js";
+
+/**
+ * The mirror location itself is wrong, in one of the ways this module
+ * checks for: not configured, malformed, or configured but currently
+ * unreachable (an unmounted drive, a dropped network share). Every
+ * message names which.
+ */
+export class MirrorCheckError extends Error {}
 
 /**
  * Where a mirror's files live, derived from the *same* key functions the
@@ -71,4 +80,64 @@ export function resolveMirrorPath(config: RemoteConfig, root: string): string | 
   }
 
   return resolvedMirror;
+}
+
+/**
+ * Throws unless the mirror at `config.mirror_path` both resolves and is
+ * currently reachable on disk -- the precondition every `sync1 mirror`
+ * subcommand needs, since none of them mean anything without a mirror
+ * that is actually there right now.
+ *
+ * "Not configured" is itself a failure here, unlike
+ * `resolveReachableMirrorIfConfigured` below: a caller reaching for this
+ * variant is asking to *use* the mirror, not merely benefit from one if
+ * present.
+ */
+export function requireReachableMirror(
+  config: RemoteConfig,
+  root: string,
+  remoteConfigPath: string,
+): string {
+  const mirrorPath = resolveMirrorPath(config, root);
+  if (mirrorPath === undefined) {
+    throw new MirrorCheckError(
+      `no mirror_path configured in "${remoteConfigPath}" -- add one to enable the mirror`,
+    );
+  }
+  assertMirrorDirExists(mirrorPath);
+  return mirrorPath;
+}
+
+/**
+ * Resolves the mirror if one is configured and reachable, or `undefined`
+ * if none is configured at all -- but **throws if one is configured and
+ * cannot currently be reached**, rather than treating that the same as
+ * "no mirror".
+ *
+ * This is the shape a caller that merely *benefits* from a mirror needs
+ * (stubify's protective gate): no mirror configured, and a healthy
+ * mirror, both mean "proceed normally". A mirror that is configured but
+ * unreachable must never be silently read as "nothing is protected" --
+ * that reads as "every file is safe to stub" when the true answer is "I
+ * cannot tell". `mirrorObjectExists` alone cannot make this distinction
+ * (an unmounted drive and a genuinely-absent object both throw `ENOENT`),
+ * which is exactly the gap that let stubify skip every row with a
+ * misleading reason while an unmounted mirror sat untouched.
+ */
+export function resolveReachableMirrorIfConfigured(
+  config: RemoteConfig,
+  root: string,
+): string | undefined {
+  const mirrorPath = resolveMirrorPath(config, root);
+  if (mirrorPath === undefined) return undefined;
+  assertMirrorDirExists(mirrorPath);
+  return mirrorPath;
+}
+
+function assertMirrorDirExists(mirrorPath: string): void {
+  if (!fs.existsSync(mirrorPath)) {
+    throw new MirrorCheckError(
+      `the configured mirror_path "${mirrorPath}" does not exist or is not reachable -- if it is a removable or network drive, mount it first`,
+    );
+  }
 }

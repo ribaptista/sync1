@@ -224,7 +224,9 @@ describe("materialize / stubify", () => {
     const result = await runCli(["stubify", "a.txt", "--root", root, "--json"], {
       env: { SYNC1_PASSWORD: PASSWORD },
     });
-    expect(result.exitCode).toBe(0);
+    // A skip is a failure, not a clean run: this is the assertion whose
+    // absence let stubify report `ok:false` and still exit 0 for years.
+    expect(result.exitCode).not.toBe(0);
     const parsed = JSON.parse(result.stdout) as {
       ok: boolean;
       stubified: number;

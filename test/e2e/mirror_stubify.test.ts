@@ -87,6 +87,9 @@ describe("stubify's mirror gate", () => {
     expect(synced.exitCode).toBe(0);
 
     const refused = await runCli(["stubify", "a.txt", "--root", root, "--json"]);
+    // A skip is a failure, not a clean run -- stubify used to report
+    // ok:false here and still exit 0.
+    expect(refused.exitCode).not.toBe(0);
     const refusedJson = JSON.parse(refused.stdout) as StubifyJson;
     expect(refusedJson.stubified).toBe(0);
     expect(refusedJson.ok).toBe(false);
@@ -163,5 +166,55 @@ describe("stubify's mirror gate", () => {
 
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(mirror, { recursive: true, force: true });
+  });
+
+  /**
+   * The failure this gate exists to prevent, and the one that made
+   * `--skip-mirror`/`--allow-unmirrored` insufficient reasoning on their
+   * own: `mirrorObjectExists` maps `ENOENT` to "not present", which is
+   * indistinguishable from "the whole drive is gone" -- a genuinely
+   * mirrored file and an unmounted mirror look identical to a per-row
+   * `statSync`. Left unchecked, unplugging the drive and running
+   * `stubify` used to report every row as "not yet mirrored" (blaming the
+   * file) and still exit 0, so a caller doing `stubify && …` would
+   * proceed as though it had succeeded.
+   *
+   * The fix is a precondition, not a per-row check: refuse to run at all
+   * when a configured mirror cannot currently be reached, the same way
+   * `sync1 mirror verify` already refuses rather than reporting a
+   * comforting zero.
+   */
+  it("fails the whole run, not just per-row, when a configured mirror is unreachable", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTemp("gate-root");
+    const mirror = mkTemp("gate-drive");
+
+    await initVault(root, bucket);
+    setMirrorPath(root, mirror);
+    fs.writeFileSync(path.join(root, "a.txt"), "genuinely mirrored before the drive vanished");
+    await runCli(["update_cache", "--root", root, "--json"]);
+    const synced = await runCli(["sync", "--root", root, "--json"], { env });
+    expect((JSON.parse(synced.stdout) as { mirrored_objects: number }).mirrored_objects).toBe(1);
+
+    // Simulate an unmounted/disconnected drive: the configured path no
+    // longer resolves to anything at all.
+    fs.rmSync(mirror, { recursive: true, force: true });
+
+    const result = await runCli(["stubify", "a.txt", "--root", root, "--json"]);
+    expect(result.exitCode).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as { ok: boolean; error: string };
+    // The command-level error shape (ok/error), not the per-row
+    // stats/skipped shape -- this must never look like "one file was
+    // skipped", it has to look like "the run itself could not proceed".
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain(mirror);
+    expect(parsed.error).toMatch(/does not exist or is not reachable/);
+
+    // Nothing was touched -- the command refused before processing any row.
+    expect(fs.existsSync(path.join(root, "a.txt"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "a.txt.stub"))).toBe(false);
+
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });

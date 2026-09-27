@@ -65,9 +65,10 @@ enumerating one by one. See [thumbnails.md](../architecture/thumbnails.md) for t
 
 ## Exit codes
 
-- `0` — the command ran to completion (some paths may still be listed under `skipped`; see `ok`/`--json`
-  output rather than the exit code for that).
-- `1` — the root isn't initialized/attached, or a filesystem error.
+- `0` — every matched path was stubbed, already a stub, or excluded as a thumbnail; nothing was skipped.
+- `1` — the root isn't initialized/attached, a filesystem error, the mirror is configured but
+  unreachable (see below), or **one or more paths were skipped** (`ok: false`) — a skip is a failure,
+  not a clean run, even though the run itself completed and any un-skipped paths were still stubbed.
 
 ## Example
 
@@ -80,6 +81,13 @@ sync1 stubify "photos/2020/*" --root ~/Pictures --json
 When the vault has a `mirror_path` configured, a file whose content is not on the mirror is **skipped**,
 with `ok: false` and the reason `not yet mirrored`. `--allow-unmirrored` overrides it, and nothing
 changes at all for a vault with no mirror.
+
+A configured `mirror_path` that cannot currently be reached (an unmounted or disconnected drive, most
+commonly) is a **different, harder failure**: the command refuses to run at all, with a command-level
+error naming the path, rather than skipping every matched file with a reason that would incorrectly
+blame the files themselves. `mirrorObjectExists`'s per-file check cannot tell "this content genuinely
+isn't mirrored yet" from "the entire mirror just vanished" — both look like a missing file — so that
+distinction has to be made once, up front, instead of row by row.
 
 The reasoning is the same one that makes this command careful in the first place. Stubbing deletes the
 last _local_ copy of a file's content, on the strength of the remote one. With a mirror configured you

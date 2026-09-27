@@ -13,6 +13,7 @@ import {
   mirrorStateSnapshotPath,
   mirrorCurrentPointerPath,
   mirrorVaultManifestPath,
+  MirrorCheckError,
 } from "../vault/mirror-paths.js";
 import { localVaultJsonPath } from "../vault/local-dir.js";
 import type { Readable } from "node:stream";
@@ -44,8 +45,6 @@ export interface MirrorVerifyStats {
   /** Orphaned `.sync1-tmp-*` left by an interrupted write. */
   staleTemps: number;
 }
-
-export class MirrorCheckError extends Error {}
 
 /**
  * Fails unless the mirror's `vault.json` is byte-identical to the local
@@ -365,3 +364,4 @@ export async function downloadObjectToMirror(
 }
 
 export type { ObjectRow };
+export { MirrorCheckError };
