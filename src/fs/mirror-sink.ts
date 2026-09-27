@@ -215,7 +215,22 @@ export function teeStream(
     // source stalls forever waiting for a destroyed stream to drain -- the
     // upload would hang rather than finish.
     source.unpipe(secondary);
-    if (onSecondaryFailure === "abort-both") primary.destroy();
+    if (onSecondaryFailure === "abort-both") {
+      primary.destroy();
+    } else {
+      // The unpipe above is necessary but, on its own, not sufficient.
+      // Node's Readable shares ONE flowing/paused state across every
+      // `.pipe()` destination it has -- when a destination backs up or is
+      // destroyed mid-write, the source pauses as a whole, not just for
+      // that one destination, and unpiping the dead one does not resume
+      // it for the survivor. Confirmed directly: with only `unpipe()` and
+      // no `resume()`, a destination-secondary failure mid-stream left
+      // `primary` paused forever, receiving no more data and never itself
+      // erroring or ending -- a genuine hang, not a clean detach, for
+      // exactly the case (a mount failing partway through a large
+      // transfer) this mode exists to survive.
+      if (source.isPaused()) source.resume();
+    }
   });
 
   source.pipe(primary);

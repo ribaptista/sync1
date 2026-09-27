@@ -601,8 +601,38 @@ export async function applyLocalChangesToCandidate(
                   // lockstep. S3 therefore goes no faster than the mirror --
                   // accepted deliberately, in exchange for a clean sync
                   // meaning a complete mirror with no reconciliation pass.
-                  const { primary, secondary } = teeStream(encryptedStream);
-                  await Promise.all([uploadTo(primary), mirrorTo(secondary)]);
+                  //
+                  // The tee's own failure mode has to match what this
+                  // attempt intends to do with a mirror failure: `ignore`
+                  // wants S3 to finish regardless (`detach-secondary`),
+                  // `fail` wants the whole object abandoned together
+                  // (`abort-both`, the default). This is the one place that
+                  // decision actually gets made -- passing nothing here
+                  // silently defaults to `abort-both` for both modes,
+                  // which used to be exactly what happened.
+                  const { primary, secondary } = teeStream(
+                    encryptedStream,
+                    mirror.onMaxRetries === "ignore" ? "detach-secondary" : "abort-both",
+                  );
+                  // `Promise.all`, not `allSettled`, would reject the
+                  // instant *either* promise does -- abandoning whichever
+                  // one is still running rather than waiting for it. For a
+                  // still-running `uploadTo` that is exactly the danger:
+                  // its underlying PUT keeps executing in the background
+                  // regardless, and would go on to set `ciphertextChecksum`
+                  // whenever it eventually resolved -- including after
+                  // `withMirrorRetry` had already decided this attempt
+                  // failed and started a fresh one, so a stale, abandoned
+                  // attempt's success could silently leak into a *later*
+                  // attempt's bookkeeping. Waiting for both to settle here,
+                  // every time, is what keeps each attempt's outcome fully
+                  // its own.
+                  const [uploadOutcome, mirrorOutcome] = await Promise.allSettled([
+                    uploadTo(primary),
+                    mirrorTo(secondary),
+                  ]);
+                  if (uploadOutcome.status === "rejected") throw uploadOutcome.reason;
+                  if (mirrorOutcome.status === "rejected") throw mirrorOutcome.reason;
                 } else if (needsS3) {
                   await uploadTo(encryptedStream);
                 } else if (mirrorTarget !== undefined) {
@@ -668,6 +698,22 @@ export async function applyLocalChangesToCandidate(
           // flag stays false, so every row riding on this job -- the
           // dispatcher and every dedup attach alike -- stays dirty in
           // cache.db, exactly as if this run had never touched it.
+          //
+          // That guarantee rests entirely on `ciphertextChecksum` staying
+          // `undefined` here, and it is NOT automatically true: with a
+          // mirror configured, a retry attempt's S3 upload can succeed in
+          // full -- setting the checksum -- and the *mirror* half can
+          // still be what ultimately fails this whole unit (`fail` mode
+          // discarding a real success on principle; or a mirror error
+          // whose failure never engaged the tee's abort/detach logic at
+          // all, e.g. a synchronous pre-write error like `mkdirSync`
+          // throwing before either stream starts flowing, so a perfectly
+          // healthy S3 side completes independently regardless of mode).
+          // A checksum set by an attempt this catch is discarding must not
+          // survive into the commit below, or the object gets recorded as
+          // uploaded despite every row riding on it being told it wasn't.
+          ciphertextChecksum = undefined;
+          wroteMirror = false;
           // abort() (not finish()) is what keeps the bar honest: this
           // file's bytes never actually reached S3, so they must not be
           // counted as transferred.

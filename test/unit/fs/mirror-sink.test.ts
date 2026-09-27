@@ -203,6 +203,77 @@ describe("teeStream", () => {
 
     await expect(collect(secondary)).rejects.toThrow();
   });
+
+  /**
+   * A source with multiple chunks and a real gap between them, consumed
+   * via `collect`'s `for await` -- both are load-bearing. A single-chunk
+   * source (as above) never exercises Node's own pipe backpressure at
+   * all, since everything is already buffered by the time either
+   * destination is touched; a plain event-listener consumer doesn't
+   * observe the specific failure mode (a stream that is destroyed but
+   * neither ends nor errors reads as a silent hang, not a rejection,
+   * under `.on("data"/"end")`, and only `for await`'s async-iterator
+   * protocol turns that into `ERR_STREAM_PREMATURE_CLOSE`).
+   */
+  function multiChunkSource(): Readable {
+    return Readable.from(
+      (async function* () {
+        yield Buffer.from("chunk-1-");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        yield Buffer.from("chunk-2-");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        yield Buffer.from("chunk-3-");
+      })(),
+    );
+  }
+
+  /** Destroys `secondary` right after its first chunk, mid-stream. */
+  function sabotageSecondaryMidStream(secondary: Readable): void {
+    let received = 0;
+    secondary.on("data", (chunk: Buffer) => {
+      received += chunk.length;
+      if (received >= "chunk-1-".length) {
+        secondary.destroy(new Error("simulated mid-write mirror failure"));
+      }
+    });
+    secondary.on("error", () => {
+      // Consumed here so it never becomes an unhandled rejection; the
+      // assertions below read primary, not secondary.
+    });
+  }
+
+  /**
+   * The defect this pins: `Readable` shares ONE flowing/paused state
+   * across every `.pipe()` destination it has. When `secondary` backs up
+   * or is destroyed mid-write, the *whole source* pauses -- not just the
+   * path to `secondary` -- and `source.unpipe(secondary)` alone does not
+   * resume it for `primary`. Without an explicit `resume()`, `primary`
+   * receives its first chunk and then nothing else, forever: it neither
+   * completes nor errors, which is a genuine hang, not a clean detach --
+   * for exactly the real-world case (a mount failing partway through a
+   * multi-GB transfer) `detach-secondary` exists to survive.
+   */
+  it("detach-secondary: a mid-stream secondary failure does not stall the primary", async () => {
+    const { primary, secondary } = teeStream(multiChunkSource(), "detach-secondary");
+    sabotageSecondaryMidStream(secondary);
+
+    const result = await collect(primary);
+    expect(result.toString()).toBe("chunk-1-chunk-2-chunk-3-");
+  });
+
+  /**
+   * The counterpart: `abort-both` must still genuinely abort `primary` for
+   * the identical mid-stream failure, not merely for the single-chunk,
+   * already-buffered case the older test above covers. Guards against a
+   * fix for the hang above accidentally making `abort-both` stop
+   * aborting.
+   */
+  it("abort-both: a mid-stream secondary failure still aborts the primary, not just a single-chunk one", async () => {
+    const { primary, secondary } = teeStream(multiChunkSource(), "abort-both");
+    sabotageSecondaryMidStream(secondary);
+
+    await expect(collect(primary)).rejects.toThrow();
+  });
 });
 
 function safeReaddir(dirPath: string): string[] {
