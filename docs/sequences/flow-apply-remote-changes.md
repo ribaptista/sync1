@@ -101,7 +101,7 @@ sequenceDiagram
             Job->>FS: rm tmpPath
             Job--xJob: throw CorruptionError
         else
-            Job->>FS: renameSync(tmpPath, absolutePath)
+            Job->>FS: durableRename(tmpPath, absolutePath) -- fsync'd, see flow-atomic-publish.md
         end
     end
 

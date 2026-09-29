@@ -14,6 +14,7 @@ import { stubPathFor } from "./stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "./decrypt-to-file.js";
 import { inTreeTempPath } from "./temp-path.js";
+import { durableRename } from "./durable.js";
 import {
   waitForRoom,
   createPoolErrorBox,
@@ -245,7 +246,7 @@ export async function materializeGlob(
                     );
                   }
 
-                  fs.renameSync(tmpPath, absolutePath);
+                  durableRename(tmpPath, absolutePath);
                 },
                 {
                   onRetry: (notice) => {
@@ -265,7 +266,7 @@ export async function materializeGlob(
                   },
                 },
               );
-              // materialize first...
+              // materialize first, durably (fsync'd data, fsync'd rename)...
               fs.rmSync(stubAbsolutePath); // ...only then delete the stub
 
               cacheRepo.upsert({ ...row, mtime: Math.round(fs.statSync(absolutePath).mtimeMs) });

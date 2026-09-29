@@ -79,7 +79,7 @@ sequenceDiagram
             Job->>FS: rm tmpPath
             Job--xJob: throw CorruptionError
         else
-            Job->>FS: fs.renameSync(tmpPath, absolutePath) -- see flow-atomic-publish.md<br/>(this call site does NOT use renameWithRetry)
+            Job->>FS: durableRename(tmpPath, absolutePath) -- fsync'd, no retry -- see flow-atomic-publish.md
         end
     end
     Job->>FS: rm the stub -- ONLY after the real file is already in place

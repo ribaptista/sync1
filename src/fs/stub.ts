@@ -7,6 +7,7 @@ import {
 } from "../crypto/hash.js";
 import { CorruptionError } from "../errors.js";
 import { inTreeTempPath } from "./temp-path.js";
+import { durableRename } from "./durable.js";
 
 export function stubPathFor(realAbsolutePath: string): string {
   return `${realAbsolutePath}.stub`;
@@ -35,9 +36,17 @@ export function readStubHash(absoluteStubPath: string): string {
   return parsed.hex;
 }
 
-/** Writes a stub file atomically (tmp + rename) so a crash never leaves a half-written stub. */
+/**
+ * Writes a stub file durably (tmp + fsync + rename + directory fsync) so a
+ * crash never leaves a half-written stub *or* an ordinary rename that never
+ * actually reached disk -- see `durableRename`. This matters more than most
+ * of this idiom's other call sites: `stubify` deletes the real file
+ * immediately after this returns, on the strength of the stub now standing
+ * in for it, so a stub that silently didn't survive a crash here would
+ * leave neither a stub nor real content behind.
+ */
 export function writeStubAtomic(absoluteStubPath: string, hashHex: string): void {
   const tmpPath = inTreeTempPath(absoluteStubPath);
   fs.writeFileSync(tmpPath, formatTaggedHash(hashHex));
-  fs.renameSync(tmpPath, absoluteStubPath);
+  durableRename(tmpPath, absoluteStubPath);
 }

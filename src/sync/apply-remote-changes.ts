@@ -17,6 +17,7 @@ import { writeStubAtomic, stubPathFor } from "../fs/stub.js";
 import { CorruptionError } from "../errors.js";
 import { decryptStreamToFile } from "../fs/decrypt-to-file.js";
 import { inTreeTempPath } from "../fs/temp-path.js";
+import { durableRename } from "../fs/durable.js";
 import {
   waitForRoom,
   createPoolErrorBox,
@@ -372,7 +373,7 @@ async function applyRemoteContentChange(
               );
             }
 
-            fs.renameSync(tmpPath, absolutePath);
+            durableRename(tmpPath, absolutePath);
           },
           {
             onRetry: (notice) => {

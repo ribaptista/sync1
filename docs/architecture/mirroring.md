@@ -97,6 +97,15 @@ exactly where it matters most.
 Unlike S3, the mirror therefore needs no abort seam: a stream that errors partway leaves only a temp,
 removed on the failing path and swept later.
 
+**Atomic and durable are different properties, and the mirror needs both.** A bare rename is atomic --
+nobody ever sees a half-written file -- but a crash can still lose the temp file's own unflushed bytes
+before the rename even happens, or (on some filesystems, ext4 without `dirsync` most notably) roll back
+the rename's own directory-entry change if it was never `fsync`'d. Either way the existence check above
+would keep trusting a file that is now truncated, garbage, or simply gone -- forever, since nothing ever
+re-checks it once written. `durableRenameWithRetry` (`src/fs/durable.ts`) closes both gaps: `fsync` the
+temp file, rename it (retried through the usual `EBUSY`/`EPERM`/`EACCES` budget for a network mount or
+external drive), then `fsync` the destination directory.
+
 ## Failure, retries, and the two budgets
 
 Mirror failures are retried on a **bounded** budget — five attempts, 50 ms exponential — deliberately

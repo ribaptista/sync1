@@ -2,8 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { PassThrough, type Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { renameWithRetry } from "./safe-fs.js";
 import { inTreeTempPath } from "./temp-path.js";
+import { durableRenameWithRetry } from "./durable.js";
 
 /**
  * Errno values worth waiting out on a local or SMB target.
@@ -134,10 +134,17 @@ export function mirrorObjectExists(absolutePath: string, expectedSize: number): 
 }
 
 /**
- * Writes `bytes` to `absolutePath` atomically: a sibling temp, then a
- * rename. A reader therefore never sees a partial file, and an interrupted
- * write leaves an obviously-named orphan rather than a plausible-looking
- * truncated object.
+ * Writes `bytes` to `absolutePath` durably: a sibling temp, fsync'd, then
+ * published by rename, with the destination directory itself fsync'd
+ * afterward (`durableRenameWithRetry`, `src/fs/durable.ts`). A reader
+ * therefore never sees a partial file, an interrupted write leaves an
+ * obviously-named orphan rather than a plausible-looking truncated object,
+ * and -- the gap a bare rename alone doesn't close -- a crash right after
+ * publishing can't silently roll the rename back or leave truncated bytes
+ * in its place. This matters more here than at most of this idiom's other
+ * call sites: `mirrorObjectExists` (below) trusts a file at the expected
+ * size as proof the mirror already holds this content, forever, with no
+ * later re-check.
  *
  * The temp is a sibling (`inTreeTempPath`) so the rename cannot cross a
  * filesystem -- on a mirror that is also a network mount, a temp in
@@ -155,7 +162,7 @@ export async function writeMirrorFile(absolutePath: string, bytes: Buffer): Prom
         removeQuietly(tempPath);
         throw err;
       }
-      await renameWithRetry(tempPath, absolutePath);
+      await durableRenameWithRetry(tempPath, absolutePath);
     }),
   );
 }
@@ -240,7 +247,12 @@ export function teeStream(
 }
 
 /**
- * Streams ciphertext to the mirror, published by rename on success.
+ * Streams ciphertext to the mirror, published durably by
+ * `durableRenameWithRetry` on success -- fsync'd before the rename, and the
+ * destination directory fsync'd after, same as `writeMirrorFile` above and
+ * for the same reason: this file's mere existence at the right size is
+ * what `mirrorObjectExists` treats as permanent proof of a complete mirror
+ * copy.
  *
  * Unlike S3, the mirror needs no abort seam: nothing is visible at the
  * destination until the rename, so a stream that errors partway simply
@@ -257,7 +269,7 @@ export async function writeMirrorStream(absolutePath: string, source: Readable):
     removeQuietly(tempPath);
     throw err;
   }
-  await renameWithRetry(tempPath, absolutePath);
+  await durableRenameWithRetry(tempPath, absolutePath);
 }
 
 /**
