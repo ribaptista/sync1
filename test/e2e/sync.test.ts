@@ -249,6 +249,7 @@ describe("sync (local-to-remote, single machine)", () => {
       remote_modified: 0,
       remote_deleted: 0,
       conflicts: [],
+      failed: [],
       case_collisions: [],
       ignored_but_synced: [],
       dropped_ignored: [],
@@ -277,6 +278,7 @@ describe("sync (local-to-remote, single machine)", () => {
       remote_modified: 0,
       remote_deleted: 0,
       conflicts: [],
+      failed: [],
       case_collisions: [],
       ignored_but_synced: [],
       dropped_ignored: [],
@@ -284,5 +286,71 @@ describe("sync (local-to-remote, single machine)", () => {
 
     fs.rmSync(rootA, { recursive: true, force: true });
     fs.rmSync(rootB, { recursive: true, force: true });
+  });
+
+  /**
+   * Regression test for a silently-successful sync: a per-object upload
+   * failure used to be swallowed beyond a log line, with the run reporting
+   * `ok: true`/exit 0 as long as *something* in the batch committed. Made
+   * unreadable (not merely a permissions edge case): update_cache has
+   * already hashed the file successfully by the time this runs, so the
+   * failure surfaces specifically inside the upload phase's own read, not
+   * the scan.
+   */
+  it("reports a per-object upload failure honestly -- non-zero exit, ok: false, named in failed", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--prefix",
+        "v0",
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    fs.writeFileSync(path.join(root, "good.txt"), "this one uploads fine");
+    fs.writeFileSync(path.join(root, "bad.txt"), "this one will fail to read at upload time");
+    await runCli(["update_cache", "--root", root, "--json"]);
+
+    // Unreadable only now, after update_cache already hashed it -- the
+    // failure this test is about happens during the upload phase's own
+    // read, not the scan.
+    fs.chmodSync(path.join(root, "bad.txt"), 0o000);
+
+    const synced = await runCli(["sync", "--root", root, "--json"], {
+      env: { SYNC1_PASSWORD: PASSWORD },
+    });
+
+    expect(synced.exitCode).toBe(1);
+    const result = JSON.parse(synced.stdout) as {
+      ok: boolean;
+      uploaded_objects: number;
+      failed: Array<{ path: string; hash: string; error: string }>;
+    };
+    expect(result.ok).toBe(false);
+    // The unrelated file still succeeded -- one bad file doesn't take
+    // down the rest of the batch.
+    expect(result.uploaded_objects).toBe(1);
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0]!.path).toBe("bad.txt");
+
+    // The failed row is still pending for a future sync (once the
+    // permission issue is fixed) -- never silently dropped.
+    fs.chmodSync(path.join(root, "bad.txt"), 0o644);
+    const diff = await runCli(["diff", "--root", root, "--json"]);
+    const diffLines = diff.stdout.trim().split("\n");
+    expect(JSON.parse(diffLines.at(-1)!) as { total: number }).toMatchObject({ total: 1 });
+
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });

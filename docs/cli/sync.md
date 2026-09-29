@@ -50,6 +50,21 @@ overwritten, and its `cache.db` row stays dirty so the next `sync` re-evaluates 
 it by hand (there's no built-in merge UI — resolution means deciding which side's content should win and
 making the local file match that before syncing again).
 
+## Failed uploads
+
+Distinct from a conflict: a conflict is a human decision this run correctly declined to make; a failed
+upload is this run trying and not succeeding -- a non-transient S3 error, a file that changed since it
+was scanned, or (under `--on-mirror-max-retries ignore`) a mirror write that failed on a unit whose S3
+half never completed either. One bad file doesn't take down the rest of the batch: everything else still
+commits, and the failed path's `cache.db` row stays dirty for the next `sync` to retry, exactly like a
+conflict. Unlike a conflict, no manual resolution is needed -- fixing whatever made the upload fail (a
+permission problem, a flaky link, restoring the file to what it was when it was scanned) and running
+`sync` again is enough.
+
+`ok` is `false` and the run exits non-zero whenever `failed` is non-empty -- this used to be silent
+beyond a debug log line, with the run reporting `ok: true` as long as _something_ in the batch
+committed.
+
 ## Recovering from an aborted run
 
 A `sync` killed mid-upload (Ctrl+C, a crash) can leave objects genuinely present on S3 with no local
@@ -84,21 +99,25 @@ face value.
   "remote_created": 1,
   "remote_modified": 0,
   "remote_deleted": 0,
-  "conflicts": []
+  "conflicts": [],
+  "failed": []
 }
 ```
 
 When there are unresolved conflicts, `ok` is `false` and `conflicts` is a non-empty array of
-`{ "path": "...", "reason": "..." }`.
+`{ "path": "...", "reason": "..." }`. When there are failed uploads (see **Failed uploads** above),
+`ok` is `false` and `failed` is a non-empty array of `{ "path": "...", "hash": "...", "error": "..." }`.
 
 ## Exit codes
 
-- `0` — success, no conflicts.
-- `1` — a hard failure unrelated to conflicts (network/S3 error, corrupt vault, missing password, or a
-  mirror write that exhausted its retries under the default `--on-mirror-max-retries fail` — see
-  **Mirroring to a second copy** below).
-- `2` — completed with one or more unresolved conflicts, or the remote moved on mid-attempt (a CAS race
-  against another machine's concurrent commit) — in the CAS-race case, just run `sync` again.
+- `0` — success, no conflicts, no failed uploads.
+- `1` — either a hard failure that aborted the run before anything committed (network/S3 error, corrupt
+  vault, missing password, or a mirror write that exhausted its retries under the default
+  `--on-mirror-max-retries fail` — see **Mirroring to a second copy** below), or a run that completed
+  with one or more failed uploads (see **Failed uploads** above) and no conflicts.
+- `2` — completed with one or more unresolved conflicts (whether or not any uploads also failed), or the
+  remote moved on mid-attempt (a CAS race against another machine's concurrent commit) — in the
+  CAS-race case, just run `sync` again.
 
 ## Example
 

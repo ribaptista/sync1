@@ -150,7 +150,8 @@ sequenceDiagram
         Job->>Job: mirrorFailures++ -- S3 already has it, verified; mirror stays behind for catchup
     else attempt failed for any other reason
         Job->>Job: ciphertextChecksum=undefined; wroteMirror=false<br/>fileTracker.abort(); inFlightByHash.delete(hash)
-        note over Job: swallowed here -- every row riding on this job stays dirty
+        Job->>Job: failed.push({path, hash, error}) for each row in job.sourceRows
+        note over Job: swallowed here -- every row riding on this job stays dirty,<br/>but no longer silently: `failed` is what SyncResult/--json surface
     end
 
     alt ciphertextChecksum is set

@@ -884,6 +884,17 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     expect(result.uploadedObjects).toBe(1);
     expect(result.conflicts).toEqual([]); // failed, not merely conflicted -- a different case
 
+    // The point of this fix: a swallowed upload failure is no longer
+    // silent beyond a log line -- it's reported here, for the caller
+    // (sync's own summary/--json/exit code) to surface.
+    expect(result.failed).toEqual([
+      {
+        path: "bad.txt",
+        hash: hashBufferHex(Buffer.from(badContent)),
+        error: "simulated permanent failure",
+      },
+    ]);
+
     const entriesRepo = new EntriesRepository(candidateDb);
     expect(entriesRepo.get("bad.txt")).toBeUndefined();
     expect(entriesRepo.get("good.txt")?.hash).toEqual(expect.any(String));
@@ -995,6 +1006,14 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     expect(result.appliedCount).toBe(0);
     expect(result.uploadedObjects).toBe(0);
     expect(result.dedupedObjects).toBe(0);
+
+    // Both paths riding on the failed job are reported, not just the one
+    // that dispatched it -- a dedup attach's own row must not go missing
+    // from this accounting just because it never got a dispatch of its own.
+    expect(result.failed).toEqual([
+      { path: "a.txt", hash, error: "simulated permanent failure" },
+      { path: "b.txt", hash, error: "simulated permanent failure" },
+    ]);
 
     const entriesRepo = new EntriesRepository(candidateDb);
     expect(entriesRepo.get("a.txt")).toBeUndefined();

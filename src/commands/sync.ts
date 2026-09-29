@@ -1,7 +1,13 @@
 import fs from "node:fs";
 import type { Command, OptionValues } from "commander";
 import type { Logger } from "../logger.js";
-import { emitJson, emitError, exitCodeForError, EXIT_CONFLICT } from "../cli/output.js";
+import {
+  emitJson,
+  emitError,
+  exitCodeForError,
+  EXIT_CONFLICT,
+  EXIT_GENERIC_ERROR,
+} from "../cli/output.js";
 import { getPassword } from "../cli/password.js";
 import { createS3Client } from "../s3/client.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
@@ -70,7 +76,8 @@ export function registerSyncCommand(program: Command): void {
         const result = await runSync(opts, globalOpts, logger, showProgress);
         const hasConflicts = result.conflicts.length > 0;
         const hasCaseCollisions = result.caseCollisions.length > 0;
-        const hasIssues = hasConflicts || hasCaseCollisions;
+        const hasFailed = result.failed.length > 0;
+        const hasIssues = hasConflicts || hasCaseCollisions || hasFailed;
 
         if (json) {
           emitJson({
@@ -86,6 +93,7 @@ export function registerSyncCommand(program: Command): void {
             remote_modified: result.remoteModified,
             remote_deleted: result.remoteDeleted,
             conflicts: result.conflicts,
+            failed: result.failed,
             case_collisions: result.caseCollisions.map((c) => ({
               path: c.path,
               collides_with: c.collidesWith,
@@ -114,6 +122,12 @@ export function registerSyncCommand(program: Command): void {
             process.stdout.write(`${result.conflicts.length} conflict(s) left unresolved:\n`);
             for (const c of result.conflicts) process.stdout.write(`  - ${c.path}: ${c.reason}\n`);
           }
+          if (hasFailed) {
+            process.stdout.write(
+              `${result.failed.length} upload(s) failed and were left dirty for the next sync:\n`,
+            );
+            for (const f of result.failed) process.stdout.write(`  - ${f.path}: ${f.error}\n`);
+          }
           if (hasCaseCollisions) {
             process.stdout.write(
               `${result.caseCollisions.length} case-insensitive collision(s) detected (not synced):\n`,
@@ -140,7 +154,14 @@ export function registerSyncCommand(program: Command): void {
           }
         }
 
-        if (hasIssues) process.exitCode = EXIT_CONFLICT;
+        // Conflicts/case-collisions are a human decision this run correctly
+        // declined to make, and take priority over a plain failure when
+        // both occur in the same run -- EXIT_CONFLICT either way. A run
+        // with failed uploads but no conflicts is a different kind of
+        // problem (this run tried and didn't succeed, not "waiting on a
+        // human"), and gets the generic hard-failure code instead.
+        if (hasConflicts || hasCaseCollisions) process.exitCode = EXIT_CONFLICT;
+        else if (hasFailed) process.exitCode = EXIT_GENERIC_ERROR;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.debug({ err: message }, "sync failed");

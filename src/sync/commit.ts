@@ -62,6 +62,14 @@ export interface SyncResult {
   remoteDeleted: number;
   conflicts: SyncConflict[];
   /**
+   * One entry per path whose upload genuinely failed this run and was left
+   * dirty for a later sync to retry -- see `ApplyLocalChangesResult.failed`
+   * (`apply-local-changes.ts`) for the full set of cases this covers. Any
+   * non-empty `failed` fails the run: `ok: false`, non-zero exit, same as
+   * `conflicts`.
+   */
+  failed: Array<{ path: string; hash: string; error: string }>;
+  /**
    * Case-insensitive path collisions found while this run's own internal
    * update_cache scan staged its diff -- surfaced here (rather than only
    * logged and silently dropped) since sync's caller has no other way to
@@ -440,6 +448,7 @@ export async function performSync(
           remoteModified: remoteResult.modified,
           remoteDeleted: remoteResult.deleted,
           conflicts: localResult.conflicts,
+          failed: localResult.failed,
           caseCollisions: updateCacheStats.caseCollisions,
           ignoredButSynced: remoteResult.ignoredButSynced,
           droppedIgnored: updateCacheStats.droppedIgnored,
@@ -503,6 +512,7 @@ export async function performSync(
         remoteModified: remoteResult.modified,
         remoteDeleted: remoteResult.deleted,
         conflicts: localResult.conflicts,
+        failed: localResult.failed,
         caseCollisions: updateCacheStats.caseCollisions,
         ignoredButSynced: remoteResult.ignoredButSynced,
         droppedIgnored: updateCacheStats.droppedIgnored,

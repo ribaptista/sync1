@@ -69,9 +69,15 @@ sequenceDiagram
 
 ## Output
 
-`ok` is `false` (and exit code `EXIT_CONFLICT`) whenever `conflicts` or `caseCollisions` is non-empty —
-every other outcome, including `mirrorFailures > 0` under `--on-mirror-max-retries ignore`, is reported
-as a successful run (`mirror catchup` is the fix, not a re-run of `sync`). A thrown `RemoteDivergedError`
+`ok` is `false` whenever `conflicts`, `caseCollisions`, or `failed` is non-empty. Exit code:
+`EXIT_CONFLICT` when `conflicts` or `caseCollisions` is non-empty (regardless of `failed`);
+`EXIT_GENERIC_ERROR` when only `failed` is. `failed` is `ApplyLocalChangesResult.failed`
+(`apply-local-changes.ts`) passed straight through `SyncResult` -- one entry per path whose upload was
+swallowed by the per-object catch there rather than escalated (the escalated case, `MirrorRequiredError`,
+is covered below). `mirrorFailures > 0` under `--on-mirror-max-retries ignore` is, by contrast, never a
+failure: the object committed, and `mirror catchup` (not a `sync` re-run) is the fix.
+
+A thrown `RemoteDivergedError`
 (the CAS genuinely lost a race — see [`flow-cas-commit.md`](flow-cas-commit.md), Shape 1) also exits
 `EXIT_CONFLICT`; every other thrown error maps through `exitCodeForError`, which includes
 `MirrorRequiredError` — a mirror write that exhausted its retries under the default

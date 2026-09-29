@@ -80,6 +80,18 @@ export interface ApplyLocalChangesResult {
   appliedCount: number;
   /** { path, reason } for every dirty row left unresolved -- stays dirty in cache.db */
   conflicts: Array<{ path: string; reason: string }>;
+  /**
+   * One entry per path whose upload genuinely failed and was left dirty for
+   * a later sync to retry -- a non-transient S3 error, a file that changed
+   * since it was scanned, or (under `--on-mirror-max-retries ignore`) a
+   * mirror write that failed on a unit whose S3 half never even completed.
+   * Distinct from `conflicts`: a conflict is a human decision this run
+   * correctly declined to make; a failure here is this run trying and not
+   * succeeding, which used to be silent beyond a log line -- the swallow-
+   * and-continue catch below was deliberately written to make adding this
+   * safe, without letting a swallowed failure be mistaken for a success.
+   */
+  failed: Array<{ path: string; hash: string; error: string }>;
 }
 
 interface InFlightUpload {
@@ -211,6 +223,7 @@ export async function applyLocalChangesToCandidate(
   let appliedCount = 0;
   const handledPaths = new Map<string, string | null>();
   const conflicts: Array<{ path: string; reason: string }> = [];
+  const failed: Array<{ path: string; hash: string; error: string }> = [];
 
   // filesDone/filesTotal track every dirty row consumed across both passes
   // (mirroring other commands' "scanned" counter); bytesDone/bytesTotal
@@ -777,17 +790,21 @@ export async function applyLocalChangesToCandidate(
           // the whole process dying on an unhandled rejection the way an
           // uncaught failure would -- letting a bulk sync lose every
           // OTHER file's progress over one bad one would be a worse
-          // outcome than a clean per-file failure. Surfacing this
-          // properly to the command's own exit code/output (today it's
-          // silent beyond this log line) is the next fix, not this one --
-          // this catch exists to make that fix safe to add, by
-          // guaranteeing a swallowed failure can never be mistaken for a
-          // success.
+          // outcome than a clean per-file failure. Recorded into `failed`
+          // (one entry per row riding on this job, not just the
+          // dispatcher) precisely so it stops being silent beyond this log
+          // line -- the caller decides what that means for the run's own
+          // exit code and summary, this function's job is only to make
+          // sure a swallowed failure can never be mistaken for a success.
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          for (const sourceRow of job.sourceRows) {
+            failed.push({ path: sourceRow.path, hash, error: errorMessage });
+          }
           logger.warn(
             {
               paths: job.sourceRows.map((r) => r.path),
               hash,
-              err: err instanceof Error ? err.message : String(err),
+              err: errorMessage,
             },
             "upload failed -- row(s) left dirty, will retry on the next sync",
           );
@@ -869,5 +886,6 @@ export async function applyLocalChangesToCandidate(
     handledPaths,
     appliedCount,
     conflicts,
+    failed,
   };
 }
