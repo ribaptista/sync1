@@ -121,10 +121,18 @@ as non-transient and rethrows immediately, leaving the bounded budget to decide.
 
 Once the budget is exhausted, `--on-mirror-max-retries` decides what that means:
 
-- **`fail`** (default) — the object is not committed, every row riding on it stays dirty, and a later
-  sync retries the whole thing. Nothing reaches the vault without reaching both copies, so the mirror
-  can never silently drift behind S3. This also gives the stubify guarantee for free: an unmirrored file
-  never reaches `state = 'unchanged'`, so `stubify` cannot act on it.
+- **`fail`** (default) — aborts the **entire run**, not just the object whose mirror write failed.
+  `applyLocalChangesToCandidate` throws `MirrorRequiredError`, uncaught, all the way out of `sync`;
+  nothing this run touched is committed, and the local upload-in-progress marker is left in place so
+  the next sync's recovery check finds and adopts (rather than re-uploads) anything that already reached
+  S3. This used to be a per-object failure — the object stayed dirty, everything else in the batch still
+  committed — which meant a same-batch rename (a delete paired with a create sharing identical content)
+  could split in half: the delete landing while the create's mirror-only write failed and stayed dirty,
+  leaving that content referenced by nothing the vault still tracked and ripe for `gc --apply` to remove
+  outright. Aborting the whole run is what closes that gap: nothing reaches the vault without reaching
+  both copies, full stop, and a change that belongs together commits together or not at all. This also
+  gives the stubify guarantee for free: an unmirrored file never reaches `state = 'unchanged'`, so
+  `stubify` cannot act on it.
 - **`ignore`** — the object commits to S3 anyway; the gap is counted, warned about, and left for
   `mirror catchup`. Backups keep progressing while the drive is detached, at the cost of
   committed-but-unmirrored objects being a normal state. Note the retry cannot simply resume: in

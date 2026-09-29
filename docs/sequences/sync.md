@@ -73,7 +73,13 @@ sequenceDiagram
 every other outcome, including `mirrorFailures > 0` under `--on-mirror-max-retries ignore`, is reported
 as a successful run (`mirror catchup` is the fix, not a re-run of `sync`). A thrown `RemoteDivergedError`
 (the CAS genuinely lost a race — see [`flow-cas-commit.md`](flow-cas-commit.md), Shape 1) also exits
-`EXIT_CONFLICT`; every other thrown error maps through `exitCodeForError`.
+`EXIT_CONFLICT`; every other thrown error maps through `exitCodeForError`, which includes
+`MirrorRequiredError` — a mirror write that exhausted its retries under the default
+`--on-mirror-max-retries fail` (see [`flow-apply-local-changes.md`](flow-apply-local-changes.md)) — since
+it isn't one of `exitCodeForError`'s own special cases and so falls through to the generic exit `1`.
+Unlike `mirrorFailures`, this never reaches the summary at all: nothing was committed, so `performSync`
+never returns a result for `runSync` to report — the CLI's own catch block emits `{ ok: false, error }`
+instead.
 
 ## Notes
 

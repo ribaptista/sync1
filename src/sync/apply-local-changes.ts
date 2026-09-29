@@ -24,6 +24,7 @@ import {
   withMirrorRetry,
   asMirrorWrite,
   MirrorWriteError,
+  MirrorRequiredError,
 } from "../fs/mirror-sink.js";
 import { mirrorObjectPath } from "../vault/mirror-paths.js";
 import {
@@ -88,10 +89,19 @@ interface InFlightUpload {
 /**
  * What to do when a mirror write has exhausted its retries.
  *
- * `fail` (the default) treats it exactly like a failed upload: the object
- * is not committed, every row riding on it stays dirty, and a later sync
- * retries the whole thing. Nothing reaches the vault without reaching both
- * copies, so the mirror can never silently drift behind S3.
+ * `fail` (the default) aborts the **whole run**, not just the one object
+ * whose mirror write failed: `applyLocalChangesToCandidate` throws
+ * `MirrorRequiredError`, which propagates uncaught all the way out, and
+ * nothing this run touched is committed. This used to be a per-object
+ * failure -- the object stayed dirty, but everything else in the batch
+ * still committed -- which meant a local rename (a delete paired with a
+ * create sharing the same content) could split in half: the delete
+ * landing while the create's mirror-only write failed and stayed dirty,
+ * leaving the content referenced by nothing the vault still tracks, ripe
+ * for `gc` to remove it outright. Aborting the whole run instead means
+ * nothing reaches the vault without reaching both copies, full stop --
+ * the mirror can never silently drift behind S3, and a change that
+ * belongs together commits together or not at all.
  *
  * `ignore` commits to S3 anyway and leaves the mirror short by a counted,
  * warned-about amount for `mirror catchup` to fill in later -- free, since
@@ -266,6 +276,17 @@ export async function applyLocalChangesToCandidate(
   const inFlightByNormalizedPath = new Map<string, string>();
 
   while (!next.done) {
+    // A dispatched job records an uncaught error into streamPoolErrors only
+    // when it's fatal to the whole run (today: MirrorRequiredError under
+    // `fail`, or an unexpected candidate-DB write failure) -- an ordinary
+    // per-object upload/mirror failure is caught and swallowed inside the
+    // job itself (see the dispatch below), never reaching this box at all.
+    // Once one has landed, the run is already doomed to abort at
+    // throwIfPoolErrored() below; there's no reason to keep feeding this
+    // pool more rows (more uploads to a candidate that will never be
+    // committed) in the meantime.
+    if (streamPoolErrors.hasError) break;
+
     const row = next.value;
     next = iter.next();
     progress.rowDiscovered();
@@ -669,7 +690,22 @@ export async function applyLocalChangesToCandidate(
           try {
             await withMirrorRetry(runUnit);
           } catch (err) {
-            if (!(err instanceof MirrorWriteError) || mirror.onMaxRetries === "fail") throw err;
+            if (!(err instanceof MirrorWriteError)) throw err;
+            if (mirror.onMaxRetries === "fail") {
+              // Escalate, deliberately: this is not a per-object failure
+              // this row can just stay dirty over. Under `fail`, nothing
+              // in this batch may commit without every mirror write
+              // succeeding, so the whole run has to abort -- thrown here,
+              // uncaught by the swallow-and-continue catch just below,
+              // so it reaches dispatchTracked's error box and, from
+              // there, throwIfPoolErrored() once every already-dispatched
+              // job has settled.
+              throw new MirrorRequiredError(
+                job.sourceRows.map((r) => r.path),
+                hash,
+                err,
+              );
+            }
             // `ignore`: the sync progresses without the second copy.
             //
             // Nothing is re-run. Because the tee detached rather than
@@ -693,6 +729,16 @@ export async function applyLocalChangesToCandidate(
             );
           }
         } catch (err) {
+          // MirrorRequiredError is not a per-object failure -- see its own
+          // doc comment (src/fs/mirror-sink.ts) and OnMirrorMaxRetries
+          // above. Rethrown here, uncaught, deliberately ahead of every
+          // other branch below: none of this job's own bookkeeping matters
+          // once the whole run is aborting, and rethrowing is what lets
+          // dispatchTracked capture it into streamPoolErrors instead of
+          // this catch swallowing it the way an ordinary upload failure
+          // is swallowed just below.
+          if (err instanceof MirrorRequiredError) throw err;
+
           // Deliberately NOT reported as applied: handledPaths/
           // appliedCount/entriesRepo are never touched below when this
           // flag stays false, so every row riding on this job -- the

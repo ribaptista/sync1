@@ -77,6 +77,46 @@ export class MirrorWriteError extends Error {
   }
 }
 
+/**
+ * Thrown by `applyLocalChangesToCandidate` (`src/sync/apply-local-changes.ts`)
+ * when `--on-mirror-max-retries fail` (the default) is in effect and a
+ * mirror write exhausts its retries for content this run is genuinely
+ * committing to the vault for the first time -- new content being
+ * uploaded, or content S3 already has that only the mirror is still
+ * missing (a dedup hit, or a `--verify-remote` adoption).
+ *
+ * Unlike an ordinary per-object upload failure, which just leaves that
+ * row's own cache entry dirty for a later sync to retry, this can't be
+ * handled the same way: under `fail`, nothing may enter the vault without
+ * also reaching the mirror, and by the time one object's mirror write has
+ * exhausted its retries, an unknown number of *other* rows in this same
+ * batch may already be dispatched or even committed to the in-memory
+ * candidate. The only way to honor `fail`'s own guarantee is to abort the
+ * whole run before any of it is promoted -- so this propagates all the
+ * way out of `applyLocalChangesToCandidate` uncaught, past the pool error
+ * box that would otherwise treat it as a swallowed-and-continue failure,
+ * and the caller's own candidate/temp-file cleanup takes care of the
+ * rest. Objects already uploaded to S3 this run are not wasted: the next
+ * sync's `--verify-remote`-style recovery (triggered automatically by the
+ * upload-in-progress marker this kind of abort leaves behind) finds and
+ * adopts them instead of re-uploading.
+ */
+export class MirrorRequiredError extends Error {
+  constructor(
+    readonly paths: readonly string[],
+    readonly hash: string,
+    override readonly cause: MirrorWriteError,
+  ) {
+    const which =
+      paths.length === 1 ? `"${paths[0]}"` : `${paths.length} path(s) (${paths.join(", ")})`;
+    super(
+      `mirror write for ${which} failed: ${cause.message} -- nothing was committed this run; ` +
+        `fix the mirror and re-run sync, or pass --on-mirror-max-retries ignore or --skip-mirror`,
+    );
+    this.name = "MirrorRequiredError";
+  }
+}
+
 /** Runs `operation`, rethrowing any mirror failure as a `MirrorWriteError`. */
 export async function asMirrorWrite<T>(target: string, operation: () => Promise<T>): Promise<T> {
   try {

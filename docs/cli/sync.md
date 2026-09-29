@@ -94,7 +94,9 @@ When there are unresolved conflicts, `ok` is `false` and `conflicts` is a non-em
 ## Exit codes
 
 - `0` — success, no conflicts.
-- `1` — a hard failure unrelated to conflicts (network/S3 error, corrupt vault, missing password).
+- `1` — a hard failure unrelated to conflicts (network/S3 error, corrupt vault, missing password, or a
+  mirror write that exhausted its retries under the default `--on-mirror-max-retries fail` — see
+  **Mirroring to a second copy** below).
 - `2` — completed with one or more unresolved conflicts, or the remote moved on mid-attempt (a CAS race
   against another machine's concurrent commit) — in the CAS-race case, just run `sync` again.
 
@@ -115,12 +117,24 @@ S3 already has but the mirror lacks is written to the mirror without being re-up
 ```
 
 Two counters join the summary and `--json`: `mirrored_objects` (written this run) and `mirror_failures`
-(committed to S3 but not mirrored, only ever non-zero under `--on-mirror-max-retries ignore`). Neither
-affects `ok` or the exit code — under the default `fail`, a mirror failure is an _object_ failure, and
-reports through the same dirty-row path as any other failed upload.
+(committed to S3 but not mirrored, only ever non-zero under `--on-mirror-max-retries ignore`).
 
-`--skip-mirror` and `--on-mirror-max-retries ignore` are the two ways to end up with a committed object
-that has no second copy. That is what [`stubify`](stubify.md)'s mirror gate exists to refuse to act on.
+**Under the default `fail`, a mirror write that exhausts its retries aborts the whole run, not just the
+object it was writing.** `mirror_failures` therefore stays `0` under `fail` — the run either commits
+with every mirror write having succeeded, or it commits nothing at all: exit `1`, `ok: false`, and an
+`error` naming the mirror target and the underlying cause. This matters for more than the one object
+that failed: a same-batch rename (a delete paired with a create sharing identical content, since there is
+no rename primitive anywhere in this system) used to be able to split in half, with the delete
+committing while the create's mirror-only write failed and stayed dirty — leaving that content
+referenced by nothing the vault still tracked, and ripe for a later `gc --apply` to remove outright.
+Aborting the whole run instead means a change that belongs together commits together or not at all.
+Objects this run already uploaded to S3 before the abort are not wasted: the next `sync` finds and adopts
+them (the same recovery a crash mid-run triggers) rather than re-uploading.
+
+`--on-mirror-max-retries ignore` commits to S3 regardless, and is one of the two ways (with
+`--skip-mirror`) to end up with a committed object that has no second copy on the mirror.
+`mirror_failures` counts those, and it's what [`stubify`](stubify.md)'s mirror gate exists to refuse to
+act on.
 
 See [mirroring.md](../architecture/mirroring.md) for the layout, the ordering rules, the retry budgets,
 and how to restore from the drive.

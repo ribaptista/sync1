@@ -54,6 +54,9 @@ sequenceDiagram
     participant S3
 
     loop each remaining row
+        opt streamPoolErrors already holds an error
+            Loop--xLoop: break -- a dispatched job already failed fatally<br/>(MirrorRequiredError, or an unexpected candidate-DB write failure);<br/>no point feeding this doomed run more work
+        end
         alt row.state = "created"
             Loop->>Candidate: findByNormalizedPath(collision key)
             Loop->>Loop: check inFlightByNormalizedPath too
@@ -140,7 +143,10 @@ sequenceDiagram
         end
     end
 
-    alt attempt raised MirrorWriteError AND onMaxRetries="ignore" AND ciphertextChecksum is set
+    alt attempt raised MirrorWriteError AND onMaxRetries="fail"
+        Job--xJob: throw MirrorRequiredError(paths, hash, cause)
+        note over Job: NOT swallowed -- escapes the outer catch below uncaught,<br/>into dispatchTracked's error box, and from there throwIfPoolErrored()<br/>aborts the whole applyLocalChangesToCandidate call once the pool<br/>drains. See flow-pool-dispatch.md.
+    else attempt raised MirrorWriteError AND onMaxRetries="ignore" AND ciphertextChecksum is set
         Job->>Job: mirrorFailures++ -- S3 already has it, verified; mirror stays behind for catchup
     else attempt failed for any other reason
         Job->>Job: ciphertextChecksum=undefined; wroteMirror=false<br/>fileTracker.abort(); inFlightByHash.delete(hash)
@@ -183,9 +189,17 @@ sequenceDiagram
   outer catch, precisely because an orphaned, still-running `uploadTo` promise (abandoned by
   `Promise.all`, not `allSettled`) could otherwise set the shared variable _after_ the retry loop had
   already moved on to a new attempt — leaking one attempt's success into another's bookkeeping. Every
-  row riding on a failed job — the dispatcher and every same-batch dedup attach alike — is left dirty in
-  `cache.db`; nothing here throws out of the dispatched job itself (swallowed and logged), so one bad
-  file cannot take down the rest of the batch.
+  row riding on an ordinary failed job — the dispatcher and every same-batch dedup attach alike — is
+  left dirty in `cache.db`; nothing here throws out of the dispatched job itself for that case
+  (swallowed and logged), so one bad file cannot take down the rest of the batch.
+- **The one exception: `MirrorRequiredError` is deliberately NOT swallowed.** Checked first, ahead of
+  every other branch in the outer catch, and rethrown uncaught. Under `--on-mirror-max-retries fail`, a
+  mirror write failure is not a per-object failure this row can just stay dirty over — nothing in the
+  whole batch may commit without every mirror write succeeding, so it has to abort
+  `applyLocalChangesToCandidate` itself, not just this one job. This is what fixed the case where a
+  same-batch rename (delete + create sharing one hash the mirror was missing) used to split in half:
+  the delete committing while the create's mirror-only write failed and stayed dirty. See
+  `src/fs/mirror-sink.ts`'s own doc comment on the class.
 - **A row is only ever recorded as applied at its actual point of success** — never at decision time —
   except the two branches with no async gap between deciding and writing (non-file rows, and a clean
   dedup hit), which record it immediately since nothing can fail in between.

@@ -9,6 +9,7 @@ import { EntriesRepository } from "../../../src/db/repositories/entries-reposito
 import { ObjectsRepository } from "../../../src/db/repositories/objects-repository.js";
 import { VersionsRepository } from "../../../src/db/repositories/versions-repository.js";
 import { hashBufferHex } from "../../../src/crypto/hash.js";
+import { MirrorRequiredError } from "../../../src/fs/mirror-sink.js";
 import type { ProgressUpdate } from "../../../src/progress-types.js";
 
 // Drains the body stream, same as a real S3 client would -- otherwise the
@@ -1352,6 +1353,196 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
     expect(result.handledPaths.get("a.txt")).toBe("v1");
     expect(result.handledPaths.get("b.txt")).toBe("v1");
 
+    candidateDb.close();
+  });
+});
+
+describe("applyLocalChangesToCandidate: mirror required under --on-mirror-max-retries fail", () => {
+  let root: string;
+  let mirror: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-mirror-fail-test-"));
+    mirror = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-mirror-drive-"));
+    putObjectStreamMock.mockReset();
+    putObjectStreamMock.mockImplementation(drainBody);
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(mirror, { recursive: true, force: true });
+  });
+
+  function touch(relPath: string, content: string, mtime = 1): void {
+    const absolute = path.join(root, relPath);
+    fs.writeFileSync(absolute, content);
+    fs.utimesSync(absolute, new Date(mtime), new Date(mtime));
+  }
+
+  /** Sabotages the mirror's shard directory for `hash` so a write to it fails synchronously (mkdirSync). */
+  function sabotageMirrorShardFor(hash: string): string {
+    const shardParent = path.join(mirror, "objects", hash.slice(0, 2));
+    fs.mkdirSync(shardParent, { recursive: true });
+    fs.chmodSync(shardParent, 0o555);
+    return shardParent;
+  }
+
+  it("rejects with MirrorRequiredError, and writes no entry, when the mirror write fails", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "content whose mirror write is sabotaged";
+    const hash = hashBufferHex(Buffer.from(content));
+    touch("a.txt", content);
+    const shardParent = sabotageMirrorShardFor(hash);
+
+    const dirtyRows = [
+      {
+        path: "a.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const streamPool = new PQueue({ concurrency: 4 });
+    streamPool.on("error", () => {});
+
+    const call = applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      streamPool,
+      8,
+      undefined,
+      undefined,
+      false,
+      { path: mirror, onMaxRetries: "fail" },
+    );
+
+    await expect(call).rejects.toBeInstanceOf(MirrorRequiredError);
+    const err = (await call.catch((e: unknown) => e)) as MirrorRequiredError;
+    expect(err.paths).toEqual(["a.txt"]);
+    expect(err.hash).toBe(hash);
+    expect(err.message).toContain("nothing was committed");
+
+    // The S3 side (mocked) "succeeded" independently of the mirror's
+    // failure -- exactly the scenario this error class exists to escalate
+    // rather than swallow -- but the row must still never have been
+    // written to the candidate.
+    expect(new EntriesRepository(candidateDb).get("a.txt")).toBeUndefined();
+
+    fs.chmodSync(shardParent, 0o755);
+    candidateDb.close();
+  });
+
+  it("aborts the whole batch even when an unrelated row's own upload would otherwise have committed cleanly", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const goodContent = "content the mirror can accept just fine";
+    const badContent = "content whose mirror write is sabotaged, again";
+    touch("good.txt", goodContent);
+    touch("bad.txt", badContent);
+    const badHash = hashBufferHex(Buffer.from(badContent));
+    const shardParent = sabotageMirrorShardFor(badHash);
+
+    const dirtyRows = [
+      {
+        path: "good.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash: hashBufferHex(Buffer.from(goodContent)),
+        size: goodContent.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+      {
+        path: "bad.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash: badHash,
+        size: badContent.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const streamPool = new PQueue({ concurrency: 4 });
+    streamPool.on("error", () => {});
+
+    await expect(
+      applyLocalChangesToCandidate(
+        candidateDb,
+        dirtyRows,
+        root,
+        Buffer.alloc(32),
+        "v1",
+        unusedS3,
+        silentLogger,
+        streamPool,
+        8,
+        undefined,
+        undefined,
+        false,
+        { path: mirror, onMaxRetries: "fail" },
+      ),
+    ).rejects.toBeInstanceOf(MirrorRequiredError);
+
+    fs.chmodSync(shardParent, 0o755);
+    candidateDb.close();
+  });
+
+  it("under --on-mirror-max-retries ignore, commits anyway and counts the gap instead of aborting", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "content whose mirror write is sabotaged (ignore mode)";
+    const hash = hashBufferHex(Buffer.from(content));
+    touch("a.txt", content);
+    const shardParent = sabotageMirrorShardFor(hash);
+
+    const dirtyRows = [
+      {
+        path: "a.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const streamPool = new PQueue({ concurrency: 4 });
+    streamPool.on("error", () => {});
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      streamPool,
+      8,
+      undefined,
+      undefined,
+      false,
+      { path: mirror, onMaxRetries: "ignore" },
+    );
+
+    expect(result.appliedCount).toBe(1);
+    expect(result.uploadedObjects).toBe(1);
+    expect(result.mirrorFailures).toBe(1);
+    expect(new EntriesRepository(candidateDb).get("a.txt")?.hash).toBe(hash);
+
+    fs.chmodSync(shardParent, 0o755);
     candidateDb.close();
   });
 });
