@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { renameWithRetry, copyFileWithRetry, writeFileWithRetry } from "../../../src/fs/safe-fs.js";
+import { renameWithRetry, writeFileAtomic, copyFileAtomic } from "../../../src/fs/safe-fs.js";
 
 function ebusy(): NodeJS.ErrnoException {
   const err = new Error("resource busy or locked") as NodeJS.ErrnoException;
@@ -24,30 +24,6 @@ describe("safe-fs retry wrapper", () => {
       .mockImplementationOnce(() => undefined);
 
     await expect(renameWithRetry("/a", "/b")).resolves.toBeUndefined();
-    expect(spy).toHaveBeenCalledTimes(2);
-  });
-
-  it("copyFileWithRetry recovers after a transient EBUSY", async () => {
-    const spy = vi
-      .spyOn(fs, "copyFileSync")
-      .mockImplementationOnce(() => {
-        throw ebusy();
-      })
-      .mockImplementationOnce(() => undefined);
-
-    await expect(copyFileWithRetry("/a", "/b")).resolves.toBeUndefined();
-    expect(spy).toHaveBeenCalledTimes(2);
-  });
-
-  it("writeFileWithRetry recovers after a transient EBUSY", async () => {
-    const spy = vi
-      .spyOn(fs, "writeFileSync")
-      .mockImplementationOnce(() => {
-        throw ebusy();
-      })
-      .mockImplementationOnce(() => undefined);
-
-    await expect(writeFileWithRetry("/a", Buffer.from("x"))).resolves.toBeUndefined();
     expect(spy).toHaveBeenCalledTimes(2);
   });
 
@@ -82,5 +58,83 @@ describe("safe-fs retry wrapper", () => {
     expect(fs.existsSync(src)).toBe(false);
 
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("writeFileAtomic / copyFileAtomic", () => {
+  let dir: string;
+
+  afterEach(() => {
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("writeFileAtomic publishes the data under the destination name", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-atomic-write-test-"));
+    const dest = path.join(dir, "state.db");
+
+    await writeFileAtomic(dest, Buffer.from("hello world"));
+
+    expect(fs.readFileSync(dest, "utf8")).toBe("hello world");
+  });
+
+  it("writeFileAtomic overwrites an existing destination in one atomic step, leaving no temp file behind", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-atomic-write-test-"));
+    const dest = path.join(dir, "state.db");
+    fs.writeFileSync(dest, "old content");
+
+    await writeFileAtomic(dest, Buffer.from("new content"));
+
+    expect(fs.readFileSync(dest, "utf8")).toBe("new content");
+    // Nothing but the destination itself should remain in the directory --
+    // no leftover `.atomic-write-<hex>` temp sibling.
+    expect(fs.readdirSync(dir)).toEqual(["state.db"]);
+  });
+
+  it("writeFileAtomic never truncates the destination if the write itself fails", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-atomic-write-test-"));
+    const dest = path.join(dir, "state.db");
+    fs.writeFileSync(dest, "original, still good");
+
+    vi.spyOn(fs, "writeSync").mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+
+    await expect(writeFileAtomic(dest, Buffer.from("new content"))).rejects.toThrow("disk full");
+
+    // The destination was never touched -- only ever the (now-discarded) temp file was.
+    expect(fs.readFileSync(dest, "utf8")).toBe("original, still good");
+  });
+
+  it("writeFileAtomic fsyncs the temp file before renaming it into place", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-atomic-write-test-"));
+    const dest = path.join(dir, "state.db");
+    const order: string[] = [];
+
+    vi.spyOn(fs, "fsyncSync").mockImplementation(() => {
+      order.push("fsync");
+    });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      order.push("rename");
+      // Delegate to the real implementation so the file actually lands.
+      vi.mocked(fs.renameSync).mockRestore();
+      fs.renameSync(from as string, to as string);
+    });
+
+    await writeFileAtomic(dest, Buffer.from("data"));
+
+    expect(order).toEqual(["fsync", "rename"]);
+  });
+
+  it("copyFileAtomic publishes the source file's bytes under the destination name", async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-atomic-copy-test-"));
+    const src = path.join(dir, "candidate.db");
+    const dest = path.join(dir, "state.db");
+    fs.writeFileSync(src, "candidate bytes");
+
+    await copyFileAtomic(src, dest);
+
+    expect(fs.readFileSync(dest, "utf8")).toBe("candidate bytes");
+    // The source is left in place -- only ever copied, never moved.
+    expect(fs.readFileSync(src, "utf8")).toBe("candidate bytes");
   });
 });

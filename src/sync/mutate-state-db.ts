@@ -18,7 +18,7 @@ import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
 import { mirrorStateSnapshot, mirrorCurrentPointer, mirrorPathFor } from "./mirror-metadata.js";
 import { tempSiblingPath } from "../fs/temp-path.js";
-import { copyFileWithRetry } from "../fs/safe-fs.js";
+import { copyFileAtomic } from "../fs/safe-fs.js";
 
 const MAX_CAS_ATTEMPTS = 5;
 
@@ -138,7 +138,7 @@ export async function mutateStateDb<T>(
         await mirrorStateSnapshot(mirrorPath, newVersionStamp, encrypted, logger);
         await mirrorCurrentPointer(mirrorPath, root, newVersionStamp, logger);
 
-        await copyFileWithRetry(candidatePath, localStateDbPath(root));
+        await copyFileAtomic(candidatePath, localStateDbPath(root));
         fs.writeFileSync(lastSyncedVersionPath(root), newVersionStamp, "utf8");
 
         return { versionStamp: newVersionStamp, result };

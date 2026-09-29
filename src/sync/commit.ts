@@ -35,7 +35,7 @@ import {
   localUploadInProgressMarkerPath,
 } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
-import { renameWithRetry, copyFileWithRetry } from "../fs/safe-fs.js";
+import { renameWithRetry, copyFileAtomic } from "../fs/safe-fs.js";
 import type { OnProgress } from "../progress-types.js";
 
 export interface SyncConflict {
@@ -412,7 +412,7 @@ export async function performSync(
         // pending on S3 that local state doesn't already know about.
         fs.rmSync(localUploadInProgressMarkerPath(root), { force: true });
         if (remoteHasMoved) {
-          await copyFileWithRetry(remoteFreshPath, localStateDbPath(root));
+          await copyFileAtomic(remoteFreshPath, localStateDbPath(root));
           fs.writeFileSync(lastSyncedVersionPath(root), remoteVersionStamp, "utf8");
         }
         reconcileCacheAfterCommit(

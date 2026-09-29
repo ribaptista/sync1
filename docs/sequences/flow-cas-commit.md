@@ -90,7 +90,7 @@ sequenceDiagram
             S3-->>Caller: OK
             note over Caller: mirror the snapshot + pointer (best-effort,<br/>see flow-mirror-metadata.md), THEN...
             Caller->>Caller: gc only: dispatch S3 deletes for staged orphans (own pool)
-            Caller->>Candidate: copyFileWithRetry(candidatePath, state.db);<br/>write last_synced_version
+            Caller->>Candidate: copyFileAtomic(candidatePath, state.db);<br/>write last_synced_version
             Caller-->>Caller: return successfully -- loop exits
         end
     end

@@ -41,7 +41,7 @@ After the ordinary lock/root-resolution preamble (see [flow-preamble.md](../sequ
 and unlocking the vault (see [flow-unlock-vault.md](../sequences/flow-unlock-vault.md)): GET `/current`,
 GET the snapshot it names, decrypt it (a failed decryption/authentication is reported as a
 `CorruptionError`, distinct from a wrong password — the password already unlocked the vault manifest by
-this point), and write the plaintext straight to the local `state.db` path via `writeFileWithRetry`. No
+this point), and write the plaintext straight to the local `state.db` path via `writeFileAtomic`. No
 candidate database, no CAS, no S3 retry loop — a plain three-step fetch with nothing to reconcile.
 
 ## Example

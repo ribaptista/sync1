@@ -25,7 +25,7 @@ import { localStateDbPath, lastSyncedVersionPath } from "../vault/local-dir.js";
 import { CorruptionError } from "../errors.js";
 import { mirrorStateSnapshot, mirrorCurrentPointer, mirrorPathFor } from "./mirror-metadata.js";
 import { tempSiblingPath } from "../fs/temp-path.js";
-import { copyFileWithRetry } from "../fs/safe-fs.js";
+import { copyFileAtomic } from "../fs/safe-fs.js";
 import {
   waitForRoom,
   createPoolErrorBox,
@@ -244,7 +244,7 @@ export async function performGc(
         // sweep fully completed when it didn't.
         throwIfPoolErrored(s3PoolErrors);
 
-        await copyFileWithRetry(candidatePath, localStateDbPath(root));
+        await copyFileAtomic(candidatePath, localStateDbPath(root));
         fs.writeFileSync(lastSyncedVersionPath(root), newVersionStamp, "utf8");
 
         return {

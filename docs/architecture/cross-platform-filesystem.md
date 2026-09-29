@@ -101,9 +101,27 @@ forward.
 
 Unrelated to case-insensitivity, but adjacent in scope: the local `state.db` file gets renamed or
 overwritten in place at a few points (`commit.ts`'s final commit and early-return-adoption paths, `gc.ts`,
-`attach_remote`/`fetch_remote`'s initial writes). On Windows, an external process — most commonly an
-antivirus scanner or the search indexer — can transiently hold a lock on a file that briefly blocks a
-rename or open-for-write against it. Tracing every one of these call sites confirmed sync1's own process
-never holds a handle on the destination at the moment of the write, so `src/fs/safe-fs.ts` wraps each of
-them in a short retry-with-backoff (5 attempts, doubling from 50ms, retried only for `EBUSY`/`EPERM`/
-`EACCES`) — purely a defensive measure against an external actor, not a fix to a bug in sync1's own logic.
+`mutate-state-db.ts`, `attach_remote`/`fetch_remote`'s initial writes). On Windows, an external process —
+most commonly an antivirus scanner or the search indexer — can transiently hold a lock on a file that
+briefly blocks a rename or open-for-write against it. Tracing every one of these call sites confirmed
+sync1's own process never holds a handle on the destination at the moment of the write, so
+`renameWithRetry` (`src/fs/safe-fs.ts`) wraps every rename that publishes over `state.db` in a short
+retry-with-backoff (5 attempts, doubling from 50ms, retried only for `EBUSY`/`EPERM`/`EACCES`) — purely a
+defensive measure against an external actor, not a fix to a bug in sync1's own logic.
+
+**A second, previously separate problem lived at the same call sites: the "overwritten in place" half was
+never actually atomic.** `commit.ts`'s own successful-commit path always promoted its candidate via a
+rename (`renameWithRetry(candidatePath, state.db)`), which is atomic at the OS level — a reader sees
+either the old file or the new one, never a partial write. But every other one of these call sites —
+`gc.ts` and `mutate-state-db.ts` after their own CAS commits, `commit.ts`'s own "remote moved but nothing
+local to commit" adoption path, and `attach_remote`/`fetch_remote`'s initial writes — used a bare
+`fs.copyFileSync`/`fs.writeFileSync` straight onto the live `state.db` path instead. Killed mid-write
+(a crash, a forced shutdown, `kill -9`), that leaves a truncated or zero-length `state.db` in place of a
+good one, and every later command fails to open it until `fetch_remote` re-fetches a clean copy from the
+vault.
+
+`writeFileAtomic`/`copyFileAtomic` (`src/fs/safe-fs.ts`) close that gap by giving those call sites the
+same shape `commit.ts`'s successful-commit path already had: write to a sibling temp file, `fsync` it, and
+only then publish it over the destination with `renameWithRetry`. A crash at any point up to and including
+the `fsync` leaves the old `state.db` untouched; a crash during or after the rename is what a rename is
+for — atomic, so it either did or didn't happen, never half of either.

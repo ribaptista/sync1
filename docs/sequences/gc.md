@@ -48,7 +48,7 @@ sequenceDiagram
                     S3Pool->>CLI: onProgress(deleted++) -- absolute count, pool resolves out of order
                 end
                 CLI->>S3Pool: await s3Pool.onIdle(); throwIfPoolErrored()
-                CLI->>Candidate: copyFileWithRetry(candidatePath, state.db); write last_synced_version
+                CLI->>Candidate: copyFileAtomic(candidatePath, state.db); write last_synced_version
                 Candidate-->>CLI: { orphanCount, reclaimedBytes, applied: true }
             end
         end

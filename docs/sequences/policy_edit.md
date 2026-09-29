@@ -35,7 +35,7 @@ sequenceDiagram
         alt CAS succeeds
             Cas->>Mirror: mirrorPathFor(root) -- resolved fresh here, swallow-on-error<br/>(see flow-mirror-metadata.md's note on this vs. sync's own resolution)
             Mirror->>Mirror: mirrorStateSnapshot + mirrorCurrentPointer (best-effort, never fails the commit)
-            Cas->>Candidate: copyFileWithRetry(candidatePath, state.db); write last_synced_version
+            Cas->>Candidate: copyFileAtomic(candidatePath, state.db); write last_synced_version
             Cas-->>CLI: { versionStamp, result } -- result is whatever `mutate` returned (e.g. new policy id)
         end
     end

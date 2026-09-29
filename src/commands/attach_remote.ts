@@ -24,7 +24,7 @@ import {
 } from "../vault/paths.js";
 import { decryptBuffer, CryptoAuthError } from "../crypto/chunked-codec.js";
 import { openCacheDb } from "../db/connection.js";
-import { writeFileWithRetry } from "../fs/safe-fs.js";
+import { writeFileAtomic } from "../fs/safe-fs.js";
 import { CorruptionError } from "../errors.js";
 import { acquireLock } from "../vault/lock.js";
 import { resolveBootstrapRoot } from "../cli/resolve-root.js";
@@ -158,7 +158,7 @@ async function runAttachRemote(
     // No filesystem writes beyond .sync1/ itself at this stage — mirrors
     // fetch_remote's contract. Materializing the tree (as stubs) happens the
     // first time `sync` runs, not here.
-    await writeFileWithRetry(localStateDbPath(root), stateDbBytes);
+    await writeFileAtomic(localStateDbPath(root), stateDbBytes);
     fs.writeFileSync(localVaultJsonPath(root), manifestObj.body);
     fs.writeFileSync(lastSyncedVersionPath(root), versionStamp, "utf8");
 

@@ -65,7 +65,7 @@ sequenceDiagram
         note over Sync: no PUT, no CAS at all
         Sync->>FS: rm upload-in-progress marker -- appliedCount was never above 0,<br/>so nothing from this run's uploads is unresolved
         opt remote had moved
-            Sync->>FS: copyFileWithRetry(remoteFreshPath, state.db)<br/>write last_synced_version = remoteVersionStamp
+            Sync->>FS: copyFileAtomic(remoteFreshPath, state.db)<br/>write last_synced_version = remoteVersionStamp
         end
         Sync->>Candidate: reconcileCacheAfterCommit(cacheRepo, handled dirty rows, handledPaths)<br/>-- still reconciles any no-op-resolved rows to 'unchanged'
         note over Sync: candidatePath is simply discarded, never promoted

@@ -46,7 +46,7 @@ sequenceDiagram
         CLI->>S3: GET /current -- missing -> CorruptionError
         CLI->>S3: GET states/<versionStamp> -- missing -> CorruptionError
         CLI->>CLI: decryptBuffer (CryptoAuthError -> CorruptionError)
-        CLI->>FS: writeFileWithRetry(state.db, decrypted); write vault.json, last_synced_version, remote.json
+        CLI->>FS: writeFileAtomic(state.db, decrypted); write vault.json, last_synced_version, remote.json
         CLI->>FS: openCacheDb(fresh, migrated, empty).close() -- ready for the first update_cache/sync,<br/>holds no rows yet
         note over CLI: no tree materialization here at all -- that happens the<br/>first time `sync` runs (as stubs), same contract as fetch_remote
     end
