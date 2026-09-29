@@ -96,10 +96,19 @@ Exit code is non-zero only for `missing`, `wrong_size` or `checksum_mismatch` �
 
 Writes whatever the mirror is missing.
 
-**Metadata comes straight from S3**, unconditionally and without `--allow-download`: `vault.json`,
-`current`, and the one snapshot `current` names. These are megabytes where the objects are hundreds of
-gigabytes, so the egress this feature exists to avoid is not at stake — and applying the same parsimony
-here would buy nothing while leaving the mirror unreadable.
+**`vault.json` and the snapshot `current` (in S3) names come straight from S3**, unconditionally and
+without `--allow-download`. These are megabytes where the objects are hundreds of gigabytes, so the
+egress this feature exists to avoid is not at stake — and applying the same parsimony here would buy
+nothing while leaving the mirror unreadable.
+
+**The mirror's own `current` pointer, by contrast, is the very last thing this command writes — and only
+once every object below has been accounted for.** `mirror verify`/`mirror prune` trust this file as
+"which version does the mirror currently claim to hold"; writing it any earlier — before the
+object-recovery loop below has actually finished — would let an interrupted or only-partially-successful
+catchup leave the pointer naming a version whose objects aren't all there, and `verify --quick` (pointer +
+snapshot presence only) would then report the mirror as up to date when it demonstrably isn't restorable
+from. A pending or unrequested restore does not hold the pointer back — same "come back later" reading as
+below — only an object with no usable source anywhere does.
 
 **Snapshot history is deliberately not backfilled.** `gc` removes objects not referenced by the current
 live state, so an object referenced only by an old snapshot is already gone from S3 — historical

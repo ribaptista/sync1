@@ -420,6 +420,84 @@ describe("mirror verify / catchup / prune", () => {
   });
 
   /**
+   * Regression test for the pointer-order bug: catchup used to write the
+   * mirror's own `current` pointer *before* the object-recovery loop ran,
+   * so an interrupted or only-partially-successful catchup left the
+   * pointer naming a version whose objects weren't actually all there --
+   * `mirror verify --quick` (pointer + snapshot presence only, no object
+   * sweep) would then report the mirror as up to date when it demonstrably
+   * wasn't restorable.
+   *
+   * Built from a vault synced with `--skip-mirror`, so the object never
+   * reaches the mirror through the ordinary sync path either -- the only
+   * way it can arrive is through `catchup` itself, which is what makes this
+   * catchup run's own pointer write the only one in question.
+   */
+  it("never moves its own pointer to a version whose objects aren't all there yet", async () => {
+    const { root, mirror } = await vaultWithMirror(0);
+    const pointerPath = path.join(mirror, "current");
+
+    fs.writeFileSync(path.join(root, "only.txt"), "content only catchup can mirror");
+    await runCli(["update_cache", "--root", root, "--json"]);
+    const synced = await runCli(["sync", "--skip-mirror", "--root", root, "--json"], { env });
+    expect(synced.exitCode).toBe(0);
+    // Not written by sync (--skip-mirror), and no catchup has run yet.
+    expect(fs.existsSync(pointerPath)).toBe(false);
+
+    // Strip the local plaintext too, with the stubify mirror gate bypassed
+    // deliberately -- the object genuinely isn't mirrored yet, which is the
+    // point of this test, not an oversight to guard against here.
+    const stubbed = await runCli([
+      "stubify",
+      "only.txt",
+      "--allow-unmirrored",
+      "--root",
+      root,
+      "--json",
+    ]);
+    expect((JSON.parse(stubbed.stdout) as { stubified: number }).stubified).toBe(1);
+
+    const stuck = await runCli(["mirror", "catchup", "--root", root, "--json"], { env });
+    expect(stuck.exitCode).not.toBe(0);
+    expect(
+      JSON.parse(stuck.stdout) as { downloaded: number; unrecoverable_locally: number },
+    ).toMatchObject({ downloaded: 0, unrecoverable_locally: 1 });
+
+    // The core assertion: metadata (vault.json, the state snapshot) is
+    // written unconditionally, but the pointer -- what `mirror verify`/
+    // `mirror prune` trust as "this mirror currently holds this version" --
+    // must still be absent. Before the fix, this run would have written it
+    // regardless, and the next line would have found `up_to_date: true`.
+    expect(fs.existsSync(pointerPath)).toBe(false);
+
+    const stillBehind = await runCli(["mirror", "verify", "--quick", "--root", root, "--json"]);
+    expect(stillBehind.exitCode).not.toBe(0);
+    expect(JSON.parse(stillBehind.stdout) as { ok: boolean }).toMatchObject({ ok: false });
+
+    // Completing the catchup with --allow-download is what finally earns
+    // the pointer.
+    const completed = await runCli(
+      ["mirror", "catchup", "--allow-download", "--root", root, "--json"],
+      { env },
+    );
+    expect(completed.exitCode).toBe(0);
+    expect(
+      JSON.parse(completed.stdout) as { downloaded: number; unrecoverable_locally: number },
+    ).toMatchObject({ downloaded: 1, unrecoverable_locally: 0 });
+    expect(fs.existsSync(pointerPath)).toBe(true);
+
+    const caughtUp = await runCli(["mirror", "verify", "--quick", "--root", root, "--json"]);
+    expect(caughtUp.exitCode).toBe(0);
+    expect(JSON.parse(caughtUp.stdout) as VerifyJson).toMatchObject({
+      ok: true,
+      up_to_date: true,
+    });
+
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(mirror, { recursive: true, force: true });
+  });
+
+  /**
    * Local plaintext must still win when both are available: it is free and
    * instant where a download costs egress, and once archives are involved
    * the difference is hours or days rather than milliseconds.

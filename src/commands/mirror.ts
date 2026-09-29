@@ -290,8 +290,17 @@ async function runCatchup(
   const manifest = parseManifest(fs.readFileSync(localVaultJsonPath(root)));
   const masterKey = unlockVault(manifest, password);
 
-  await writeMirrorFile(mirrorCurrentPointerPath(mirrorPath), Buffer.from(versionStamp, "utf8"));
-
+  // openMirrorSnapshot reads the state.db snapshot file this run just wrote
+  // to the mirror above -- it does not depend on the mirror's own `current`
+  // pointer, which is deliberately NOT written yet. Writing it here, before
+  // the object-recovery loop below has actually run, is what used to let an
+  // interrupted or partial catchup leave the mirror's pointer naming a
+  // version whose objects aren't all there -- `mirror verify --quick`
+  // (pointer + snapshot presence only, no object sweep) would then report
+  // `up_to_date: true` on a mirror that couldn't actually restore anything
+  // materialized-but-not-locally-recoverable. The pointer is written last,
+  // below, and only once every object this run knows about was either
+  // already present, recovered, or downloaded.
   const snapshot = openMirrorSnapshot(mirrorPath, root, versionStamp, masterKey);
   const cacheDb = openCacheDbReadOnly(path.join(root, ".sync1", "cache.db"));
 
@@ -382,6 +391,28 @@ async function runCatchup(
           "object is archived and no restore has been requested -- pass --request-retrieval to start one",
         );
       }
+    }
+
+    // The pointer is what `readMirrorVersion` (used by `mirror verify`/
+    // `mirror prune`) trusts as "which version does this mirror currently
+    // claim to hold" -- writing it here, only now that every object this
+    // run knows about has been accounted for, is what keeps that claim
+    // honest. Gated on the same condition as `ok` below: an unrecoverable
+    // object means this version's object set is genuinely incomplete on
+    // the mirror, so the pointer must not move to it yet. A restore still
+    // pending, or an archived object whose retrieval was never requested,
+    // does not block it -- consistent with `ok`'s own "come back later,
+    // not a failure" reading of those two states.
+    if (unrecoverableLocally === 0) {
+      await writeMirrorFile(
+        mirrorCurrentPointerPath(mirrorPath),
+        Buffer.from(versionStamp, "utf8"),
+      );
+    } else {
+      logger.debug(
+        { versionStamp, unrecoverableLocally },
+        "leaving the mirror's current pointer unmoved -- at least one object this run knows about has no usable source; run again with --allow-download, or supply the content locally",
+      );
     }
 
     return {

@@ -68,7 +68,7 @@ sequenceDiagram
         CLI->>Mirror: writeMirrorFile(snapshot) -- metadataFetched++
     end
     note over CLI: deliberately NOT backfilling older snapshots --<br/>gc already made them partially dangling in S3
-    CLI->>Mirror: writeMirrorFile(current pointer, versionStamp)
+    note over CLI: the current pointer is NOT written yet -- see below
     CLI->>Objects: openMirrorSnapshot(versionStamp)
 
     loop every object row in the mirror's own snapshot
@@ -96,6 +96,12 @@ sequenceDiagram
             end
         end
     end
+
+    alt unrecoverableLocally === 0
+        CLI->>Mirror: writeMirrorFile(current pointer, versionStamp)
+    else
+        note over CLI: pointer left unmoved (debug-logged) -- at least one object<br/>this run knows about has no usable source yet
+    end
 ```
 
 `recoverFromLocalSources(row)`: for every local path referencing this hash (dedup: several may) whose
@@ -105,6 +111,16 @@ just the first, since one may still hold the original bytes while another was ed
 
 `ok` is `false` only when `unrecoverableLocally > 0` — a pending or unrequested restore reads as "come
 back later," the same as `materialize`.
+
+**The pointer write is the last thing this command does, and only runs at all when
+`unrecoverableLocally === 0`.** `readMirrorVersion` (what `verify`/`prune` trust as "which version does
+this mirror currently claim to hold") reads this same file, so writing it any earlier — before the object
+loop above has actually run to completion — would let an interrupted or only-partially-successful catchup
+leave the pointer naming a version whose objects aren't all there. `mirror verify --quick` (pointer +
+snapshot presence only, no object sweep) would then report the mirror as up to date when it demonstrably
+isn't restorable from. A restore still pending, or an archived object whose retrieval was never requested,
+does not block the pointer — consistent with `ok`'s own "come back later, not a failure" reading of those
+two states; only an object with no usable source anywhere does.
 
 ## Sequence — `writeVerifiedMirrorObject` (catchup's local-recovery path)
 
