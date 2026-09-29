@@ -9,10 +9,12 @@ import type { CacheEntryRow } from "../db/repositories/cache-entries-repository.
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
+import { StoragePoliciesRepository } from "../db/repositories/storage-policies-repository.js";
 import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
 import { HASH_BYTES } from "../crypto/hash.js";
 import { putObjectStream, headObject } from "../s3/client.js";
 import { withS3Retry } from "../s3/retry.js";
+import { resolveHashTargetClass } from "../s3/policy-evaluation.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
@@ -209,6 +211,16 @@ export async function applyLocalChangesToCandidate(
   const objectsRepo = new ObjectsRepository(candidateDb);
   const entriesRepo = new EntriesRepository(candidateDb);
   const versionsRepo = new VersionsRepository(candidateDb);
+  // Loaded once for the whole run, not per row: a many-small-files sync
+  // would otherwise pay for the same two small, unchanging queries on
+  // every single dispatch. Used only to pick a genuinely new upload's
+  // storage class up front (see the dispatch below) -- `converge` remains
+  // the authority for correcting it later, for shared content another
+  // path's own policy disagrees with, or for a policy edited after the
+  // fact.
+  const storagePoliciesRepo = new StoragePoliciesRepository(candidateDb);
+  const nonDefaultPolicies = storagePoliciesRepo.listNonDefaultByPriority();
+  const defaultPolicy = storagePoliciesRepo.getDefault();
 
   // Must exist before any entries row can reference it (entries.state_version
   // is a foreign key into versions.version_stamp) -- even if it turns out no
@@ -507,6 +519,14 @@ export async function applyLocalChangesToCandidate(
     const size = row.size!;
     progress.expectBytes(size);
 
+    // Resolved from this one dispatching path, not re-evaluated per
+    // dedup attach that rides on the same job afterward -- a same-batch
+    // attach whose own path implies a warmer class than the row that
+    // actually dispatched the upload can't change a class already in
+    // flight. `converge`, not this decision, is what a shared object's
+    // warmest-wins policy ultimately has to enforce.
+    const { targetClass } = resolveHashTargetClass([row.path], nonDefaultPolicies, defaultPolicy);
+
     await waitForRoom(streamPool, streamQueueLimit);
     dispatchTracked(streamPool, streamPoolErrors, async () => {
       const absolutePath = path.join(root, row.path);
@@ -621,6 +641,7 @@ export async function applyLocalChangesToCandidate(
                     remoteKey(s3.location, key),
                     stream,
                     encryptedSize(size, context.length),
+                    targetClass,
                   );
                 };
                 const mirrorTo = async (stream: Readable): Promise<void> => {

@@ -9,6 +9,8 @@ import { EntriesRepository } from "../../../src/db/repositories/entries-reposito
 import { ObjectsRepository } from "../../../src/db/repositories/objects-repository.js";
 import { VersionsRepository } from "../../../src/db/repositories/versions-repository.js";
 import { hashBufferHex } from "../../../src/crypto/hash.js";
+import { objectKey } from "../../../src/vault/paths.js";
+import { StoragePoliciesRepository } from "../../../src/db/repositories/storage-policies-repository.js";
 import { MirrorRequiredError } from "../../../src/fs/mirror-sink.js";
 import type { ProgressUpdate } from "../../../src/progress-types.js";
 
@@ -1562,6 +1564,132 @@ describe("applyLocalChangesToCandidate: mirror required under --on-mirror-max-re
     expect(new EntriesRepository(candidateDb).get("a.txt")?.hash).toBe(hash);
 
     fs.chmodSync(shardParent, 0o755);
+    candidateDb.close();
+  });
+});
+
+describe("applyLocalChangesToCandidate: uploads directly into the policy's storage class", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-storage-class-test-"));
+    putObjectStreamMock.mockReset();
+    putObjectStreamMock.mockImplementation(drainBody);
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function touch(relPath: string, content: string, mtime = 1): void {
+    const absolute = path.join(root, relPath);
+    fs.writeFileSync(absolute, content);
+    fs.utimesSync(absolute, new Date(mtime), new Date(mtime));
+  }
+
+  it("passes the matching policy's target class to a new upload, and STANDARD (the default policy) to one that matches nothing else", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    new StoragePoliciesRepository(candidateDb).create("*.mov", "DEEP_ARCHIVE", 0);
+
+    const movContent = "a video that should land straight in cold storage";
+    const txtContent = "an ordinary file matching no policy but the default";
+    touch("clip.mov", movContent);
+    touch("notes.txt", txtContent);
+
+    const dirtyRows = [
+      {
+        path: "clip.mov",
+        type: "file" as const,
+        mtime: 1,
+        hash: hashBufferHex(Buffer.from(movContent)),
+        size: movContent.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+      {
+        path: "notes.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash: hashBufferHex(Buffer.from(txtContent)),
+        size: txtContent.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const streamPool = new PQueue({ concurrency: 4 });
+    streamPool.on("error", () => {});
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      streamPool,
+      8,
+    );
+
+    expect(result.appliedCount).toBe(2);
+    expect(result.uploadedObjects).toBe(2);
+    expect(result.failed).toEqual([]);
+
+    const classByKeySegment = new Map<string, unknown>();
+    for (const call of putObjectStreamMock.mock.calls) {
+      const key = call[2] as string;
+      classByKeySegment.set(key, call[5]);
+    }
+    // Content-addressed keys, not filenames -- distinguish the two calls by
+    // which hash they targeted rather than any name in the S3 key itself.
+    const movKey = objectKey(hashBufferHex(Buffer.from(movContent)));
+    const txtKey = objectKey(hashBufferHex(Buffer.from(txtContent)));
+    expect(classByKeySegment.get(movKey)).toBe("DEEP_ARCHIVE");
+    expect(classByKeySegment.get(txtKey)).toBe("STANDARD");
+
+    candidateDb.close();
+  });
+
+  it("does not re-upload or reclassify a dedup hit against an object the candidate already knows", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    new StoragePoliciesRepository(candidateDb).create("*.mov", "DEEP_ARCHIVE", 0);
+    const hash = "a".repeat(64);
+    new ObjectsRepository(candidateDb).upsert({
+      hash,
+      s3_key: `objects/${hash}`,
+      size: 1,
+      ciphertext_checksum: "crc-test",
+    });
+
+    const dirtyRow = {
+      path: "clip.mov",
+      type: "file" as const,
+      mtime: 1,
+      hash,
+      size: 1,
+      state: "created" as const,
+      parent_state_version: "v0",
+    };
+
+    const result = await applyLocalChangesToCandidate(
+      candidateDb,
+      [dirtyRow],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+    );
+
+    expect(result.dedupedObjects).toBe(1);
+    expect(result.uploadedObjects).toBe(0);
+    expect(putObjectStreamMock).not.toHaveBeenCalled();
+
     candidateDb.close();
   });
 });

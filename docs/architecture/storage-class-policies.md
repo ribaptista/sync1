@@ -54,3 +54,35 @@ differing only in whether a decided action (`decideStorageClassAction`) is actua
 `status` never applies (`apply: false`), `converge` always does (`apply: true`). Neither needs a
 `--apply` flag the way `ensure_storage_class` did: `status` fully replaces that command's default
 count-only mode, and `converge` fully replaces `--apply`.
+
+## `sync` uploads new content directly into its policy's target class
+
+A brand-new upload (`applyLocalChangesToCandidate`, `src/sync/apply-local-changes.ts`) resolves the
+dispatching row's own path against the candidate's storage policies (`resolveHashTargetClass`,
+`src/s3/policy-evaluation.ts`, the same function `status`/`converge` use) and passes that class straight
+to `PutObjectCommand`/`Upload` (`putObjectStream`, `src/s3/client.ts`) — so an object matching a
+GLACIER/DEEP_ARCHIVE policy at the moment it's first backed up never spends even a moment in STANDARD,
+and never costs the extra copy `converge` would otherwise have to make right after.
+
+This is resolved once, from the one path that actually dispatched the upload — not re-resolved for a
+same-batch dedup attach that rides on the same job afterward. If that attaching path's own policy
+implies a warmer class, this doesn't retroactively change a class already in flight; `converge`'s own
+dedup warmest-wins resolution (above) is still what a shared object's policy disagreement ultimately has
+to settle, the same as it would for two paths synced in different runs entirely.
+
+Three cases this deliberately leaves alone, all for the same reason — none of them uploads new bytes
+through this path at all, so there is no class decision to make here:
+
+- **A dedup hit against an object the candidate already knows** (`objectsRepo.has(hash)`) keeps
+  whatever class that object already has. Re-evaluating it here would race the very mechanism (dedup
+  warmest-wins) that exists to resolve a shared object's policy disagreements deliberately, not
+  incidentally.
+- **A `--verify-remote` adoption** (a prior aborted run's own upload, found already on S3 by the HEAD
+  check) keeps the class it was written with. Nothing here re-uploads it, so there's nothing to attach a
+  fresh decision to.
+- **The mirror** stores ciphertext with no storage class of its own; the concept doesn't apply to a
+  local filesystem copy.
+
+`converge` remains the authority for every one of these, and for a policy edited after the fact — this
+is purely an optimization for the _first_ time a policy exists and a matching file is uploaded, not a
+replacement for the reconciliation pass.

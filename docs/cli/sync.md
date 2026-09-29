@@ -157,3 +157,13 @@ act on.
 
 See [mirroring.md](../architecture/mirroring.md) for the layout, the ordering rules, the retry budgets,
 and how to restore from the drive.
+
+## Uploading into a storage-class policy
+
+A brand-new object matching a [storage policy](storage_policy.md) (`GLACIER`/`DEEP_ARCHIVE`) is
+uploaded straight into that class, not `STANDARD` followed by a separate copy — so if the policy already
+exists before the matching file is first synced, there's nothing left for [`converge`](converge.md) to
+do afterward. A dedup hit against content another path already committed keeps that object's existing
+class regardless; `converge` (not this upload) is what resolves a shared object's policies disagreeing,
+and what catches up a policy created or edited after the fact. See
+[storage-class-policies.md](../architecture/storage-class-policies.md).

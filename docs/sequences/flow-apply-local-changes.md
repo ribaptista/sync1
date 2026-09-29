@@ -1,6 +1,7 @@
 # Flow: applying local changes to the candidate
 
-**Derived from:** `src/sync/apply-local-changes.ts`, `src/sync/conflict-rules.ts`
+**Derived from:** `src/sync/apply-local-changes.ts`, `src/sync/conflict-rules.ts`,
+`src/s3/policy-evaluation.ts`
 
 **Used by:** [`sync.md`](sync.md) (via [`flow-candidate-db.md`](flow-candidate-db.md))
 
@@ -94,6 +95,7 @@ sequenceDiagram
                         Loop->>Loop: decline the shortcut -- fall through to a real re-upload
                     end
                 end
+                Loop->>Loop: resolveHashTargetClass([row.path], policies) -- from this row's<br/>path alone, not re-resolved for a later same-batch dedup attach
                 Loop->>Loop: waitForRoom(streamPool); dispatchTracked(job) -- see below
             end
         end
@@ -129,13 +131,13 @@ sequenceDiagram
         alt needsS3 AND mirrorTarget defined
             Job->>Tee: teeStream(encryptedStream, onMaxRetries="ignore" ? "detach-secondary" : "abort-both")
             par uploadTo(primary)
-                Tee->>S3: putObjectStream -> ciphertextChecksum
+                Tee->>S3: putObjectStream(..., targetClass) -> ciphertextChecksum
             and mirrorTo(secondary)
                 Tee->>Mirror: writeMirrorStream -> wroteMirror=true
             end
             Job->>Job: Promise.allSettled([upload, mirror]); rethrow whichever rejected
         else needsS3 only
-            Job->>S3: uploadTo(encryptedStream)
+            Job->>S3: uploadTo(encryptedStream) -- putObjectStream(..., targetClass)
         else mirrorTarget only (S3 already had the bytes)
             Job->>Mirror: mirrorTo(encryptedStream)
         else neither (ignore-mode fallback, both sinks already satisfied)
@@ -168,6 +170,16 @@ sequenceDiagram
 
 ## Notes
 
+- **Storage class is resolved once per dispatch, from the storage policies loaded at the top of the
+  whole function** (`StoragePoliciesRepository.listNonDefaultByPriority()`/`getDefault()` -- one query
+  pair for the entire run, not per row) -- `resolveHashTargetClass([row.path], ...)`, the same function
+  `status`/`converge` use. A same-batch dedup attach that arrives after dispatch rides on the class
+  already chosen for the row that actually dispatched the job; it is never re-resolved for the attach's
+  own path. `converge` remains the authority for correcting a shared object's policy disagreement, or a
+  policy edited after the fact -- this only ever affects a genuinely new upload, never a dedup hit
+  (`objectsRepo.has(hash)`, keeps whatever class that object already has) or a `--verify-remote`
+  adoption (keeps the class it was written with). See
+  [`storage-class-policies.md`](../architecture/storage-class-policies.md).
 - **Concurrency:** Pass 1 has none. In Pass 2, only the upload/mirror job is dispatched to
   `streamPool`, bounded by `streamQueueLimit` via `waitForRoom` (see
   [`flow-pool-dispatch.md`](flow-pool-dispatch.md)). Inside one job, the tee's two branches

@@ -21,16 +21,17 @@ sequenceDiagram
     participant Body as body stream (encryptStream)
     participant S3
 
-    Caller->>PutStream: putObjectStream(client, bucket, key, body, contentLength)
+    Caller->>PutStream: putObjectStream(client, bucket, key, body, contentLength, storageClass?)
     PutStream->>Tap: tap(body) -- passes every byte through untouched while hashing it
     PutStream->>PutStream: firstBodyError(tapped, aborter) -- races the upload<br/>against the body's own 'error' event
 
     alt contentLength < 32 MiB
-        PutStream->>S3: PutObjectCommand(tapped, ChecksumAlgorithm: CRC64NVME), abortSignal
+        PutStream->>S3: PutObjectCommand(tapped, ChecksumAlgorithm: CRC64NVME, StorageClass: storageClass), abortSignal
     else contentLength >= 32 MiB
-        PutStream->>S3: lib-storage Upload(tapped, ChecksumAlgorithm), abortController
+        PutStream->>S3: lib-storage Upload(tapped, ChecksumAlgorithm, StorageClass: storageClass), abortController
         note right of S3: multipart: CreateMultipartUpload / UploadPart×N / CompleteMultipartUpload
     end
+    note over PutStream: storageClass is undefined for every caller but sync's own new-content<br/>dispatch (see flow-apply-local-changes.md) -- omitted, S3 defaults to STANDARD
 
     par the PUT/Upload itself
         S3-->>PutStream: result (ChecksumCRC64NVME, or undefined)

@@ -191,6 +191,57 @@ describe("status", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  /**
+   * Regression test: `sync` used to always upload new content into
+   * STANDARD regardless of any matching policy, leaving `converge` to make
+   * an extra copy right afterward. A policy created *before* the matching
+   * file is even written proves the object lands in its target class from
+   * the upload itself -- `status` (a pure read, no `--apply`) finds
+   * nothing left to do.
+   */
+  it("uploads new content straight into a pre-existing policy's target class, with nothing left for status to flag", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    // The policy exists before the matching file is ever written or
+    // synced -- unlike every other test in this file, which adds the
+    // policy after a plain sync to exercise the catch-up path instead.
+    await createPolicy(root, "*.mov", "GLACIER");
+    fs.writeFileSync(path.join(root, "clip.mov"), "cold storage from the moment it's uploaded");
+    fs.writeFileSync(path.join(root, "notes.txt"), "matches only the default (STANDARD) policy");
+    const s = await sync(root);
+    expect(s.exitCode).toBe(0);
+
+    const result = await status(root);
+    expect(result.exitCode).toBe(0);
+    expect(result.parsed).toMatchObject({
+      ok: true,
+      already_correct: 2, // both objects, no exceptions
+      changed_immediate: 0,
+      restore_requested: 0,
+      restore_pending: 0,
+      finalized: 0,
+      conflicts: [],
+    });
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
   it("fails cleanly when the root was never initialized/attached", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-e2e-status-bare-"));
     const result = await status(root);

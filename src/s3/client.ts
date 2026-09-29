@@ -176,6 +176,16 @@ export async function putObjectStream(
   key: string,
   body: Readable,
   contentLength: number,
+  /**
+   * Uploads directly into a colder storage class when the object's target
+   * (resolved from the vault's storage policies at dispatch time) is
+   * already known -- skipping the extra copy `converge` would otherwise
+   * have to make right after. Omitted (STANDARD, S3's own default) for
+   * every other caller: dedup hits, verify-remote adoptions, and the
+   * mirror, none of which upload new content through here in a context
+   * where a policy applies.
+   */
+  storageClass?: StorageClass,
 ): Promise<string> {
   const tap = new UploadChecksumTap();
   const tapped = tap.tap(body);
@@ -197,6 +207,7 @@ export async function putObjectStream(
             Body: tapped,
             ContentLength: contentLength,
             ChecksumAlgorithm: "CRC64NVME",
+            StorageClass: storageClass,
           }),
           { abortSignal: aborter.signal },
         ),
@@ -209,7 +220,13 @@ export async function putObjectStream(
 
     const upload = new Upload({
       client,
-      params: { Bucket: bucket, Key: key, Body: tapped, ChecksumAlgorithm: "CRC64NVME" },
+      params: {
+        Bucket: bucket,
+        Key: key,
+        Body: tapped,
+        ChecksumAlgorithm: "CRC64NVME",
+        StorageClass: storageClass,
+      },
       // Also reaches CreateMultipartUpload/UploadPart in flight, and lets
       // lib-storage run its own AbortMultipartUpload rather than leaving
       // parts behind for S3 to keep billing for.
