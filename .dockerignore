@@ -1,0 +1,11 @@
+.git
+node_modules
+dist
+test
+docs
+*.md
+.sync1
+coverage
+.vscode
+.idea
+npm-debug.log*

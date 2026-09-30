@@ -122,6 +122,75 @@ either one doesn't break anything else in sync1; only the `thumbnail`/`thumbnail
 them, and they fail with a clear "not found on PATH" error (`MediaToolMissingError`) rather than a cryptic
 one if you try to use them without the tool installed.
 
+## Docker
+
+The repository's [`Dockerfile`](../Dockerfile) builds a self-contained image with the CLI and both
+external media tools above already installed and pinned — no separate `npm install`/`apt install` step,
+and no risk of an unnoticed ImageMagick 6 (the `>= 7` floor above, silently unmet) or a too-old ffmpeg.
+This is the fastest way to get a fully working `sync1` — including thumbnails — without touching the
+host at all.
+
+```bash
+docker build -t sync1 .
+```
+
+Every command needs the vault's directory available inside the container, so bind-mount it rather than
+relying on the container's own filesystem — the mount is what persists `.sync1/{state,cache}.db`, the
+vault lock, and every tracked file across separate `docker run` invocations, the same way a real
+directory on disk does when running natively:
+
+```bash
+docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
+  -v /path/to/your/vault:/data \
+  -e SYNC1_PASSWORD \
+  sync1 sync --root /data
+```
+
+`--user "$(id -u):$(id -g)"` is not optional in practice — the image runs as its own unprivileged user by
+default, whose uid/gid essentially never matches an arbitrary bind-mounted host directory's ownership,
+and every write into it (a downloaded object, a generated thumbnail, `.sync1/state.db` itself) fails
+with a permission error otherwise. The vault password is read from `$SYNC1_PASSWORD` (as above) or, on a
+real TTY (`-it`), an interactive masked prompt — never as a CLI flag (see [`src/cli/password.
+ts`](../src/cli/password.ts)).
+
+The image's `ENTRYPOINT` is the CLI itself, so any subcommand works the same way — e.g. `... sync1
+thumbnail ensure --root /data` — and running the image with no arguments at all prints `--help`.
+
+The `Dockerfile` pins its base image by content digest and both media tools by exact Debian package
+version (verified against the same `>= 7`/`>= 4.4` floors this doc documents above); see the comments at
+the top of the file for exactly how those versions were chosen and how to update them later, including
+the tradeoff of an exact-version `apt-get install` eventually being superseded by a Debian security
+update.
+
+### Multi-platform (arm64)
+
+The image builds and runs correctly on `linux/arm64` (Apple Silicon, Raspberry Pi, AWS Graviton, etc.),
+not just `linux/amd64` — confirmed directly, not just inferred from published package listings: built
+and ran the actual `Dockerfile` under `docker buildx` with QEMU emulation, exercised `better-sqlite3` and
+`sodium-native` (the two native Node addons, the real risk on a non-amd64 architecture) with real
+database/hash operations, and round-tripped an image through `convert`/`identify` via the same
+bind-mount `--user` flow as amd64. Everything the image depends on already publishes arm64 builds: the
+pinned `node:22-trixie-slim` base is a multi-arch manifest list including `linux/arm64/v8`, both
+`better-sqlite3` and `sodium-native` ship `linux-arm64` (glibc) prebuilds, and Debian trixie's archive
+carries the exact same pinned `ffmpeg`/`imagemagick` package versions for `arm64` as for `amd64`.
+
+On a machine that's natively arm64 (e.g. Apple Silicon), the plain commands above already produce a
+native arm64 image — no extra flags needed. Cross-building arm64 from an amd64 host (or vice versa)
+needs `docker buildx` plus QEMU emulation registered once per host:
+
+```bash
+docker run --rm --privileged tonistiigi/binfmt --install all   # one-time, registers QEMU for all archs
+docker buildx create --use                                      # one-time, a build-capable builder
+
+docker buildx build --platform linux/arm64 -t sync1 --load .
+```
+
+`--load` pulls the built image into the local `docker images` list (as `docker build` does implicitly);
+omit it (and add `--push`) when building for a registry instead. Emulated cross-builds are meaningfully
+slower than a native build on that architecture — the `apt-get install` step alone ran several minutes
+longer under emulation in testing — but produce a bit-identical result to a native arm64 build.
+
 ## Running without building
 
 `npm run dev` (all platforms) runs the CLI directly from TypeScript source via `tsx`, without a build
