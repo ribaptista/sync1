@@ -49,6 +49,10 @@ See [`docs/platform-setup.md`](docs/platform-setup.md) for macOS/Windows-specifi
 walkthroughs below assume the built binary is available as `sync1` on your `PATH` — substitute
 `node dist/cli.js` if you haven't linked it.
 
+Prefer not to install Node/ImageMagick/ffmpeg on your host at all? `docker build -t sync1 .` builds a
+self-contained image with the CLI and both external media tools already installed — see
+[Docker](docs/platform-setup.md#docker) for how to run it.
+
 ## Walkthroughs
 
 Every example below uses the same running scenario: `~/backups/photos` on **machine A**, and
