@@ -12,9 +12,8 @@ import {
   type StorageClass,
   type Tier,
 } from "@aws-sdk/client-s3";
-import { Upload } from "@aws-sdk/lib-storage";
-import { UploadChecksumTap } from "./checksum.js";
-import { CorruptionError } from "../errors.js";
+import type { Logger as SmithyLogger } from "@smithy/types";
+import type { Logger } from "../logger.js";
 
 export interface S3ClientOptions {
   /** Required-but-nullable rather than optional: sidesteps exactOptionalPropertyTypes
@@ -22,6 +21,45 @@ export interface S3ClientOptions {
   region: string | undefined;
   /** Set for LocalStack/S3-compatible backends; omit for real AWS S3. */
   endpoint: string | undefined;
+  /**
+   * Routes the SDK's own diagnostics (retry warnings, the "non-retryable
+   * streaming request" notice -- see `src/s3/retry.ts`'s doc comment) into
+   * this logger instead of `console`. Smithy's retry middleware checks
+   * `context.logger instanceof NoOpLogger` and falls back to `console`
+   * specifically when nothing was configured here, which is how one of
+   * this vault's own real incidents went completely unlogged: the only
+   * trace of it was a line printed to the terminal with no path, no
+   * attempt count, nothing a later `grep` over `sync.log` could ever find.
+   * Optional, and only wired up by `sync` so far (see `createS3Client`'s
+   * other callers) -- every other command can opt in the same way.
+   */
+  logger?: Logger;
+}
+
+/**
+ * Adapts this project's structured pino logger (`debug(context, msg)`) to
+ * the shape `@smithy/types` expects (`debug(...content: unknown[])`,
+ * matching `console`'s own variadic signature). The SDK always calls with
+ * a message, sometimes followed by extra values -- folded into one
+ * structured `args` field rather than interpolated into the message
+ * string, per this repo's own logging convention (see AGENTS.md).
+ */
+function smithyLoggerAdapter(logger: Logger): SmithyLogger {
+  const forward =
+    (level: "trace" | "debug" | "info" | "warn" | "error") =>
+    (...content: unknown[]): void => {
+      const [message, ...rest] = content;
+      const context: Record<string, unknown> = { source: "aws-sdk" };
+      if (rest.length > 0) context.args = rest;
+      logger[level](context, typeof message === "string" ? message : String(message));
+    };
+  return {
+    trace: forward("trace"),
+    debug: forward("debug"),
+    info: forward("info"),
+    warn: forward("warn"),
+    error: forward("error"),
+  };
 }
 
 export function createS3Client(opts: S3ClientOptions): S3Client {
@@ -41,6 +79,9 @@ export function createS3Client(opts: S3ClientOptions): S3Client {
     // the minimum, which is why this never surfaced in the e2e suite.
     requestStreamBufferSize: 65_536,
   };
+  if (opts.logger) {
+    config.logger = smithyLoggerAdapter(opts.logger);
+  }
   if (opts.endpoint) {
     config.endpoint = opts.endpoint;
     // path-style is required by LocalStack and most S3-compatible backends;
@@ -111,176 +152,35 @@ export async function putObject(
 /**
  * Below this size, a plain single-shot PutObject is strictly better (one
  * request, no part-numbering/completion overhead) -- matches S3's own
- * sweet-spot guidance. Comfortably above `Upload`'s enforced 5 MiB minimum
- * part size (so an object just over the threshold isn't needlessly split
- * into many tiny parts) and comfortably below the point where a failed
+ * sweet-spot guidance. Comfortably above S3's enforced 5 MiB minimum part
+ * size (so an object just over the threshold isn't needlessly split into
+ * many tiny parts) and comfortably below the point where a failed
  * single-PUT retry becomes expensive on a flaky connection.
  */
 export const MULTIPART_THRESHOLD_BYTES = 32 * 1024 * 1024;
 
-/**
- * Streaming counterpart to `putObject` -- content-object uploads have no
- * CAS/conditional semantics to preserve (dedup is already checked before any
- * upload is attempted). Below `MULTIPART_THRESHOLD_BYTES`, a plain
- * PutObjectCommand with a precomputed `contentLength` (the chunked codec's
- * fixed per-chunk overhead makes this exact, computed upfront by the
- * caller via `encryptedSize`) is enough. At or above it, S3's ~5GiB
- * single-PUT limit means a real backup file (this vault exists specifically
- * to hold multi-GB/100GB files) needs multipart upload -- `@aws-sdk/
- * lib-storage`'s `Upload` class accepts the same streamed body directly (no
- * local temp-file staging) and manages the part uploads internally.
- */
-/**
- * Verifies what S3 says it stored against what we streamed, throwing on any
- * disagreement.
- *
- * Worth being clear about what this adds, since it is narrower than it
- * looks. Reads are already protected end-to-end: every download decrypts
- * and re-hashes, the AEAD authenticates each chunk, and a mismatch raises
- * `CorruptionError`. What was missing is a check at *write* time -- until
- * now an upload trusted its 200, so an object S3 stored wrongly would only
- * be discovered on a later materialize, quite possibly after the local copy
- * had been stubified away. That is the window this closes.
- *
- * CRC64NVME's single-value-either-way property (see checksum.ts) is what
- * lets this be one function for both upload paths, rather than a
- * full-object comparison for one and a composite comparison for the other.
- */
-function verifyStoredChecksum(key: string, expected: string, reported: string | undefined): void {
-  if (reported === expected) return;
-  // Silence is a failure, not a compatibility affordance. This function
-  // exists to make an upload prove itself rather than trust its 200, and a
-  // backend that reports nothing has proved nothing -- returning early here
-  // would reopen the exact window described above, silently, for the
-  // objects least likely to be noticed. The remedy is never to substitute
-  // a locally computed value: convergent encryption means we could derive
-  // the same number without a download, but recording it would make an
-  // uncorroborated upload indistinguishable from a verified one, which is
-  // worse than having no record at all. So a backend that does not
-  // implement CRC64NVME is unsupported for writing -- already true in
-  // practice (see the version pin in test/e2e/helpers/localstack.ts), now
-  // enforced rather than assumed.
-  if (reported === undefined || reported === "") {
-    throw new CorruptionError(
-      `S3 accepted "${key}" but reported no CRC64NVME checksum, so the upload was never verified against the ${expected} we computed -- this backend does not support the integrity guarantee sync1 requires for writes`,
-    );
-  }
-  throw new CorruptionError(
-    `S3 stored "${key}" with a CRC64NVME checksum of ${reported}, but the bytes we sent checksum to ${expected} -- the upload was corrupted in transit or at rest`,
-  );
-}
+/** S3's hard ceiling on parts per multipart upload. */
+const MAX_MULTIPART_PARTS = 10_000;
 
-export async function putObjectStream(
-  client: S3Client,
-  bucket: string,
-  key: string,
-  body: Readable,
-  contentLength: number,
-  /**
-   * Uploads directly into a colder storage class when the object's target
-   * (resolved from the vault's storage policies at dispatch time) is
-   * already known -- skipping the extra copy `converge` would otherwise
-   * have to make right after. Omitted (STANDARD, S3's own default) for
-   * every other caller: dedup hits, verify-remote adoptions, and the
-   * mirror, none of which upload new content through here in a context
-   * where a policy applies.
-   */
-  storageClass?: StorageClass,
-): Promise<string> {
-  const tap = new UploadChecksumTap();
-  const tapped = tap.tap(body);
-  // Aborting is not tidiness. Winning the race below only settles *our*
-  // promise; the SDK's request keeps waiting on a body that will never
-  // produce another byte, and Node will not exit until its socket times
-  // out -- around a minute per failed object, after the failure has already
-  // been logged and moved past. The signal collapses that to immediate.
-  const aborter = new AbortController();
-  const bodyFailed = firstBodyError(tapped, aborter);
-
-  try {
-    if (contentLength < MULTIPART_THRESHOLD_BYTES) {
-      const result = await Promise.race([
-        client.send(
-          new PutObjectCommand({
-            Bucket: bucket,
-            Key: key,
-            Body: tapped,
-            ContentLength: contentLength,
-            ChecksumAlgorithm: "CRC64NVME",
-            StorageClass: storageClass,
-          }),
-          { abortSignal: aborter.signal },
-        ),
-        bodyFailed.promise,
-      ]);
-      const expected = await tap.checksum();
-      verifyStoredChecksum(key, expected, result.ChecksumCRC64NVME);
-      return expected;
-    }
-
-    const upload = new Upload({
-      client,
-      params: {
-        Bucket: bucket,
-        Key: key,
-        Body: tapped,
-        ChecksumAlgorithm: "CRC64NVME",
-        StorageClass: storageClass,
-      },
-      // Also reaches CreateMultipartUpload/UploadPart in flight, and lets
-      // lib-storage run its own AbortMultipartUpload rather than leaving
-      // parts behind for S3 to keep billing for.
-      abortController: aborter,
-    });
-    const result = (await Promise.race([upload.done(), bodyFailed.promise])) as {
-      ChecksumCRC64NVME?: string;
-    };
-    const expected = await tap.checksum();
-    verifyStoredChecksum(key, expected, result.ChecksumCRC64NVME);
-    return expected;
-  } finally {
-    bodyFailed.dispose();
-  }
-}
+/** S3's own enforced minimum size for every part but the last. */
+const MIN_PART_SIZE_BYTES = 5 * 1024 * 1024;
 
 /**
- * Turns a body-stream failure into a rejected promise the caller can await,
- * instead of an unhandled `'error'` event that takes the process down.
+ * Part size for a multipart upload of `contentLength` bytes: the minimum,
+ * unless that would need more than S3's 10,000 parts.
  *
- * The body can fail for reasons that are the *point*, not accidents:
- * `encryptStream` aborts mid-stream when the source file changed size, or
- * when its plaintext stops matching the hash it is being stored under (see
- * `EncryptStreamOptions`). Both must surface as a normal rejection, so the
- * upload is abandoned and its row left dirty for the next sync — which is
- * only true if someone is listening. Without this, a small-file PUT dies
- * with `Unhandled 'error' event` before the caller's own try/catch can see
- * anything, and the run's `--json` summary never gets written at all.
+ * Has to be passed explicitly. The uploader (src/s3/upload-object.ts) sizes
+ * each part's read off this, so it can only ever use the minimum -- left
+ * unaccounted for, that caps every multipart upload at 10,000 x 5 MiB =
+ * ~52.4 GB. A real 96 GB file reached exactly that byte, after which the
+ * upload could never complete.
  *
- * Raced rather than merely observed, because the SDK may keep waiting on a
- * body that will never produce another byte.
+ * Memory scales with it: the uploader keeps up to 4 parts in flight at
+ * once, so a 96 GB object holds ~40 MB in flight, and S3's 5 TB object
+ * ceiling would hold ~2 GB.
  */
-function firstBodyError(
-  stream: Readable,
-  aborter: AbortController,
-): { promise: Promise<never>; dispose: () => void } {
-  let onError: ((err: Error) => void) | undefined;
-  const promise = new Promise<never>((_resolve, reject) => {
-    onError = (err: Error) => {
-      aborter.abort();
-      reject(err);
-    };
-    stream.once("error", onError);
-  });
-  // An unsettled rejection handler on a stream that never errors would
-  // otherwise be reported as an unhandled rejection when the race is won by
-  // the upload instead.
-  promise.catch(() => undefined);
-  return {
-    promise,
-    dispose: () => {
-      if (onError) stream.off("error", onError);
-    },
-  };
+export function multipartPartSize(contentLength: number): number {
+  return Math.max(MIN_PART_SIZE_BYTES, Math.ceil(contentLength / MAX_MULTIPART_PARTS));
 }
 
 export async function getObject(
@@ -330,7 +230,7 @@ export interface HeadResult {
   restore?: string;
   /**
    * The object's full-object CRC64NVME checksum, base64 -- the exact value
-   * `putObjectStream` computes and returns on upload, and what
+   * `uploadObjectStream` (src/s3/upload-object.ts) computes and returns on upload, and what
    * `objects.ciphertext_checksum` stores (see src/s3/checksum.ts and
    * 0006_add_object_ciphertext_checksum.sql). Absent unless S3 actually
    * has one recorded for the object: an object uploaded before this vault

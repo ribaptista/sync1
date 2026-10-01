@@ -69,6 +69,34 @@ throughput cost on a slow mount, accepted deliberately in exchange for a simple 
 sync means a complete mirror**, with no reconciliation pass and no partially-mirrored commit to reason
 about.
 
+## Coordinating across sinks
+
+One `AbortController` per attempt is shared by the upload, the mirror write, and the source read
+(`countingReadable`/`encryptStream`). Whichever gives up for good is what decides the attempt's
+outcome, and signals the others to stop wherever they are, rather than each one only noticing the
+failure if its own stream happens to error -- which is what used to silently stall the whole attempt:
+`teeStream` (`src/fs/mirror-sink.ts`) already fails the sibling branch when one tee branch fails, but a
+sink that doesn't error its own stream (a consumer that simply stops reading) wouldn't otherwise be
+told. See `flow-apply-local-changes.md` for the full sequence.
+
+**Three kinds of failure, told apart deliberately, because they mean three different things:**
+
+- **Upstream** (the read itself: a permission change, a hash mismatch, the file changing since it was
+  scanned) is this row's own problem. Watched for directly on the encrypted stream every sink's body is
+  derived from -- neither `uploadObjectStream` nor `writeMirrorStream` can tell "my own call failed"
+  from "the body I was handed failed", since both arrive identically as a rejected read. Leaves the row
+  dirty, same as always; does not abort the run.
+- **S3**, once `uploadObjectStream` has already retried every transient failure internally, means a
+  non-transient error -- fatal to the whole run (`S3UploadFatalError`; see
+  [dedup-and-object-storage.md](dedup-and-object-storage.md)).
+- **Mirror** is the retry/escalation ladder this whole doc describes above.
+
+Whichever of the three is recorded first wins and decides the outcome; every failure is logged
+regardless, so a mirror failure masked by a later, unrelated upload echo is never silent. "First" is
+decided by `AbortController.abort()`'s own synchronicity: the first call sets the shared signal, and
+every later rejection -- including the echo the abort itself causes in the sink it just stopped -- finds
+the signal already aborted and is logged only, never promoted to the cause.
+
 ## Ordering: objects, then the snapshot, then the pointer
 
 [commit-pointer.ts](../../src/sync/commit-pointer.ts) states the invariant for S3 — objects and
@@ -94,8 +122,11 @@ the cheap existence check sound. The temp is a _sibling_ (`inTreeTempPath`) so t
 filesystem; a temp in `/tmp` would silently degrade into a copy on a network mount, losing atomicity
 exactly where it matters most.
 
-Unlike S3, the mirror therefore needs no abort seam: a stream that errors partway leaves only a temp,
-removed on the failing path and swept later.
+A stream that errors partway leaves only a temp, removed on the failing path and swept later --
+`writeMirrorStream` also accepts a `signal` (`AbortSignal`) so the job coordinating both sinks
+(`applyLocalChangesToCandidate`, `src/sync/apply-local-changes.ts`) can stop an in-progress mirror write
+the moment the _other_ sink gives up for good, rather than only reacting after its own stream happens to
+error. See **Coordinating across sinks** below.
 
 **Atomic and durable are different properties, and the mirror needs both.** A bare rename is atomic --
 nobody ever sees a half-written file -- but a crash can still lose the temp file's own unflushed bytes

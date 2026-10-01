@@ -12,8 +12,8 @@ import { VersionsRepository } from "../db/repositories/versions-repository.js";
 import { StoragePoliciesRepository } from "../db/repositories/storage-policies-repository.js";
 import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
 import { HASH_BYTES } from "../crypto/hash.js";
-import { putObjectStream, headObject } from "../s3/client.js";
-import { withS3Retry } from "../s3/retry.js";
+import { headObject } from "../s3/client.js";
+import { uploadObjectStream, S3UploadFatalError } from "../s3/upload-object.js";
 import { resolveHashTargetClass } from "../s3/policy-evaluation.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
@@ -548,17 +548,19 @@ export async function applyLocalChangesToCandidate(
         // giving up on small ones entirely.
         const key = objectKey(hash);
 
-        // Only the transfer itself -- withS3Retry's whole read-encrypt-PUT
-        // -- is treated as a recoverable, leave-it-dirty-and-move-on
-        // failure. Deliberately its own inner try/catch, not folded into
-        // one big catch around this whole job: a failure in the DB writes
-        // below (objectsRepo/entriesRepo) is a fundamentally different,
-        // more serious problem -- evidence the candidate DB itself is
-        // broken, not that one file's content didn't make it to S3 -- and
-        // must not be silently swallowed the same way. Left to propagate
-        // out of this whole dispatched job uncaught, it's exactly what the
-        // stream pool's own error capture exists to catch properly.
-        // The checksum doubles as the success flag: `putObjectStream`
+        // Only the transfer itself is treated as a recoverable,
+        // leave-it-dirty-and-move-on failure -- EXCEPT a non-transient S3
+        // error, which is fatal to the whole run (see `S3UploadFatalError`,
+        // src/s3/upload-object.ts). Deliberately its own inner try/catch,
+        // not folded into one big catch around this whole job: a failure
+        // in the DB writes below (objectsRepo/entriesRepo) is a
+        // fundamentally different, more serious problem -- evidence the
+        // candidate DB itself is broken, not that one file's content
+        // didn't make it to S3 -- and must not be silently swallowed the
+        // same way. Left to propagate out of this whole dispatched job
+        // uncaught, it's exactly what the stream pool's own error capture
+        // exists to catch properly.
+        // The checksum doubles as the success flag: `uploadObjectStream`
         // resolves only once S3's own CRC64NVME matched the client's, so a
         // value here *is* proof the upload landed and was verified, and a
         // separate boolean could only ever disagree with it. That also
@@ -581,149 +583,245 @@ export async function applyLocalChangesToCandidate(
         const mirrorTarget = mirrorNeedsObject ? mirrorObjectTarget : undefined;
         let wroteMirror = false;
         try {
-          // The retriable unit is the whole read-encrypt-PUT, not just the
-          // PUT: a Readable that has already errored can't be replayed, so
-          // each attempt opens a fresh one. The DB upserts below stay
-          // outside it -- a retry re-sends bytes, it doesn't re-run
-          // bookkeeping.
-          //
-          // A retried attempt re-reads from byte zero, so `onRetry` hands
-          // the abandoned partial back via fileTracker.retrying(): the bar
-          // rewinds to the last state actually committed to S3, which is
-          // exactly what the next attempt has to re-earn. Leaving it in
-          // place would have the new attempt's advance() calls pile onto
-          // bytes that no longer exist anywhere.
-          // Nested deliberately, outermost first: the retriable unit is the
-          // whole read-encrypt-write, since a Readable that already errored
-          // cannot be replayed, so recovering from *either* sink means
-          // starting the read over. The budgets stay separate because S3's
-          // is unbounded and its retryable errnos include ETIMEDOUT and
-          // ENETUNREACH -- exactly what a dropped SMB mount throws.
-          const runUnit = (): Promise<void> =>
-            withS3Retry(
-              async () => {
-                // Cheap guard ahead of the expensive one. `hash` and `size`
-                // both come from the cache row written back in the scanning
-                // phase, while the bytes below are read now -- hours later on
-                // a large vault. A stat costs one syscall and rejects any
-                // edit that moved mtime or size *before* a single byte goes
-                // out, where encryptStream's hash check can only reject after
-                // the body is already in flight. Neither subsumes the other:
-                // this misses a size- and mtime-preserving edit, which is
-                // exactly the silent case the hash catches.
-                const current = fs.statSync(absolutePath);
-                // Rounded to match how the cache stores it (see
-                // `Math.round(fsEntry.mtimeMs)` in update-cache.ts) -- an
-                // unrounded comparison would report a spurious change on any
-                // filesystem with sub-millisecond timestamps.
-                const currentMtime = Math.round(current.mtimeMs);
-                if (current.size !== size || currentMtime !== row.mtime) {
-                  throw new Error(
-                    `"${row.path}" changed since it was scanned (size ${size} -> ${current.size}, mtime ${row.mtime} -> ${currentMtime}) -- leaving it dirty for the next sync rather than storing it under a stale hash`,
-                  );
-                }
-                const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
-                  fileTracker.advance(n),
-                );
-                // `expectedHash` is `hash` itself: for a content object the
-                // context *is* the content hash, so this asks the codec to
-                // prove the bytes it is encrypting are the ones that hash
-                // was taken from. See EncryptStreamOptions for why the two
-                // can disagree, and why a mismatch has to abort the stream
-                // rather than be reported afterwards.
-                const encryptedStream = encryptStream(sourceStream, size, masterKey, context, {
-                  expectedHash: hash,
-                });
-                const uploadTo = async (stream: Readable): Promise<void> => {
-                  ciphertextChecksum = await putObjectStream(
-                    s3.client,
-                    s3.bucket,
-                    remoteKey(s3.location, key),
-                    stream,
-                    encryptedSize(size, context.length),
-                    targetClass,
-                  );
-                };
-                const mirrorTo = async (stream: Readable): Promise<void> => {
-                  await asMirrorWrite(mirrorTarget!, () =>
-                    writeMirrorStream(mirrorTarget!, stream),
-                  );
-                  wroteMirror = true;
-                };
+          // The retriable unit is the whole read-encrypt-write, not just
+          // one request: a Readable that has already errored can't be
+          // replayed, so each attempt opens a fresh one. The DB upserts
+          // below stay outside it -- a retry re-sends bytes, it doesn't
+          // re-run bookkeeping. Only `withMirrorRetry` wraps this now --
+          // S3's own transient failures are retried per-request/per-part
+          // *inside* `uploadObjectStream`, so they never need the whole
+          // file re-read and re-encrypted from byte zero the way they used
+          // to.
+          const runUnit = async (): Promise<void> => {
+            // Cheap guard ahead of the expensive one. `hash` and `size`
+            // both come from the cache row written back in the scanning
+            // phase, while the bytes below are read now -- hours later on
+            // a large vault. A stat costs one syscall and rejects any
+            // edit that moved mtime or size *before* a single byte goes
+            // out, where encryptStream's hash check can only reject after
+            // the body is already in flight. Neither subsumes the other:
+            // this misses a size- and mtime-preserving edit, which is
+            // exactly the silent case the hash catches.
+            const current = fs.statSync(absolutePath);
+            // Rounded to match how the cache stores it (see
+            // `Math.round(fsEntry.mtimeMs)` in update-cache.ts) -- an
+            // unrounded comparison would report a spurious change on any
+            // filesystem with sub-millisecond timestamps.
+            const currentMtime = Math.round(current.mtimeMs);
+            if (current.size !== size || currentMtime !== row.mtime) {
+              throw new Error(
+                `"${row.path}" changed since it was scanned (size ${size} -> ${current.size}, mtime ${row.mtime} -> ${currentMtime}) -- leaving it dirty for the next sync rather than storing it under a stale hash`,
+              );
+            }
 
-                if (needsS3 && mirrorTarget !== undefined) {
-                  // One read, one encryption, two sinks advancing in
-                  // lockstep. S3 therefore goes no faster than the mirror --
-                  // accepted deliberately, in exchange for a clean sync
-                  // meaning a complete mirror with no reconciliation pass.
-                  //
-                  // The tee's own failure mode has to match what this
-                  // attempt intends to do with a mirror failure: `ignore`
-                  // wants S3 to finish regardless (`detach-secondary`),
-                  // `fail` wants the whole object abandoned together
-                  // (`abort-both`, the default). This is the one place that
-                  // decision actually gets made -- passing nothing here
-                  // silently defaults to `abort-both` for both modes,
-                  // which used to be exactly what happened.
-                  const { primary, secondary } = teeStream(
-                    encryptedStream,
-                    mirror.onMaxRetries === "ignore" ? "detach-secondary" : "abort-both",
-                  );
-                  // `Promise.all`, not `allSettled`, would reject the
-                  // instant *either* promise does -- abandoning whichever
-                  // one is still running rather than waiting for it. For a
-                  // still-running `uploadTo` that is exactly the danger:
-                  // its underlying PUT keeps executing in the background
-                  // regardless, and would go on to set `ciphertextChecksum`
-                  // whenever it eventually resolved -- including after
-                  // `withMirrorRetry` had already decided this attempt
-                  // failed and started a fresh one, so a stale, abandoned
-                  // attempt's success could silently leak into a *later*
-                  // attempt's bookkeeping. Waiting for both to settle here,
-                  // every time, is what keeps each attempt's outcome fully
-                  // its own.
-                  const [uploadOutcome, mirrorOutcome] = await Promise.allSettled([
-                    uploadTo(primary),
-                    mirrorTo(secondary),
-                  ]);
-                  if (uploadOutcome.status === "rejected") throw uploadOutcome.reason;
-                  if (mirrorOutcome.status === "rejected") throw mirrorOutcome.reason;
-                } else if (needsS3) {
-                  await uploadTo(encryptedStream);
-                } else if (mirrorTarget !== undefined) {
-                  // S3 already holds these exact bytes (a dedup hit, or a
-                  // verifyRemote HEAD): only the mirror is missing, so no
-                  // upload is paid for at all.
-                  await mirrorTo(encryptedStream);
-                } else {
-                  // Reachable only on the `ignore` fallback pass for an
-                  // object S3 already had: both sinks are now satisfied or
-                  // given up on, so there is nothing left to stream. The
-                  // source still has to be drained, or the file handle and
-                  // the progress tracker are both left dangling.
-                  encryptedStream.destroy();
-                }
-              },
-              {
-                onRetry: (notice) => {
-                  fileTracker.retrying(notice);
-                  logger.warn(
-                    {
-                      path: row.path,
-                      attempt: notice.attempt,
-                      delayMs: notice.delayMs,
-                      err:
-                        notice.error instanceof Error ? notice.error.message : String(notice.error),
-                    },
-                    "transient S3 failure while uploading -- retrying",
-                  );
+            // Shared by every sink this attempt touches, so that whichever
+            // one gives up for good stops the others wherever they are --
+            // instead of each stream reaching that conclusion on its own,
+            // if it ever does, the way the tee alone used to have to. The
+            // source read is included: without it, an upload that aborted
+            // because the mirror failed would leave the file handle open,
+            // paused, for nothing left to read it.
+            const controller = new AbortController();
+            const signal = controller.signal;
+            let firstFailure: { source: "s3" | "mirror"; error: unknown } | undefined;
+            // Every failed sink is logged here, the instant it happens --
+            // not only the one that ultimately decides the attempt's
+            // outcome -- so a hang-shaped failure (the mirror never
+            // settling) can no longer hide the fact that the S3 side
+            // already failed minutes earlier. `!signal.aborted` is what
+            // makes the *first* failure the one that decides: aborting is
+            // synchronous, so whichever rejection is observed first sets
+            // it, and every later one -- including the echo the abort
+            // itself causes in the other sink -- finds the signal already
+            // aborted and is logged only, never promoted to the cause.
+            const recordFailure = (source: "s3" | "mirror", error: unknown): void => {
+              logger.warn(
+                {
+                  path: row.path,
+                  hash,
+                  source,
+                  err: error instanceof Error ? error.message : String(error),
                 },
-              },
+                "sink failed during upload attempt",
+              );
+              if (signal.aborted) return;
+              firstFailure = { source, error };
+              controller.abort(error);
+            };
+
+            const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
+              fileTracker.advance(n),
             );
+            // `expectedHash` is `hash` itself: for a content object the
+            // context *is* the content hash, so this asks the codec to
+            // prove the bytes it is encrypting are the ones that hash
+            // was taken from. See EncryptStreamOptions for why the two
+            // can disagree, and why a mismatch has to abort the stream
+            // rather than be reported afterwards.
+            const encryptedStream = encryptStream(sourceStream, size, masterKey, context, {
+              expectedHash: hash,
+              signal,
+            });
+            // Observed, never consumed: `uploadObjectStream` has no way to
+            // tell "my own S3 call failed" from "the body stream I was
+            // handed failed" -- a read error (a permission change, a
+            // yanked drive) or a hash mismatch surfaces to it identically,
+            // as a rejected read. Listening here, directly on the one
+            // stream every sink's body is derived from, is what lets this
+            // attempt tell the two apart and route each correctly: an
+            // upstream failure stays a per-row "leave dirty" case, not an
+            // `S3UploadFatalError` that would wrongly abort the whole run
+            // over a problem S3 was never involved in.
+            //
+            // No `controller.abort()` here, deliberately: the stream
+            // failing already fails the upload on its own -- the
+            // producer's own `readExact` rejects with this same error,
+            // which is what reaches `uploadObjectStream`'s catch and
+            // aborts the multipart upload. Calling `abort()` too would
+            // only cancel whichever `UploadPart` requests happened to
+            // still be in flight a little sooner; it changes nothing
+            // observable, so it isn't worth the extra mechanism.
+            let upstreamError: unknown;
+            encryptedStream.once("error", (err: unknown) => {
+              upstreamError ??= err;
+            });
+            const uploadTo = async (stream: Readable): Promise<void> => {
+              ciphertextChecksum = await uploadObjectStream(
+                s3.client,
+                s3.bucket,
+                remoteKey(s3.location, key),
+                stream,
+                encryptedSize(size, context.length),
+                targetClass,
+                {
+                  signal,
+                  logger,
+                  onRetry: (notice) => {
+                    fileTracker.retrying(notice);
+                    logger.warn(
+                      {
+                        path: row.path,
+                        hash,
+                        part: notice.part,
+                        attempt: notice.attempt,
+                        delayMs: notice.delayMs,
+                        err:
+                          notice.error instanceof Error
+                            ? notice.error.message
+                            : String(notice.error),
+                      },
+                      "transient S3 failure while uploading -- retrying",
+                    );
+                  },
+                },
+              );
+            };
+            const mirrorTo = async (stream: Readable): Promise<void> => {
+              await asMirrorWrite(mirrorTarget!, () =>
+                writeMirrorStream(mirrorTarget!, stream, { signal }),
+              );
+              wroteMirror = true;
+            };
+
+            if (needsS3 && mirrorTarget !== undefined) {
+              // One read, one encryption, two sinks advancing in
+              // lockstep. S3 therefore goes no faster than the mirror --
+              // accepted deliberately, in exchange for a clean sync
+              // meaning a complete mirror with no reconciliation pass.
+              //
+              // The tee's own failure mode has to match what this
+              // attempt intends to do with a mirror failure: `ignore`
+              // wants S3 to finish regardless (`detach-secondary`),
+              // `fail` wants the whole object abandoned together
+              // (`abort-both`, the default). This is the one place that
+              // decision actually gets made -- passing nothing here
+              // silently defaults to `abort-both` for both modes,
+              // which used to be exactly what happened. The tee's own
+              // early-close detection (src/fs/mirror-sink.ts) stays as a
+              // safety net for whatever doesn't honor `signal` directly;
+              // the controller above is now the primary mechanism.
+              const { primary, secondary } = teeStream(
+                encryptedStream,
+                mirror.onMaxRetries === "ignore" ? "detach-secondary" : "abort-both",
+              );
+              // `Promise.all`, not `allSettled`, would reject the
+              // instant *either* promise does -- abandoning whichever
+              // one is still running rather than waiting for it. For a
+              // still-running `uploadTo` that is exactly the danger:
+              // its underlying PUT keeps executing in the background
+              // regardless, and would go on to set `ciphertextChecksum`
+              // whenever it eventually resolved -- including after
+              // `withMirrorRetry` had already decided this attempt
+              // failed and started a fresh one, so a stale, abandoned
+              // attempt's success could silently leak into a *later*
+              // attempt's bookkeeping. Waiting for both to settle here,
+              // every time, is what keeps each attempt's outcome fully
+              // its own.
+              const [uploadOutcome, mirrorOutcome] = await Promise.allSettled([
+                uploadTo(primary),
+                mirrorTo(secondary),
+              ]);
+              if (uploadOutcome.status === "rejected") {
+                recordFailure("s3", uploadOutcome.reason);
+              }
+              if (mirrorOutcome.status === "rejected") {
+                recordFailure("mirror", mirrorOutcome.reason);
+              }
+              // Checked ahead of both sinks' own classification: the tee
+              // destroys *both* branches with the identical error the
+              // moment the source itself fails, so whichever of
+              // `uploadTo`/`mirrorTo` happened to settle (and call
+              // `recordFailure`) first would otherwise mislabel a read
+              // failure or hash mismatch as that sink's own fault.
+              if (upstreamError !== undefined) throw upstreamError;
+              if (firstFailure?.source === "mirror") throw firstFailure.error;
+              if (firstFailure?.source === "s3") {
+                throw new S3UploadFatalError(
+                  job.sourceRows.map((r) => r.path),
+                  hash,
+                  firstFailure.error,
+                );
+              }
+            } else if (needsS3) {
+              try {
+                await uploadTo(encryptedStream);
+              } catch (err) {
+                // Same ordering as the branch above: a failure that
+                // originated upstream of `uploadObjectStream` (a read
+                // error, a hash mismatch) is this row's own problem to
+                // leave dirty, not evidence S3 did anything wrong --
+                // `uploadObjectStream` has no way to tell the two apart
+                // itself, since both arrive as an ordinary rejected read.
+                if (upstreamError !== undefined) throw upstreamError;
+                // No mirror in this attempt to coordinate with, but the
+                // same rule from the branch above still applies: a
+                // non-transient S3 error is fatal to the whole run, not a
+                // per-object failure this row can just stay dirty over.
+                throw new S3UploadFatalError(
+                  job.sourceRows.map((r) => r.path),
+                  hash,
+                  err,
+                );
+              }
+            } else if (mirrorTarget !== undefined) {
+              // S3 already holds these exact bytes (a dedup hit, or a
+              // verifyRemote HEAD): only the mirror is missing, so no
+              // upload is paid for at all.
+              await mirrorTo(encryptedStream);
+            } else {
+              // Reachable only on the `ignore` fallback pass for an
+              // object S3 already had: both sinks are now satisfied or
+              // given up on, so there is nothing left to stream. The
+              // source still has to be drained, or the file handle and
+              // the progress tracker are both left dangling.
+              encryptedStream.destroy();
+            }
+          };
 
           try {
             await withMirrorRetry(runUnit);
           } catch (err) {
+            if (err instanceof S3UploadFatalError) throw err;
             if (!(err instanceof MirrorWriteError)) throw err;
             if (mirror.onMaxRetries === "fail") {
               // Escalate, deliberately: this is not a per-object failure
@@ -763,15 +861,16 @@ export async function applyLocalChangesToCandidate(
             );
           }
         } catch (err) {
-          // MirrorRequiredError is not a per-object failure -- see its own
-          // doc comment (src/fs/mirror-sink.ts) and OnMirrorMaxRetries
-          // above. Rethrown here, uncaught, deliberately ahead of every
-          // other branch below: none of this job's own bookkeeping matters
-          // once the whole run is aborting, and rethrowing is what lets
+          // MirrorRequiredError and S3UploadFatalError are not per-object
+          // failures -- see their own doc comments (src/fs/mirror-sink.ts,
+          // src/s3/upload-object.ts) and OnMirrorMaxRetries above.
+          // Rethrown here, uncaught, deliberately ahead of every other
+          // branch below: none of this job's own bookkeeping matters once
+          // the whole run is aborting, and rethrowing is what lets
           // dispatchTracked capture it into streamPoolErrors instead of
           // this catch swallowing it the way an ordinary upload failure
           // is swallowed just below.
-          if (err instanceof MirrorRequiredError) throw err;
+          if (err instanceof MirrorRequiredError || err instanceof S3UploadFatalError) throw err;
 
           // Deliberately NOT reported as applied: handledPaths/
           // appliedCount/entriesRepo are never touched below when this

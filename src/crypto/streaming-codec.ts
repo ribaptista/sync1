@@ -20,8 +20,14 @@ import { StreamingHasher } from "./hash.js";
  * callers supply/consume plain Node Readables.
  */
 
-/** Accumulates arbitrary-sized chunks from a stream until an exact byte count is available. */
-class StreamByteReader {
+/**
+ * Accumulates arbitrary-sized chunks from a stream until an exact byte
+ * count is available. Exported for `src/s3/upload-object.ts`, which reads
+ * fixed-size multipart parts off the same kind of stream this module
+ * encrypts into -- re-buffering chunk boundaries is exactly this class's
+ * job, regardless of what the fixed size is for.
+ */
+export class StreamByteReader {
   private buffered = Buffer.alloc(0);
   private readonly iterator: AsyncIterator<Buffer>;
   private done = false;
@@ -84,6 +90,17 @@ export interface EncryptStreamOptions {
    * recorded hash — quite possibly after `stubify` removed the local copy.
    */
   expectedHash?: string;
+  /**
+   * Job-level coordination from the caller: when the sink(s) this stream
+   * feeds have given up for good (the mirror failed, S3 gave up), the read
+   * has to stop too, rather than going on reading and encrypting bytes
+   * nothing downstream will ever consume. Checked once per chunk, not
+   * continuously -- the chunk already being read when the signal fires is
+   * still allowed to finish, which is simpler than threading cancellation
+   * into `StreamByteReader` itself and costs at most one chunk's worth of
+   * wasted work.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -102,7 +119,7 @@ export function encryptStream(
   context: Buffer,
   options: EncryptStreamOptions = {},
 ): Readable {
-  const { chunkSize = DEFAULT_CHUNK_SIZE, expectedHash } = options;
+  const { chunkSize = DEFAULT_CHUNK_SIZE, expectedHash, signal } = options;
   const objectKey = deriveObjectKey(masterKey, context);
   const header = encodeHeader(context, chunkSize, totalPlaintextSize);
   const totalChunks = Math.ceil(totalPlaintextSize / chunkSize);
@@ -120,6 +137,15 @@ export function encryptStream(
     yield header;
     const reader = new StreamByteReader(sourceStream);
     for (let i = 0; i < totalChunks; i++) {
+      // Checked once per chunk, not continuously -- see `signal`'s doc on
+      // `EncryptStreamOptions`. Explicitly destroying `sourceStream` (not
+      // just throwing out of this generator) is what actually releases the
+      // open file handle; throwing alone would leave it open until GC,
+      // same as the hang this whole mechanism exists to prevent.
+      if (signal?.aborted) {
+        sourceStream.destroy();
+        signal.throwIfAborted();
+      }
       const len = i === totalChunks - 1 ? totalPlaintextSize - chunkSize * i : chunkSize;
       const chunk = await reader.readExact(len);
       if (!chunk || chunk.length !== len) {

@@ -60,7 +60,7 @@ count-only mode, and `converge` fully replaces `--apply`.
 A brand-new upload (`applyLocalChangesToCandidate`, `src/sync/apply-local-changes.ts`) resolves the
 dispatching row's own path against the candidate's storage policies (`resolveHashTargetClass`,
 `src/s3/policy-evaluation.ts`, the same function `status`/`converge` use) and passes that class straight
-to `PutObjectCommand`/`Upload` (`putObjectStream`, `src/s3/client.ts`) — so an object matching a
+to `PutObjectCommand`/multipart (`uploadObjectStream`, `src/s3/upload-object.ts`) — so an object matching a
 GLACIER/DEEP_ARCHIVE policy at the moment it's first backed up never spends even a moment in STANDARD,
 and never costs the extra copy `converge` would otherwise have to make right after.
 

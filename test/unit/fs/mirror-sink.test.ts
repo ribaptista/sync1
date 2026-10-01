@@ -11,7 +11,9 @@ import {
   withMirrorRetry,
   asMirrorWrite,
   MirrorWriteError,
+  TeeBranchAbortedError,
 } from "../../../src/fs/mirror-sink.js";
+import { UploadChecksumTap } from "../../../src/s3/checksum.js";
 import { isInTreeTempName } from "../../../src/fs/temp-path.js";
 
 let dir: string;
@@ -273,6 +275,68 @@ describe("teeStream", () => {
     sabotageSecondaryMidStream(secondary);
 
     await expect(collect(primary)).rejects.toThrow();
+  });
+
+  /**
+   * Far more than every buffer between source and consumer can hold, so
+   * the source genuinely has to pause on backpressure -- the state the
+   * hang below lives in. A short source would be fully buffered before
+   * any consumer walked away, and pass whether or not the tee noticed.
+   */
+  function largeSource(): Readable {
+    return Readable.from(
+      (function* () {
+        for (let i = 0; i < 256; i++) yield Buffer.alloc(64 * 1024, i);
+      })(),
+    );
+  }
+
+  /** Reads one chunk, then stops -- how lib-storage abandons a body when a part upload fails. */
+  async function abandonAfterFirstChunk(stream: Readable): Promise<void> {
+    for await (const _chunk of stream) break;
+  }
+
+  /**
+   * The hang a real 30-hour sync sat in. A consumer that stops reading
+   * destroys its stream *without* an error, which emits only 'close'. The
+   * tee used to watch for 'error' alone, so the shared source stayed paused
+   * on a branch nobody would drain, and the secondary -- the mirror write
+   * -- stalled forever with no error and no CPU.
+   */
+  it("fails the secondary when the primary's consumer silently walks away mid-stream", async () => {
+    const source = largeSource();
+    const { primary, secondary } = teeStream(source);
+    const mirror = collect(secondary);
+
+    await abandonAfterFirstChunk(primary);
+
+    await expect(mirror).rejects.toBeInstanceOf(TeeBranchAbortedError);
+    // With neither branch left to drain it, the source would otherwise sit
+    // paused holding its file descriptor until the process exits.
+    expect(source.destroyed).toBe(true);
+  });
+
+  /**
+   * The same hang through the real upload path: the S3 branch is wrapped
+   * by UploadChecksumTap, and it is the *tap* lib-storage abandons. The tap
+   * used `.pipe()`, which answers a destroyed destination by unpiping --
+   * so the primary never even closed, and the tee had nothing to see.
+   */
+  it("fails the secondary when the upload abandons the checksum-tapped primary", async () => {
+    const { primary, secondary } = teeStream(largeSource());
+    const mirror = collect(secondary);
+
+    await abandonAfterFirstChunk(new UploadChecksumTap().tap(primary));
+
+    await expect(mirror).rejects.toBeInstanceOf(TeeBranchAbortedError);
+  });
+
+  it("marks only the torn-down sibling as an echo, so the real failure can be told apart", async () => {
+    const { primary, secondary } = teeStream(largeSource(), "abort-both");
+    const upload = collect(primary);
+    secondary.destroy(new Error("disk unplugged"));
+
+    await expect(upload).rejects.toEqual(new TeeBranchAbortedError("secondary"));
   });
 });
 

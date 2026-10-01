@@ -23,7 +23,7 @@ sequenceDiagram
     participant Hasher as StreamingHasher
     participant Source as source stream (fs.createReadStream)
 
-    Caller->>Enc: encryptStream(source, size, masterKey, context, { expectedHash? })
+    Caller->>Enc: encryptStream(source, size, masterKey, context, { expectedHash?, signal? })
     Enc->>Enc: deriveObjectKey(masterKey, context); encodeHeader(...)
 
     alt totalChunks === 0 (zero-byte plaintext)
@@ -37,6 +37,10 @@ sequenceDiagram
     Enc-->>Caller: yield header
 
     loop i = 0 .. totalChunks-1
+        alt signal is aborted (checked once per chunk, not continuously)
+            Enc->>Source: destroy() -- releases the open file handle<br/>before anyone can leave it unread
+            Enc-->>Caller: throw signal.reason
+        end
         Enc->>Reader: readExact(chunkLen)
         Reader->>Source: pull bytes until chunkLen satisfied or source ends
         alt fewer bytes than declared (source shrank)
@@ -61,14 +65,18 @@ sequenceDiagram
 ## Notes
 
 - **Concurrency:** none — one source, one reader, fully sequential; the async generator yields to
-  whatever is consuming it (typically `putObjectStream`'s tap, or a mirror write) one chunk at a time.
+  whatever is consuming it (typically `uploadObjectStream`, a mirror write, or both at once via
+  `teeStream`) one chunk at a time.
 - **On failure:** this is the mechanism, not a side effect, of a stronger guarantee. Throwing _before the
-  final yield_ means the consumer (`putObjectStream`) receives a body shorter than the `ContentLength` it
-  declared, and the SDK aborts the request rather than completing it — see
+  final yield_ means the consumer (`uploadObjectStream`) receives a body shorter than the declared length
+  it expected, and the request is aborted rather than completed — see
   [`flow-put-object-stream.md`](flow-put-object-stream.md) for what that looks like from the S3 side. The
   object is therefore **never created**, not created and then cleaned up, which matters because a
   compensating delete would leave a window in which another machine's `verifyRemote` HEAD check could
   adopt the bad object before the cleanup ran.
+- **`signal`** is the job-level coordination from `flow-apply-local-changes.md`: when the sink(s) this
+  stream feeds have given up for good (the mirror exhausted its retries, S3 gave up), the read stops too
+  rather than continuing to read and encrypt bytes nothing downstream will ever consume.
 - **What `expectedHash` closes:** the plaintext hash a content object is stored under is computed once,
   during `update_cache`'s scanning phase, from whatever the file's content was _then_. The bytes actually
   streamed here are read later — potentially hours later, on a large vault's upload phase. A file edited
