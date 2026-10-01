@@ -1019,6 +1019,18 @@ export async function applyLocalChangesToCandidate(
             size,
             ciphertext_checksum: remoteChecksum,
           });
+          // `size` was already counted toward the run's byte total --
+          // `progress.expectBytes(size)` ran back when this job was
+          // dispatched (every job's does, regardless of how it resolves),
+          // and commit.ts's own enumeration pass counts it too, since it
+          // can't know yet that S3 already has it. Nothing is ever going
+          // to transfer these bytes, so without this the bar would sit
+          // short of its own total forever -- the same gap `skipBytes`
+          // (src/progress-types.ts) already closes for materialize.ts's
+          // archived objects. Once per job, not per `sourceRow`: a
+          // same-batch dedup attach never called `expectBytes` of its
+          // own, so crediting it again here would overshoot the total.
+          progress.skipBytes(size);
           for (const sourceRow of job.sourceRows) {
             dedupedObjects++;
             handledPaths.set(sourceRow.path, versionStamp);
