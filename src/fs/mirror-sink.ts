@@ -208,6 +208,21 @@ export async function writeMirrorFile(absolutePath: string, bytes: Buffer): Prom
 }
 
 /**
+ * Raised on a `teeStream` branch that was torn down only because its
+ * *sibling* failed. Never the root cause of anything: a caller holding
+ * both branches' outcomes reports the sibling's failure instead, so a
+ * dying mirror still surfaces as a `MirrorWriteError` (retried, or
+ * escalated under `--on-mirror-max-retries fail`) rather than as an
+ * upload failure that merely echoes it.
+ */
+export class TeeBranchAbortedError extends Error {
+  constructor(readonly failedBranch: "primary" | "secondary") {
+    super(`${failedBranch} branch of the tee failed before the stream ended`);
+    this.name = "TeeBranchAbortedError";
+  }
+}
+
+/**
  * What a failure of the *secondary* branch should do to the primary.
  *
  * `abort-both` is right when the object will not be committed without both
@@ -249,21 +264,40 @@ export function teeStream(
     secondary.destroy(err);
   });
 
+  // A branch that closes before it ended has failed, error or not. Node
+  // destroys a stream *without* an error when its consumer simply stops --
+  // a `for await` that breaks or throws, which is exactly how lib-storage
+  // walks away from its body when a part upload fails -- and that emits
+  // only 'close'. Listening for 'error' alone, as this used to, missed it:
+  // the source stayed paused on a branch nobody would ever drain again,
+  // stalling the other branch with it, with no error and no CPU -- a
+  // genuine hang a real sync sat in for most of a day.
+  const onPrematureClose = (branch: Readable, fail: () => void): void => {
+    branch.on("close", () => {
+      if (!branch.readableEnded) fail();
+    });
+  };
+
   // The primary is the one whose result is being kept, so its failure
   // always ends the secondary -- there is nothing left for the mirror's
-  // copy to accompany.
-  primary.on("error", () => {
+  // copy to accompany. The source goes too: with neither branch left to
+  // drain it, it would otherwise sit paused holding its file descriptor
+  // until the process exits.
+  const failPrimary = (): void => {
     source.unpipe(secondary);
-    secondary.destroy();
-  });
+    secondary.destroy(new TeeBranchAbortedError("primary"));
+    source.destroy();
+  };
+  primary.on("error", failPrimary);
+  onPrematureClose(primary, failPrimary);
 
-  secondary.on("error", () => {
+  const failSecondary = (): void => {
     // `pipe()` does NOT unpipe on a destination error, so without this the
     // source stalls forever waiting for a destroyed stream to drain -- the
     // upload would hang rather than finish.
     source.unpipe(secondary);
     if (onSecondaryFailure === "abort-both") {
-      primary.destroy();
+      primary.destroy(new TeeBranchAbortedError("secondary"));
     } else {
       // The unpipe above is necessary but, on its own, not sufficient.
       // Node's Readable shares ONE flowing/paused state across every
@@ -278,7 +312,9 @@ export function teeStream(
       // transfer) this mode exists to survive.
       if (source.isPaused()) source.resume();
     }
-  });
+  };
+  secondary.on("error", failSecondary);
+  onPrematureClose(secondary, failSecondary);
 
   source.pipe(primary);
   source.pipe(secondary);
@@ -300,11 +336,22 @@ export function teeStream(
  * is why `encryptStream`'s hash check has to be careful about *when* it
  * throws for S3's sake, and does not have to be for the mirror's.
  */
-export async function writeMirrorStream(absolutePath: string, source: Readable): Promise<void> {
+export async function writeMirrorStream(
+  absolutePath: string,
+  source: Readable,
+  options: { signal?: AbortSignal } = {},
+): Promise<void> {
   fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
   const tempPath = inTreeTempPath(absolutePath);
   try {
-    await pipeline(source, fs.createWriteStream(tempPath));
+    // `signal` is the job-level coordination from `apply-local-changes.ts`:
+    // when the *other* sink (S3) gives up for good, this write has to stop
+    // too, not just sit there as the last thing still holding `source`
+    // open. `pipeline`'s own `signal` support destroys both streams with
+    // an `AbortError` the instant it fires, which is what lets the shared
+    // upstream read actually finish rather than waiting on a drain that
+    // will never come.
+    await pipeline(source, fs.createWriteStream(tempPath), { signal: options.signal });
   } catch (err) {
     removeQuietly(tempPath);
     throw err;

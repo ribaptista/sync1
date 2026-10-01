@@ -102,12 +102,14 @@ sequenceDiagram
     end
 ```
 
-## Sequence — the dispatched job: tee, retry budgets, checksum accounting
+## Sequence — the dispatched job: coordinated abort, three failure sources, checksum accounting
 
 One job per distinct content hash; every same-batch dedup row rides on it via `job.sourceRows`.
 Delegates the actual streaming to [`flow-encrypt-stream.md`](flow-encrypt-stream.md) and
-[`flow-put-object-stream.md`](flow-put-object-stream.md), and its outer retry to
-[`flow-s3-retry.md`](flow-s3-retry.md).
+[`flow-put-object-stream.md`](flow-put-object-stream.md). `withS3Retry` no longer wraps this whole unit
+— every S3 request's own transient-failure retry now happens _inside_ `uploadObjectStream`, per
+request/part, so only `withMirrorRetry` retries the whole read-encrypt-write here (a `Readable` that
+already errored can't be replayed, so recovering from a mirror failure means starting the read over).
 
 ```mermaid
 sequenceDiagram
@@ -115,29 +117,45 @@ sequenceDiagram
     participant FS
     participant Codec as encryptStream
     participant Tee as teeStream
-    participant S3
-    participant Mirror as mirror (fs)
+    participant S3 as uploadObjectStream
+    participant Mirror as writeMirrorStream
     participant Candidate as candidate.db
 
     Job->>Job: needsS3 = !alreadyOnS3 && remoteChecksum===undefined<br/>mirrorTarget = mirrorNeedsObject ? target : undefined
 
-    loop withMirrorRetry(withS3Retry(runUnit)) -- one "attempt"
+    loop withMirrorRetry(runUnit) -- one "attempt"
         Job->>FS: statSync(absolutePath); compare size/mtime to the scanned row
         opt changed since scanned
             Job--xJob: throw -- row stays dirty, not stored under a stale hash
         end
+        Job->>Job: controller = new AbortController(); signal = controller.signal<br/>firstFailure = undefined; upstreamError = undefined
         Job->>FS: createReadStream (counted via countingReadable)
-        Job->>Codec: encryptStream(source, size, masterKey, context, {expectedHash: hash})
+        Job->>Codec: encryptStream(source, size, masterKey, context, {expectedHash: hash, signal})
+        Job->>Codec: encryptedStream.once("error", err => upstreamError ??= err)<br/>-- observed, never consumed: distinguishes "the body I was handed<br/>failed" from either sink's own call failing, which look identical to them
         alt needsS3 AND mirrorTarget defined
             Job->>Tee: teeStream(encryptedStream, onMaxRetries="ignore" ? "detach-secondary" : "abort-both")
             par uploadTo(primary)
-                Tee->>S3: putObjectStream(..., targetClass) -> ciphertextChecksum
+                Tee->>S3: uploadObjectStream(..., targetClass, {signal, onRetry, logger}) -> ciphertextChecksum
             and mirrorTo(secondary)
-                Tee->>Mirror: writeMirrorStream -> wroteMirror=true
+                Tee->>Mirror: writeMirrorStream(..., {signal}) -> wroteMirror=true
             end
-            Job->>Job: Promise.allSettled([upload, mirror]); rethrow whichever rejected
+            Job->>Job: Promise.allSettled([upload, mirror])<br/>rejected? recordFailure("s3"|"mirror", reason) -- logs always;<br/>records+aborts(signal) only if not already aborted (first wins)
+            alt upstreamError is set
+                Job--xJob: throw upstreamError -- ahead of both sinks' own<br/>classification: the tee destroys both branches with this<br/>same error, so whichever sink settled first would otherwise<br/>mislabel it as its own fault
+            else firstFailure.source === "mirror"
+                Job--xJob: throw firstFailure.error (a MirrorWriteError)
+            else firstFailure.source === "s3"
+                Job--xJob: throw S3UploadFatalError(paths, hash, firstFailure.error)
+            end
         else needsS3 only
-            Job->>S3: uploadTo(encryptedStream) -- putObjectStream(..., targetClass)
+            Job->>S3: uploadTo(encryptedStream) -- uploadObjectStream(..., targetClass)
+            opt uploadTo rejects
+                alt upstreamError is set
+                    Job--xJob: throw upstreamError
+                else
+                    Job--xJob: throw S3UploadFatalError(paths, hash, err)
+                end
+            end
         else mirrorTarget only (S3 already had the bytes)
             Job->>Mirror: mirrorTo(encryptedStream)
         else neither (ignore-mode fallback, both sinks already satisfied)
@@ -145,12 +163,15 @@ sequenceDiagram
         end
     end
 
-    alt attempt raised MirrorWriteError AND onMaxRetries="fail"
+    alt attempt threw S3UploadFatalError
+        Job--xJob: rethrow uncaught
+        note over Job: not a per-row failure -- every transient S3 error already<br/>retries forever inside uploadObjectStream, so anything it still<br/>throws is irrecoverable. Escapes the outer catch below uncaught,<br/>into dispatchTracked's error box, and from there throwIfPoolErrored()<br/>aborts the whole applyLocalChangesToCandidate call once the pool<br/>drains -- same escalation path as MirrorRequiredError. See flow-pool-dispatch.md.
+    else attempt raised MirrorWriteError AND onMaxRetries="fail"
         Job--xJob: throw MirrorRequiredError(paths, hash, cause)
-        note over Job: NOT swallowed -- escapes the outer catch below uncaught,<br/>into dispatchTracked's error box, and from there throwIfPoolErrored()<br/>aborts the whole applyLocalChangesToCandidate call once the pool<br/>drains. See flow-pool-dispatch.md.
+        note over Job: also escapes uncaught, the same way
     else attempt raised MirrorWriteError AND onMaxRetries="ignore" AND ciphertextChecksum is set
         Job->>Job: mirrorFailures++ -- S3 already has it, verified; mirror stays behind for catchup
-    else attempt failed for any other reason
+    else attempt failed for any other reason (upstream: changed file, hash mismatch)
         Job->>Job: ciphertextChecksum=undefined; wroteMirror=false<br/>fileTracker.abort(); inFlightByHash.delete(hash)
         Job->>Job: failed.push({path, hash, error}) for each row in job.sourceRows
         note over Job: swallowed here -- every row riding on this job stays dirty,<br/>but no longer silently: `failed` is what SyncResult/--json surface
@@ -185,19 +206,36 @@ sequenceDiagram
   [`flow-pool-dispatch.md`](flow-pool-dispatch.md)). Inside one job, the tee's two branches
   (`uploadTo`/`mirrorTo`) genuinely run concurrently — one read, one encryption, two sinks advancing in
   lockstep, so S3 goes no faster than the mirror.
-- **Two independent retry budgets, nested deliberately:** `withMirrorRetry` is outermost and wraps
-  `runUnit`, which is itself `withS3Retry` around the actual read-encrypt-write. The budgets stay
-  separate because S3's is unbounded and its retryable errnos include `ETIMEDOUT`/`ENETUNREACH` —
-  exactly what a dropped SMB mount throws, so folding a mirror failure into S3's own retry loop would
-  give a flaky mount an unbounded number of attempts too. Either way, the retriable unit is the whole
-  read-encrypt-write, since a `Readable` that already errored can't be replayed: a retried attempt
+- **Only one retry budget lives at this level now:** `withMirrorRetry` wraps `runUnit` (the whole
+  read-encrypt-write, since a `Readable` that already errored can't be replayed — a retried attempt
   re-reads from byte zero, and hands the abandoned partial back via `fileTracker.retrying()` so the
-  progress bar rewinds to what was actually committed.
+  progress bar rewinds to what was actually committed). S3's own transient-failure retry no longer wraps
+  this whole unit: it happens _inside_ `uploadObjectStream`, per request/part, so a dropped connection on
+  part 9,000 of a large upload resends just that part rather than restarting the whole file (see
+  [`flow-put-object-stream.md`](flow-put-object-stream.md)). The two budgets staying conceptually
+  separate is still the point — S3's is unbounded and retries `ETIMEDOUT`/`ENETUNREACH` (exactly what a
+  dropped SMB mount throws), so folding a mirror failure into it would give a flaky mount an unbounded
+  number of attempts too.
 - **The tee's failure mode is chosen per-attempt from `mirror.onMaxRetries`**: `"ignore"` uses
   `detach-secondary` (S3 finishes regardless of a mirror failure); `"fail"` (the default) uses
   `abort-both` (the whole object is abandoned together). Passing no mode at all silently defaults to
-  `abort-both` for both — a bug this branch fixed, since it meant `detach-secondary` was reachable in
+  `abort-both` for both — a bug a past change fixed, since it meant `detach-secondary` was reachable in
   the type system but never actually selected.
+- **A shared `AbortController`, not the tee's own stream-level reaction, is now the primary
+  coordination.** One signal per attempt is threaded through `encryptStream`, `uploadObjectStream` and
+  `writeMirrorStream`; whichever of the two sinks fails first calls `recordFailure`, which logs
+  unconditionally but only records the cause and calls `controller.abort()` if the signal isn't already
+  aborted — so the _first_ failure decides the outcome, and the echo it causes in the sibling is logged,
+  never promoted. `teeStream`'s own early-close detection (destroying the sibling with a
+  `TeeBranchAbortedError` when a branch closes before it ended) still exists underneath this, as a
+  safety net for whatever doesn't honor the signal directly.
+- **An upstream failure is told apart from either sink's own failure by watching `encryptedStream`
+  itself, not by classifying whichever rejection happens to arrive.** Neither `uploadObjectStream` nor
+  `writeMirrorStream` can distinguish "my own call failed" from "the body I was handed failed" — both
+  arrive identically as a rejected read. A listener on `encryptedStream`'s `'error'` event captures the
+  real cause directly; checked ahead of `firstFailure`'s own s3/mirror classification, so a permission
+  change or a hash mismatch is never mistaken for an S3 or mirror problem just because of which sink's
+  promise happened to settle (and call `recordFailure`) first.
 - **On failure:** a failed attempt resets `ciphertextChecksum` and `wroteMirror` explicitly in the
   outer catch, precisely because an orphaned, still-running `uploadTo` promise (abandoned by
   `Promise.all`, not `allSettled`) could otherwise set the shared variable _after_ the retry loop had
@@ -205,14 +243,18 @@ sequenceDiagram
   row riding on an ordinary failed job — the dispatcher and every same-batch dedup attach alike — is
   left dirty in `cache.db`; nothing here throws out of the dispatched job itself for that case
   (swallowed and logged), so one bad file cannot take down the rest of the batch.
-- **The one exception: `MirrorRequiredError` is deliberately NOT swallowed.** Checked first, ahead of
-  every other branch in the outer catch, and rethrown uncaught. Under `--on-mirror-max-retries fail`, a
-  mirror write failure is not a per-object failure this row can just stay dirty over — nothing in the
-  whole batch may commit without every mirror write succeeding, so it has to abort
-  `applyLocalChangesToCandidate` itself, not just this one job. This is what fixed the case where a
-  same-batch rename (delete + create sharing one hash the mirror was missing) used to split in half:
-  the delete committing while the create's mirror-only write failed and stayed dirty. See
-  `src/fs/mirror-sink.ts`'s own doc comment on the class.
+- **Two exceptions are deliberately NOT swallowed: `MirrorRequiredError` and `S3UploadFatalError`.**
+  Both checked first, ahead of every other branch in the outer catch, and rethrown uncaught. Under
+  `--on-mirror-max-retries fail`, a mirror write failure is not a per-object failure this row can just
+  stay dirty over — nothing in the whole batch may commit without every mirror write succeeding, so it
+  has to abort `applyLocalChangesToCandidate` itself, not just this one job. This is what fixed the case
+  where a same-batch rename (delete + create sharing one hash the mirror was missing) used to split in
+  half: the delete committing while the create's mirror-only write failed and stayed dirty. See
+  `src/fs/mirror-sink.ts`'s own doc comment on the class. `S3UploadFatalError` (`src/s3/upload-object.ts`)
+  escalates the same way for the same reason: every transient S3 failure already retries forever inside
+  `uploadObjectStream`, so anything that still reaches this point is irrecoverable (access denied, a
+  missing bucket, a bug) — leaving the row dirty would just waste the next sync hitting the identical
+  error again, so nothing this run touched commits instead.
 - **A row is only ever recorded as applied at its actual point of success** — never at decision time —
   except the two branches with no async gap between deciding and writing (non-file rows, and a clean
   dedup hit), which record it immediately since nothing can fail in between.

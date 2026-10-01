@@ -2,17 +2,24 @@
 
 **Derived from:** `src/s3/retry.ts`
 
-**Used by:** [`sync.md`](sync.md) (via [`flow-apply-local-changes.md`](flow-apply-local-changes.md) and
-[`flow-apply-remote-changes.md`](flow-apply-remote-changes.md)),
-[`materialize.md`](materialize.md)
+**Used by:** [`sync.md`](sync.md) (via [`flow-put-object-stream.md`](flow-put-object-stream.md),
+sync's upload path, and [`flow-apply-remote-changes.md`](flow-apply-remote-changes.md), its download
+path), [`materialize.md`](materialize.md)
 
 **Deliberately not used by:** `gc.md`, `converge_status.md`, `policy_edit.md` — see below.
 
-`withS3Retry` wraps a whole operation (a GET, a PUT, or — in the upload/download paths — an entire
-read-encrypt-transfer unit) and retries it **forever** on a fixed set of transient AWS SDK error names,
-node socket/DNS errnos, and HTTP status codes, with exponential backoff capped at a maximum delay. There
-is no attempt limit: a backup tool waiting out a long outage is judged better than one that gives up and
-loses six hours of upload progress.
+`withS3Retry` wraps one S3 request and retries it **forever** on a fixed set of transient AWS SDK error
+names, node socket/DNS errnos, and HTTP status codes, with exponential backoff capped at a maximum
+delay. There is no attempt limit: a backup tool waiting out a long outage is judged better than one that
+gives up and loses hours of transfer progress. On the **download** path
+([`flow-apply-remote-changes.md`](flow-apply-remote-changes.md)) the retriable unit is still an entire
+read-decrypt-write, since a GET's response stream can't be replayed either. On the **upload** path it is
+narrower than that now: each request inside `uploadObjectStream`
+([`flow-put-object-stream.md`](flow-put-object-stream.md)) — one `PutObject`, one `UploadPart` — is its
+own retriable unit, not the whole file, which is what lets a connection that drops partway through a
+100 GB upload resend only the few megabytes that failed rather than the whole thing from byte zero. See
+that file for why: `@aws-sdk/lib-storage`, the library this replaced, sent each part as a stream, and the
+SDK's retry middleware refuses to retry any request with a streamed body.
 
 ## Sequence
 
@@ -22,8 +29,11 @@ sequenceDiagram
     participant Retry as withS3Retry
     participant S3
 
-    Caller->>Retry: withS3Retry(operation, { onRetry })
+    Caller->>Retry: withS3Retry(operation, { onRetry, signal? })
     loop attempt = 1, 2, 3, ... (no upper bound)
+        opt signal is already aborted
+            Retry-->>Caller: throw signal.reason -- checked before every attempt,<br/>so an already-doomed attempt never starts one more operation()
+        end
         Retry->>S3: operation()
         alt succeeds
             S3-->>Retry: result
@@ -31,7 +41,7 @@ sequenceDiagram
         else transient error (network/DNS errno, 429/500/502/503/504,<br/>NetworkingError, TimeoutError, SlowDown, ...)
             S3-->>Retry: throws
             Retry->>Caller: onRetry(notice) -- attempt, delayMs, elapsedMs
-            Retry->>Retry: sleep(delay); delay = min(delay * 2, MAX_DELAY_MS)
+            Retry->>Retry: sleep(delay, signal) -- resolves early, rejecting<br/>with signal.reason, if aborted mid-wait<br/>delay = min(delay * 2, MAX_DELAY_MS)
         else non-transient error (anything not on the list --<br/>auth failures, CasConflictError, CorruptionError, ...)
             S3-->>Retry: throws
             Retry-->>Caller: rethrow immediately, no retry
@@ -43,6 +53,13 @@ sequenceDiagram
 
 - **Concurrency:** none of its own — one caller, one operation in flight. Concurrency comes from
   whatever pool the caller itself runs inside (see [`flow-pool-dispatch.md`](flow-pool-dispatch.md)).
+  `uploadObjectStream`'s multipart path runs several `withS3Retry`-wrapped `UploadPart` requests
+  concurrently (bounded at 4), but each is its own independent retry loop with its own `onRetry`.
+- **`signal` is the escape hatch for the unbounded case:** something else irrecoverable happened
+  elsewhere (a sibling part failed for good, the mirror gave up) and this particular retry loop needs to
+  stop even though it is, on its own, still succeeding eventually. Checked before every attempt and
+  threaded through the backoff sleep, so an abort lands within one tick rather than at the end of the
+  current (up to 30s) wait.
 - **On failure:** a non-transient error propagates on the very first attempt, unchanged from before this
   wrapper existed. A transient error is invisible to the caller until either it stops happening or the
   process is killed (Ctrl-C is the intended escape hatch for "I've decided this outage isn't ending").

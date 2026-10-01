@@ -50,20 +50,41 @@ overwritten, and its `cache.db` row stays dirty so the next `sync` re-evaluates 
 it by hand (there's no built-in merge UI — resolution means deciding which side's content should win and
 making the local file match that before syncing again).
 
+## Uploads and transient S3 failures
+
+A dropped connection, a read timeout, or S3 asking you to slow down are never fatal: every upload
+retries such a failure for as long as it takes, with exponential backoff. For a large file this retry is
+scoped to the part that actually failed, not the whole upload -- a multipart upload resends only the few
+megabytes that didn't make it, not the whole file from byte zero, so a connection that drops periodically
+on a 100 GB upload still eventually finishes rather than restarting into the same failure forever. See
+[dedup-and-object-storage.md](../architecture/dedup-and-object-storage.md) for the part-size math and
+why this replaced an earlier design built on `@aws-sdk/lib-storage`.
+
 ## Failed uploads
 
 Distinct from a conflict: a conflict is a human decision this run correctly declined to make; a failed
-upload is this run trying and not succeeding -- a non-transient S3 error, a file that changed since it
-was scanned, or (under `--on-mirror-max-retries ignore`) a mirror write that failed on a unit whose S3
-half never completed either. One bad file doesn't take down the rest of the batch: everything else still
+upload is this run trying and not succeeding at something a per-row retry on a later `sync` can plausibly
+fix -- a file that changed since it was scanned, its content no longer matching the hash it was scanned
+under, or (under `--on-mirror-max-retries ignore`) a mirror write that failed on a unit whose S3 half
+never completed either. One bad file doesn't take down the rest of the batch: everything else still
 commits, and the failed path's `cache.db` row stays dirty for the next `sync` to retry, exactly like a
 conflict. Unlike a conflict, no manual resolution is needed -- fixing whatever made the upload fail (a
-permission problem, a flaky link, restoring the file to what it was when it was scanned) and running
-`sync` again is enough.
+permission problem, restoring the file to what it was when it was scanned) and running `sync` again is
+enough.
 
 `ok` is `false` and the run exits non-zero whenever `failed` is non-empty -- this used to be silent
 beyond a debug log line, with the run reporting `ok: true` as long as _something_ in the batch
 committed.
+
+**A non-transient S3 error is not in this list, deliberately.** Every transient failure already gets
+retried forever (see above), so anything an upload still raises after that is something no amount of
+waiting fixes -- access denied, a missing bucket, a bug. Leaving that row dirty for the next `sync` to
+retry would just waste that run hitting the same irrecoverable error again, so it isn't treated as a
+per-row failure at all: it aborts the **whole run**, the same escalation an exhausted mirror write uses
+under the default `--on-mirror-max-retries fail` (see **Mirroring to a second copy** below). Nothing
+this run touched is committed, `ok` is `false`, and the error names the path and the underlying cause.
+Objects already uploaded to S3 before the abort are not wasted -- the next `sync`'s own aborted-run
+recovery (see below) finds and adopts them instead of re-uploading.
 
 ## Recovering from an aborted run
 
@@ -111,10 +132,11 @@ When there are unresolved conflicts, `ok` is `false` and `conflicts` is a non-em
 ## Exit codes
 
 - `0` — success, no conflicts, no failed uploads.
-- `1` — either a hard failure that aborted the run before anything committed (network/S3 error, corrupt
-  vault, missing password, or a mirror write that exhausted its retries under the default
-  `--on-mirror-max-retries fail` — see **Mirroring to a second copy** below), or a run that completed
-  with one or more failed uploads (see **Failed uploads** above) and no conflicts.
+- `1` — either a hard failure that aborted the run before anything committed (a non-transient S3 error,
+  corrupt vault, missing password, or a mirror write that exhausted its retries under the default
+  `--on-mirror-max-retries fail` — see **Uploads and transient S3 failures** and **Mirroring to a second
+  copy** above/below), or a run that completed with one or more failed uploads (see **Failed uploads**
+  above) and no conflicts.
 - `2` — completed with one or more unresolved conflicts (whether or not any uploads also failed), or the
   remote moved on mid-attempt (a CAS race against another machine's concurrent commit) — in the
   CAS-race case, just run `sync` again.

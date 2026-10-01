@@ -24,7 +24,16 @@
  * transient list below throws on its first occurrence, exactly as before.
  * That includes `CasConflictError` (which has its own retry loops with their
  * own semantics, see mutate-state-db.ts and gc.ts), `CorruptionError`, and
- * every auth/permission failure.
+ * every auth/permission failure -- and, as of the per-part multipart
+ * uploader (src/s3/upload-object.ts), it's the caller's job to treat such
+ * an error as fatal to the whole run, not just to one attempt.
+ *
+ * `signal` (`RetryOptions`) is the escape hatch for the *unbounded* case:
+ * something else irrecoverable happened (a sibling part failed, the mirror
+ * gave up) and this particular retry loop needs to stop even though it is,
+ * on its own, still succeeding eventually. Checked before every attempt and
+ * threaded through the backoff sleep, so an abort lands within one tick
+ * rather than at the end of the current 30s wait.
  */
 
 /**
@@ -150,10 +159,33 @@ export interface RetryOptions {
   onRetry?: (notice: RetryNotice) => void;
   /** Injectable so tests drive the backoff without waiting through it. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Cooperative cancellation for a retry loop that would otherwise run
+   * forever. Checked before every attempt (so an already-aborted signal
+   * never starts one more `op()`) and passed through to `sleep`, so a long
+   * backoff wait is cut short rather than outlived. `op` itself still has
+   * to honor the signal for an attempt already in flight to actually stop
+   * -- this only governs whether *another* attempt follows.
+   */
+  signal?: AbortSignal;
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      },
+      { once: true },
+    );
+  });
 }
 
 /**
@@ -180,6 +212,7 @@ export async function withS3Retry<T>(op: () => Promise<T>, opts: RetryOptions = 
   let firstFailureAt: number | undefined;
 
   for (let attempt = 1; ; attempt++) {
+    opts.signal?.throwIfAborted();
     try {
       return await op();
     } catch (err) {
@@ -192,7 +225,7 @@ export async function withS3Retry<T>(op: () => Promise<T>, opts: RetryOptions = 
         elapsedMs: Date.now() - firstFailureAt,
         error: err,
       });
-      await sleep(delayMs);
+      await sleep(delayMs, opts.signal);
     }
   }
 }

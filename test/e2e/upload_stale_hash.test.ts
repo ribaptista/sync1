@@ -114,10 +114,11 @@ describe("upload with a stale hash", () => {
     // keeps waiting on a body that will never produce another byte, and
     // Node will not exit until its socket times out -- roughly a minute per
     // failed object, long after the failure was logged. The abort signal in
-    // putObjectStream collapses that to immediate. The bound is deliberately
-    // loose (a healthy run here is ~1s) so this fails on a 60s hang, never
-    // on a slow machine. The e2e project sets no test timeout, so without
-    // this the hang would merely make the suite crawl.
+    // uploadObjectStream (src/s3/upload-object.ts) collapses that to
+    // immediate. The bound is deliberately loose (a healthy run here is
+    // ~1s) so this fails on a 60s hang, never on a slow machine. The e2e
+    // project sets no test timeout, so without this the hang would merely
+    // make the suite crawl.
     expect(elapsed).toBeLessThan(25_000);
 
     // And the row is still pending, so a later sync retries it honestly
@@ -129,10 +130,11 @@ describe("upload with a stale hash", () => {
   });
 
   /**
-   * The same guarantee above the multipart threshold, where `lib-storage`'s
-   * `Upload` rather than a single `PutObjectCommand` is in play: an errored
-   * body must abort the multipart upload instead of completing it, and must
-   * not leave parts behind that S3 would keep billing for.
+   * The same guarantee above the multipart threshold, where
+   * `uploadObjectStream`'s own part loop (src/s3/upload-object.ts) rather
+   * than a single `PutObjectCommand` is in play: an errored body must
+   * abort the multipart upload instead of completing it, and must not
+   * leave parts behind that S3 would keep billing for.
    */
   it("aborts rather than completing a multipart upload, leaving no stray parts", async () => {
     const s3 = createTestS3Client(localstack.endpoint);

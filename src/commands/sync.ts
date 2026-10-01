@@ -184,7 +184,11 @@ async function runSync(
   const manifest = parseManifest(fs.readFileSync(localVaultJsonPath(root)));
   const masterKey = unlockVault(manifest, password);
 
-  const client = createS3Client({ endpoint: remoteConfig.endpoint, region: remoteConfig.region });
+  const client = createS3Client({
+    endpoint: remoteConfig.endpoint,
+    region: remoteConfig.region,
+    logger,
+  });
   const prefix = normalizePrefix(remoteConfig.prefix);
   const location: RemoteLocation = { bucket: remoteConfig.bucket, prefix };
 

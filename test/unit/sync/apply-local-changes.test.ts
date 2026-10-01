@@ -13,14 +13,16 @@ import { objectKey } from "../../../src/vault/paths.js";
 import { StoragePoliciesRepository } from "../../../src/db/repositories/storage-policies-repository.js";
 import { MirrorRequiredError } from "../../../src/fs/mirror-sink.js";
 import type { ProgressUpdate } from "../../../src/progress-types.js";
+import type { UploadObjectStreamOptions } from "../../../src/s3/upload-object.js";
 
 // Drains the body stream, same as a real S3 client would -- otherwise the
 // encrypt pipeline never finishes flowing, and the source file read can race
 // past a test's own cleanup. Reinstated in every beforeEach below, because
 // mockClear() forgets recorded calls but keeps whatever implementation a
 // previous test installed (the retry test installs a failing one). Returns
-// a fixed fake checksum -- putObjectStream's real return value, which none
-// of these tests inspect -- so the mock's shape matches the real function.
+// a fixed fake checksum -- uploadObjectStream's real return value, which
+// none of these tests inspect -- so the mock's shape matches the real
+// function.
 async function drainBody(
   _client: unknown,
   _bucket: unknown,
@@ -33,15 +35,30 @@ async function drainBody(
   return "fake-checksum";
 }
 
-vi.mock("../../../src/s3/client.js", () => ({
-  putObjectStream: vi.fn(),
-  headObject: vi.fn(),
-}));
+// Only `headObject` is replaced -- `MULTIPART_THRESHOLD_BYTES`/
+// `multipartPartSize` stay real, since `src/s3/upload-object.js` (mocked
+// below, but via `importOriginal` for its own unrelated exports) imports
+// them from this same module at load time, and a wholesale replacement
+// here would leave that import undefined.
+vi.mock("../../../src/s3/client.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../src/s3/client.js")>();
+  return { ...actual, headObject: vi.fn() };
+});
+
+// Only `uploadObjectStream` is replaced -- `S3UploadFatalError` stays the
+// real class via `importOriginal`, so `instanceof` checks in
+// apply-local-changes.ts (and in this file's own assertions) see the same
+// constructor the production code throws.
+vi.mock("../../../src/s3/upload-object.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../src/s3/upload-object.js")>();
+  return { ...actual, uploadObjectStream: vi.fn() };
+});
 
 const { applyLocalChangesToCandidate } = await import("../../../src/sync/apply-local-changes.js");
-const { putObjectStream, headObject } = await import("../../../src/s3/client.js");
+const { headObject } = await import("../../../src/s3/client.js");
+const { uploadObjectStream, S3UploadFatalError } = await import("../../../src/s3/upload-object.js");
 const headObjectMock = vi.mocked(headObject);
-const putObjectStreamMock = vi.mocked(putObjectStream);
+const putObjectStreamMock = vi.mocked(uploadObjectStream);
 
 const silentLogger = {
   debug: () => {},
@@ -616,23 +633,35 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     candidateDb.close();
   });
 
-  it("retries a transient upload failure, rewinding the bar rather than double-counting", async () => {
+  it("rewinds the bar when uploadObjectStream reports a retried part, rather than double-counting", async () => {
     const candidateDb = openStateDb(":memory:");
     new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
     const content = "a".repeat(400);
     touch("a.txt", content);
 
-    // Fails the first attempt with a socket reset after the body has been
-    // partly read, then succeeds. The partial read is what makes the rewind
-    // observable: without it the first attempt would contribute nothing.
-    let attempts = 0;
+    // `withS3Retry`'s per-part/per-request retry now lives *inside*
+    // `uploadObjectStream` (src/s3/upload-object.ts, covered by its own
+    // unit tests) rather than wrapping the whole read-encrypt-write here --
+    // this mock stands in for an internal retry by calling `onRetry`
+    // itself, which is the one piece of that contract apply-local-changes
+    // still owns: wiring the notice to `fileTracker.retrying()` so the bar
+    // rewinds and announces the attempt.
     putObjectStreamMock.mockImplementation(
-      async (_client: unknown, _bucket: unknown, _key: unknown, body: AsyncIterable<unknown>) => {
-        attempts++;
-        if (attempts === 1) {
-          for await (const _chunk of body) break; // consume one chunk, then die
-          throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
-        }
+      async (
+        _client: unknown,
+        _bucket: unknown,
+        _key: unknown,
+        body: AsyncIterable<unknown>,
+        _contentLength: unknown,
+        _storageClass: unknown,
+        options: UploadObjectStreamOptions = {},
+      ) => {
+        options.onRetry?.({
+          attempt: 1,
+          delayMs: 1000,
+          elapsedMs: 1000,
+          error: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+        });
         for await (const _chunk of body) {
           // draining is the point
         }
@@ -664,8 +693,6 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
       (u) => updates.push({ ...u }),
     );
 
-    // The run completed rather than dying on the reset -- the whole point.
-    expect(attempts).toBe(2);
     expect(result.uploadedObjects).toBe(1);
     expect(result.conflicts).toEqual([]);
 
@@ -678,8 +705,7 @@ describe("applyLocalChangesToCandidate: byte progress", () => {
     // was nothing at all.
     expect(retryUpdate?.bytesDone).toBe(0);
 
-    // No double counting: the file lands on exactly its own size despite
-    // having been read twice.
+    // No double counting: the file lands on exactly its own size.
     expect(updates.at(-1)).toMatchObject({
       bytesDone: content.length,
       bytesTotal: content.length,
@@ -804,13 +830,24 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     fs.utimesSync(absolute, new Date(mtime), new Date(mtime));
   }
 
-  it("leaves a failed upload's path dirty, with no entry written, while an unrelated success still lands", async () => {
+  it("aborts the whole run with S3UploadFatalError, even when an unrelated row's own upload would otherwise have committed cleanly", async () => {
+    // A non-transient upload error used to be a per-row failure: this row
+    // stayed dirty, everything else in the batch still committed. That
+    // changed deliberately -- `uploadObjectStream` (src/s3/upload-
+    // object.ts) already retries every *transient* S3 failure internally,
+    // forever, so anything it still throws is something no amount of
+    // waiting fixes (access denied, a missing bucket, a bug of ours).
+    // Leaving the row dirty for "the next sync" to retry would just waste
+    // that next sync hitting the same irrecoverable error again -- so the
+    // whole run aborts and commits nothing instead, the same escalation
+    // `MirrorRequiredError` uses for an exhausted mirror.
     const candidateDb = openStateDb(":memory:");
     new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
     const goodContent = "fine content";
     const badContent = "b".repeat(300); // well past the 100-byte contentLength threshold below
     touch("good.txt", goodContent);
     touch("bad.txt", badContent);
+    const badHash = hashBufferHex(Buffer.from(badContent));
 
     putObjectStreamMock.mockImplementation(
       async (
@@ -829,10 +866,11 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
         // never actually match either file. contentLength is real,
         // deterministic ciphertext framing (encryptedSize) that differs
         // enough between the two bodies below to tell them apart cleanly.
-        // The error itself is a plain, unclassified Error, so withS3Retry
-        // treats it as non-transient and throws on the very first attempt
-        // rather than retrying it away.
-        if (Number(contentLength) > 100) throw new Error("simulated permanent failure");
+        if (Number(contentLength) > 100) {
+          const err = new Error("Access Denied") as Error & { name: string };
+          err.name = "AccessDenied";
+          throw err;
+        }
         return "fake-checksum";
       },
     );
@@ -851,7 +889,7 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
         path: "bad.txt",
         type: "file" as const,
         mtime: 1,
-        hash: hashBufferHex(Buffer.from(badContent)),
+        hash: badHash,
         size: badContent.length,
         state: "created" as const,
         parent_state_version: "v0",
@@ -865,7 +903,7 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     const streamPool = new PQueue({ concurrency: 4 });
     streamPool.on("error", () => {});
 
-    const result = await applyLocalChangesToCandidate(
+    const run = applyLocalChangesToCandidate(
       candidateDb,
       dirtyRows,
       root,
@@ -876,30 +914,15 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
       streamPool,
       8,
     );
-
-    // The point of this whole fix: a row whose upload failed is not
-    // reported as applied, and the run still completes rather than
-    // losing track of the unrelated row that succeeded.
-    expect(result.handledPaths.has("bad.txt")).toBe(false);
-    expect(result.handledPaths.get("good.txt")).toBe("v1");
-    expect(result.appliedCount).toBe(1);
-    expect(result.uploadedObjects).toBe(1);
-    expect(result.conflicts).toEqual([]); // failed, not merely conflicted -- a different case
-
-    // The point of this fix: a swallowed upload failure is no longer
-    // silent beyond a log line -- it's reported here, for the caller
-    // (sync's own summary/--json/exit code) to surface.
-    expect(result.failed).toEqual([
-      {
-        path: "bad.txt",
-        hash: hashBufferHex(Buffer.from(badContent)),
-        error: "simulated permanent failure",
-      },
-    ]);
-
-    const entriesRepo = new EntriesRepository(candidateDb);
-    expect(entriesRepo.get("bad.txt")).toBeUndefined();
-    expect(entriesRepo.get("good.txt")?.hash).toEqual(expect.any(String));
+    // Thrown uncaught, same as `MirrorRequiredError`: this candidate.db is
+    // scratch, written to directly as each job completes, and never reaches
+    // the real vault -- `performSync` (src/sync/commit.ts) only promotes it
+    // past the CAS write once `applyLocalChangesToCandidate` itself
+    // resolves, which this run never does. good.txt's row existing *here*
+    // reflects that it genuinely finished before bad.txt aborted the batch,
+    // not that anything was committed.
+    await expect(run).rejects.toBeInstanceOf(S3UploadFatalError);
+    await expect(run).rejects.toMatchObject({ paths: ["bad.txt"], hash: badHash });
 
     candidateDb.close();
   });
@@ -952,7 +975,7 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     candidateDb.close();
   });
 
-  it("leaves a same-batch dedup attach dirty too, when the job it rode on fails", async () => {
+  it("names every path riding on the failed job, not just the one that dispatched it, when S3UploadFatalError aborts the run", async () => {
     const candidateDb = openStateDb(":memory:");
     new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
     const content = "shared content that will fail to upload";
@@ -961,7 +984,9 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     touch("b.txt", content);
 
     putObjectStreamMock.mockImplementation(async (): Promise<string> => {
-      throw new Error("simulated permanent failure");
+      const err = new Error("Access Denied") as Error & { name: string };
+      err.name = "AccessDenied";
+      throw err;
     });
 
     const dirtyRows = [
@@ -988,7 +1013,7 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     const streamPool = new PQueue({ concurrency: 4 });
     streamPool.on("error", () => {});
 
-    const result = await applyLocalChangesToCandidate(
+    const run = applyLocalChangesToCandidate(
       candidateDb,
       dirtyRows,
       root,
@@ -1001,21 +1026,11 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     );
 
     // b.txt never got a dispatch of its own -- it attached to a.txt's job,
-    // which failed. Neither is applied, and b.txt is not miscounted as a
-    // successful dedup either: nothing about this batch actually landed.
-    expect(result.handledPaths.has("a.txt")).toBe(false);
-    expect(result.handledPaths.has("b.txt")).toBe(false);
-    expect(result.appliedCount).toBe(0);
-    expect(result.uploadedObjects).toBe(0);
-    expect(result.dedupedObjects).toBe(0);
-
-    // Both paths riding on the failed job are reported, not just the one
-    // that dispatched it -- a dedup attach's own row must not go missing
-    // from this accounting just because it never got a dispatch of its own.
-    expect(result.failed).toEqual([
-      { path: "a.txt", hash, error: "simulated permanent failure" },
-      { path: "b.txt", hash, error: "simulated permanent failure" },
-    ]);
+    // the one that actually failed. Both still have to be named in the
+    // escalation, not just the dispatcher, or b.txt's own row would go
+    // missing from the failure a caller has to report.
+    await expect(run).rejects.toBeInstanceOf(S3UploadFatalError);
+    await expect(run).rejects.toMatchObject({ paths: ["a.txt", "b.txt"], hash });
 
     const entriesRepo = new EntriesRepository(candidateDb);
     expect(entriesRepo.get("a.txt")).toBeUndefined();
@@ -1024,7 +1039,14 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     candidateDb.close();
   });
 
-  it("does not count a failed file's bytes as transferred", async () => {
+  it("never reports a file's bytes as fully transferred when its upload fails irrecoverably", async () => {
+    // `S3UploadFatalError` aborts the whole run uncaught -- same as
+    // `MirrorRequiredError` -- so `fileTracker.abort()`/`progress.settle()`
+    // are never reached for this file; there is no well-formed "final"
+    // update to assert on the way the old leave-dirty-and-continue path
+    // had. What still has to hold is the narrower guarantee: nothing ever
+    // reports this file's bytes as the completed amount a successful
+    // `finish()` would have recorded.
     const candidateDb = openStateDb(":memory:");
     new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
     const content = "a".repeat(500);
@@ -1037,10 +1059,10 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
         _key: unknown,
         body: AsyncIterable<unknown>,
       ): Promise<string> => {
-        // Reads some of the body -- so bytesDone would be nonzero if abort()
-        // failed to rewind it the way retrying() does -- then fails outright.
-        for await (const _chunk of body) break;
-        throw new Error("simulated permanent failure");
+        for await (const _chunk of body) break; // read some of the body, then fail
+        const err = new Error("Access Denied") as Error & { name: string };
+        err.name = "AccessDenied";
+        throw err;
       },
     );
 
@@ -1048,39 +1070,32 @@ describe("applyLocalChangesToCandidate: upload failure", () => {
     const streamPool = new PQueue({ concurrency: 4 });
     streamPool.on("error", () => {});
 
-    await applyLocalChangesToCandidate(
-      candidateDb,
-      [
-        {
-          path: "bad.txt",
-          type: "file" as const,
-          mtime: 1,
-          hash: hashBufferHex(Buffer.from(content)),
-          size: content.length,
-          state: "created" as const,
-          parent_state_version: "v0",
-        },
-      ],
-      root,
-      Buffer.alloc(32),
-      "v1",
-      unusedS3,
-      silentLogger,
-      streamPool,
-      8,
-      (u) => updates.push({ ...u }),
-    );
+    await expect(
+      applyLocalChangesToCandidate(
+        candidateDb,
+        [
+          {
+            path: "bad.txt",
+            type: "file" as const,
+            mtime: 1,
+            hash: hashBufferHex(Buffer.from(content)),
+            size: content.length,
+            state: "created" as const,
+            parent_state_version: "v0",
+          },
+        ],
+        root,
+        Buffer.alloc(32),
+        "v1",
+        unusedS3,
+        silentLogger,
+        streamPool,
+        8,
+        (u) => updates.push({ ...u }),
+      ),
+    ).rejects.toBeInstanceOf(S3UploadFatalError);
 
-    // The file never actually finished, so it must never be reported as
-    // fully done the way a successful finish() would -- settle() still
-    // brings the phase to 100% (every row, including the failed one, did
-    // get *resolved*), but zero of this file's bytes are counted done.
-    expect(updates.at(-1)).toMatchObject({
-      bytesDone: 0,
-      filesDone: 1,
-      filesTotal: 1,
-      totalsFinal: true,
-    });
+    expect(updates.every((u) => u.bytesDone < content.length)).toBe(true);
 
     candidateDb.close();
   });

@@ -100,13 +100,16 @@ round trips for a recovery mechanism it will never need.
 `objects.ciphertext_checksum` is **`NOT NULL`**, and that is a correctness property rather than a
 schema preference.
 
-The value is CRC64NVME over the _ciphertext_, base64. It is computed **client-side**, by
-`UploadChecksumTap` (`src/s3/checksum.ts`), as the encrypted bytes stream past on their way to S3 — and
-S3 computes the same thing independently and reports it back. `verifyStoredChecksum`
-(`src/s3/client.ts`) compares the two and refuses to return unless they match. So the recorded value is
-not a copy of something S3 said; it is the residue of an agreement between two independent
-computations. Storing it is what makes a later audit — `mirror verify`, a remote content check —
-meaningful without a download, a decryption, or the master key.
+The value is CRC64NVME over the _ciphertext_, base64. It is computed **client-side** by
+`uploadObjectStream` (`src/s3/upload-object.ts`) — fed into a `Crc64Nvme` instance one Buffer at a time,
+either the single drained body or each multipart part in the order it was read — and S3 computes the
+same thing independently and reports it back. `verifyStoredChecksum` (same file) compares the two and
+refuses to return unless they match. So the recorded value is not a copy of something S3 said; it is the
+residue of an agreement between two independent computations. Storing it is what makes a later audit —
+`mirror verify`, a remote content check — meaningful without a download, a decryption, or the master
+key. (`UploadChecksumTap`, `src/s3/checksum.ts`, computes the same CRC64NVME over a plain stream rather
+than a buffer — used by `mirror verify --checksum` to recompute a local mirror file's checksum for
+comparison, not by the upload path.)
 
 That matters most where it is least visible. Without a write-time check an upload trusts its `200`, so
 an object S3 stored wrongly would surface only on a much later `materialize` — quite possibly after
@@ -169,7 +172,32 @@ machine's `verifyRemote` HEAD could adopt the bad object, and a failed cleanup w
 content-addressed key permanently. Move the comparison anywhere else — upstream of the codec, or after
 the loop — and the seam is gone, which is why it lives inside the generator rather than around it.
 
-`putObjectStream` also aborts the in-flight request when the body fails. Rejecting the caller's promise
-only settles _our_ side; the SDK would keep waiting on a body that will never produce another byte, and
-Node would not exit until the socket timed out — around a minute per failed object, long after the
-failure was logged and moved past.
+`uploadObjectStream` (`src/s3/upload-object.ts`) also makes sure a body failure never leaves the request
+itself hanging. Below the multipart threshold the whole body is drained into a buffer before any S3 call
+is even made, so a body failure there rejects immediately with nothing in flight to abort. Above it,
+the body is read a part at a time; a failure partway through stops the producer from reading further
+(its own read is what just rejected) and reaches the function's own `catch`, which issues a best-effort
+`AbortMultipartUpload` before rethrowing — whatever `UploadPart` requests happened to still be in flight
+are simply discarded once that lands, rather than cancelled outright, since cancelling them changes
+nothing observable.
+
+### Multipart part size, and why `@aws-sdk/lib-storage` was replaced
+
+A file at or above `MULTIPART_THRESHOLD_BYTES` (32 MiB) uploads via multipart: `CreateMultipartUpload`,
+one `UploadPart` per chunk, `CompleteMultipartUpload`. S3 requires every part but the last to be at
+least 5 MiB, and allows at most 10,000 parts per upload — so `multipartPartSize(contentLength)`
+(`src/s3/client.ts`) picks `max(5 MiB, ceil(contentLength / 10,000))`, growing past the minimum only
+once a file would otherwise need more than 10,000 parts (~52.4 GB at 5 MiB each). This has to be
+computed explicitly: nothing reading a stream of unknown total length can size parts for itself from the
+stream alone.
+
+This replaced `@aws-sdk/lib-storage`'s `Upload` class, which sent each part's body as a stream. The
+SDK's retry middleware refuses to retry any request whose body is a stream ("An error was encountered in
+a non-retryable streaming request"), so a single dropped connection failed the _entire_ multipart upload,
+which could only be restarted from byte zero by the caller. For a 100 GB file on a connection that drops
+periodically, the odds of every one of ~10,000 parts landing within the same attempt are astronomically
+small — that upload could never complete. `uploadObjectStream` reads each part into a **Buffer** before
+sending it, which makes `UploadPartCommand` an ordinary retryable request: a failed part is simply
+resent from the buffer already in hand, with no re-read, no re-encryption, and no restarting the file.
+At most 4 parts are read ahead of what's already been sent (`MAX_PARTS_IN_FLIGHT`), so memory stays
+bounded regardless of file size — roughly `4 * partSize`.

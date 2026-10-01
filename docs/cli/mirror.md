@@ -71,7 +71,7 @@ Two orthogonal axes — **depth** and **reference**:
 | `--checksum` | Additionally hashes every stored byte. Reads the whole mirror, so it is opt-in.  |
 | `--offline`  | Compare against local `last_synced_version` rather than S3.                      |
 
-The checksum it compares against is **S3-corroborated**: `putObjectStream` refuses to return unless
+The checksum it compares against is **S3-corroborated**: `uploadObjectStream` refuses to return unless
 S3's independently-computed value matched the client's. So a deep check verifies the mirror against a
 number S3 agreed to, without touching S3.
 

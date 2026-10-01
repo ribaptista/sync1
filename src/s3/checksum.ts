@@ -1,5 +1,5 @@
 import { Crc64Nvme } from "@aws-sdk/checksums/crc";
-import { Transform, type Readable } from "node:stream";
+import { Transform, pipeline, type Readable } from "node:stream";
 
 /**
  * Computes the CRC64NVME checksum over an upload body as it streams past,
@@ -32,10 +32,22 @@ export class UploadChecksumTap {
         callback(null, chunk);
       },
     });
-    // Propagate a source failure rather than letting the pipeline stall: a
-    // retried upload builds a whole new tap and stream anyway.
-    source.on("error", (err) => transform.destroy(err));
-    return source.pipe(transform);
+    // `pipeline`, not `source.pipe(transform)`, because failure has to
+    // travel in BOTH directions. Forward (a source failure reaching the
+    // consumer) was all `.pipe()` plus an error listener ever gave us.
+    // Backward is the one that hung a real 30-hour sync: when lib-storage
+    // abandons the body after a part upload fails, it destroys this
+    // transform -- and `.pipe()` answers that by merely *unpiping* the
+    // source, leaving it paused with a full buffer, neither ended nor
+    // errored. When the source is a `teeStream` branch, that stalls the
+    // shared source and with it the mirror branch, forever and silently.
+    // `pipeline` destroys the source with ERR_STREAM_PREMATURE_CLOSE
+    // instead, which the tee turns into a failure of both branches. The
+    // no-op callback is required by `pipeline`'s signature; the error
+    // itself reaches whoever is consuming `transform`. A retried upload
+    // builds a whole new tap and stream anyway.
+    pipeline(source, transform, () => {});
+    return transform;
   }
 
   /**
