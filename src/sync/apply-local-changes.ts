@@ -207,6 +207,18 @@ export async function applyLocalChangesToCandidate(
    */
   verifyRemote = false,
   mirror: MirrorOptions = { path: undefined, onMaxRetries: "fail" },
+  /**
+   * Where `verifyRemote`'s HEAD checks are dispatched -- a metadata-only
+   * call, cheap enough to deserve its own, typically much higher,
+   * concurrency limit than the upload pool (`--s3-metadata-parallelism`,
+   * the same pool `converge`/`status`/`sanity_check` use). Optional and
+   * defaulting to `streamPool` itself: a caller that doesn't pass one
+   * (every existing test, today) still gets correct behavior, just with
+   * the HEAD checks and the uploads they occasionally escalate to sharing
+   * one concurrency budget instead of two.
+   */
+  metadataPool: PQueue = streamPool,
+  metadataQueueLimit: number = streamQueueLimit,
 ): Promise<ApplyLocalChangesResult> {
   const objectsRepo = new ObjectsRepository(candidateDb);
   const entriesRepo = new EntriesRepository(candidateDb);
@@ -252,8 +264,12 @@ export async function applyLocalChangesToCandidate(
   // See dispatchTracked's own doc comment: streamPool.onIdle() alone can't
   // tell this function a dispatched job threw, since a rejection just
   // discarded by `void streamPool.add(...)` becomes an unhandled one --
-  // this is what turns that into a real, catchable error instead.
+  // this is what turns that into a real, catchable error instead. Two
+  // boxes, one per pool, since either can fail independently -- same
+  // reason materialize.ts (src/fs/materialize.ts) keeps its own s3Pool
+  // and streamPool errors apart.
   const streamPoolErrors = createPoolErrorBox();
+  const metadataPoolErrors = createPoolErrorBox();
   if (estimatedTotals) progress.setEstimatedTotals(estimatedTotals);
 
   const iter = dirtyRows[Symbol.iterator]();
@@ -303,14 +319,16 @@ export async function applyLocalChangesToCandidate(
   while (!next.done) {
     // A dispatched job records an uncaught error into streamPoolErrors only
     // when it's fatal to the whole run (today: MirrorRequiredError under
-    // `fail`, or an unexpected candidate-DB write failure) -- an ordinary
-    // per-object upload/mirror failure is caught and swallowed inside the
-    // job itself (see the dispatch below), never reaching this box at all.
-    // Once one has landed, the run is already doomed to abort at
-    // throwIfPoolErrored() below; there's no reason to keep feeding this
-    // pool more rows (more uploads to a candidate that will never be
-    // committed) in the meantime.
-    if (streamPoolErrors.hasError) break;
+    // `fail`, S3UploadFatalError, or an unexpected candidate-DB write
+    // failure) -- an ordinary per-object upload/mirror failure is caught
+    // and swallowed inside the job itself (see the dispatch below), never
+    // reaching this box at all. metadataPoolErrors is the same idea for an
+    // uncaught HEAD-check failure (see the verifyRemote dispatch below).
+    // Once either has landed, the run is already doomed to abort at
+    // throwIfPoolErrored() below; there's no reason to keep feeding either
+    // pool more rows (more uploads/HEAD-checks for a candidate that will
+    // never be committed) in the meantime.
+    if (streamPoolErrors.hasError || metadataPoolErrors.hasError) break;
 
     const row = next.value;
     next = iter.next();
@@ -435,76 +453,16 @@ export async function applyLocalChangesToCandidate(
     // which writes only the sinks that are missing.
     const alreadyOnS3 = objectsRepo.has(hash);
 
-    // verifyRemote only: not known to *this* candidate, but a prior run's
-    // upload could still have reached S3 before it got aborted -- object
-    // records only ever live in whatever candidate DB that run was using,
-    // discarded along with everything else it never got to promote. A HEAD
-    // is a sound existence check here specifically because the key is
-    // content-addressed and encryption is convergent: present can only
-    // mean this exact plaintext, encrypted the exact same way, already
-    // made it. Awaited inline, not dispatched -- this only ever runs
-    // during the slow, recovery-mode path, so trading some parallelism for
-    // a simpler decide-then-dispatch shape is the right call here.
-    // Set when S3 is known to hold this object but the local candidate has
-    // no row for it yet -- the verifyRemote recovery case. Distinct from
-    // `alreadyOnS3`, which means the row exists already and needs nothing.
-    let remoteChecksum: string | undefined;
-    if (verifyRemote && !alreadyOnS3) {
-      const existingKey = objectKey(hash);
-      const head = await headObject(s3.client, s3.bucket, remoteKey(s3.location, existingKey));
-      // A checksum is part of the shortcut's price, not a bonus. Taking it
-      // writes the only `objects` row this hash will ever get -- every
-      // later run hits the objectsRepo.has() branch above and never
-      // re-upserts -- so a checksum missing here would be missing forever,
-      // and 0011 requires one. Rather than fail the run or invent a value,
-      // decline the shortcut and let the normal upload path below produce
-      // a properly corroborated one. Costs one re-upload of an object that
-      // is already there, self-heals permanently, and can now only happen
-      // for an object predating the checksum column at all.
-      if (head && !head.checksumCrc64Nvme) {
-        logger.debug(
-          { path: row.path, hash },
-          "content present in S3 but with no recorded checksum -- re-uploading rather than adopting an unverified object",
-        );
-      }
-      if (head?.checksumCrc64Nvme) {
-        // Recorded even when the mirror still needs the object: S3 is
-        // demonstrably holding the right bytes, so the dispatch below has
-        // only the mirror left to write.
-        remoteChecksum = head.checksumCrc64Nvme;
-      }
-      if (head?.checksumCrc64Nvme && !mirrorNeedsObject) {
-        dedupedObjects++;
-        handledPaths.set(row.path, versionStamp);
-        appliedCount++;
-        logger.debug(
-          { path: row.path, hash },
-          "content already present in S3 from a prior aborted run -- skipping re-upload (verify-remote)",
-        );
-        // Unlike the objectsRepo.has(hash) branch above, this candidate
-        // never had an objects row for this hash at all -- has to be
-        // written now, not just the entries row, or a later dedup-attach
-        // in this same batch couldn't find it either.
-        //
-        // The checksum comes from the HEAD above, and is trustworthy for a
-        // specific reason: an object only reached S3 through
-        // `putObjectStream`, which refuses to return without S3's own
-        // value matching the client's. So S3's stored number was already
-        // corroborated -- by the very run that crashed before recording
-        // it. Adopting it here is reading back a proof, not assuming one.
-        // The guard above guarantees it is present.
-        objectsRepo.upsert({
-          hash,
-          s3_key: existingKey,
-          size: row.size!,
-          ciphertext_checksum: head.checksumCrc64Nvme,
-        });
-        entriesRepo.upsert({ path: row.path, type: row.type, hash, state_version: versionStamp });
-        progress.rowResolved();
-        continue;
-      }
-    }
-
+    // Claimed *before* any async work starts -- including the verifyRemote
+    // HEAD check below, which now runs concurrently with other rows' own
+    // HEAD checks rather than one at a time. A same-batch row sharing this
+    // hash that arrives while either the HEAD check or the upload itself is
+    // still in flight finds this job already here and attaches to it
+    // (below), rather than racing it: two rows reaching the
+    // `inFlightByHash.get(hash)` check above before either had recorded
+    // itself here would otherwise both decide "not in flight" and both pay
+    // for their own HEAD check and, if S3 doesn't have it yet, their own
+    // separate upload of identical bytes.
     const job: InFlightUpload = { sourceRows: [{ path: row.path, type: row.type }] };
     inFlightByHash.set(hash, job);
 
@@ -527,8 +485,11 @@ export async function applyLocalChangesToCandidate(
     // warmest-wins policy ultimately has to enforce.
     const { targetClass } = resolveHashTargetClass([row.path], nonDefaultPolicies, defaultPolicy);
 
-    await waitForRoom(streamPool, streamQueueLimit);
-    dispatchTracked(streamPool, streamPoolErrors, async () => {
+    // The actual read-encrypt-write, extracted so it can be invoked from
+    // either branch below with whatever `remoteChecksum` that branch has in
+    // hand: `undefined` when verifyRemote never ran or found nothing, the
+    // HEAD's own value when it did.
+    const runUploadJob = async (remoteChecksum: string | undefined): Promise<void> => {
       const absolutePath = path.join(root, row.path);
       const fileTracker = progress.startFile(row.path, size);
       try {
@@ -980,16 +941,142 @@ export async function applyLocalChangesToCandidate(
         // way by the time this runs.
         for (let i = 0; i < job.sourceRows.length; i++) progress.rowResolved();
       }
-    });
-    // Logged after add(), not before -- add() synchronously starts the task
-    // (if capacity allows) before returning, so this reflects occupancy
-    // *including* the job just dispatched.
-    logger.debug(
-      { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
-      "dispatched",
-    );
+    };
+
+    if (verifyRemote && !alreadyOnS3) {
+      // Not known to *this* candidate, but a prior run's upload could
+      // still have reached S3 before it got aborted -- object records
+      // only ever live in whatever candidate DB that run was using,
+      // discarded along with everything else it never got to promote. A
+      // HEAD is a sound existence check here specifically because the key
+      // is content-addressed and encryption is convergent: present can
+      // only mean this exact plaintext, encrypted the exact same way,
+      // already made it.
+      //
+      // Dispatched to its own pool (`metadataPool`, bounded by
+      // `--s3-metadata-parallelism`), separate from the upload pool below:
+      // a HEAD is metadata-only and cheap, so it deserves its own,
+      // typically much higher, concurrency limit -- nested dispatch, the
+      // same pattern materialize's own classify-then-maybe-download ladder
+      // uses (src/fs/materialize.ts). This also closes the hole the old,
+      // awaited-inline version of this check left open: with only one HEAD
+      // ever in flight at a time, this whole phase ran at a single
+      // connection's pace regardless of `--s3-metadata-parallelism`.
+      await waitForRoom(metadataPool, metadataQueueLimit);
+      dispatchTracked(metadataPool, metadataPoolErrors, async () => {
+        const existingKey = objectKey(hash);
+        // Not wrapped in withS3Retry, deliberately unchanged from before
+        // this function went concurrent: an uncaught failure here lands in
+        // metadataPoolErrors exactly like an uncaught failure from the old
+        // inline `await` propagated straight out of the whole function --
+        // fatal to the run, not a per-row "leave dirty" case. A transient
+        // HEAD failure during recovery was already treated this harshly;
+        // this preserves that rather than quietly softening it.
+        const head = await headObject(s3.client, s3.bucket, remoteKey(s3.location, existingKey));
+        // A checksum is part of the shortcut's price, not a bonus. Taking it
+        // writes the only `objects` row this hash will ever get -- every
+        // later run hits the objectsRepo.has() branch above and never
+        // re-upserts -- so a checksum missing here would be missing forever,
+        // and 0011 requires one. Rather than fail the run or invent a value,
+        // decline the shortcut and let the normal upload path below produce
+        // a properly corroborated one. Costs one re-upload of an object that
+        // is already there, self-heals permanently, and can now only happen
+        // for an object predating the checksum column at all.
+        if (head && !head.checksumCrc64Nvme) {
+          logger.debug(
+            { path: row.path, hash },
+            "content present in S3 but with no recorded checksum -- re-uploading rather than adopting an unverified object",
+          );
+        }
+        // Recorded even when the mirror still needs the object: S3 is
+        // demonstrably holding the right bytes, so escalating to
+        // runUploadJob below (if it comes to that) has only the mirror
+        // left to write.
+        const remoteChecksum = head?.checksumCrc64Nvme;
+        if (remoteChecksum && !mirrorNeedsObject) {
+          // Every row riding on this job -- the dispatcher, plus any
+          // dedup attach that arrived while this HEAD was still in flight
+          // (job.sourceRows can have grown since dispatch, exactly like
+          // runUploadJob's own success path handles for an upload) -- is a
+          // dedup hit: S3 already has these bytes and the mirror doesn't
+          // need them either, so nothing further has to run for any of
+          // them.
+          //
+          // Unlike the objectsRepo.has(hash) branch above, this candidate
+          // never had an objects row for this hash at all -- has to be
+          // written now, not just the entries row, or a later dedup-attach
+          // in this same batch couldn't find it either.
+          //
+          // The checksum comes from the HEAD above, and is trustworthy for
+          // a specific reason: an object only reached S3 through
+          // `uploadObjectStream`, which refuses to return without S3's own
+          // value matching the client's. So S3's stored number was already
+          // corroborated -- by the very run that crashed before recording
+          // it. Adopting it here is reading back a proof, not assuming one.
+          objectsRepo.upsert({
+            hash,
+            s3_key: existingKey,
+            size,
+            ciphertext_checksum: remoteChecksum,
+          });
+          for (const sourceRow of job.sourceRows) {
+            dedupedObjects++;
+            handledPaths.set(sourceRow.path, versionStamp);
+            appliedCount++;
+            entriesRepo.upsert({
+              path: sourceRow.path,
+              type: sourceRow.type,
+              hash,
+              state_version: versionStamp,
+            });
+          }
+          logger.debug(
+            { paths: job.sourceRows.map((r) => r.path), hash },
+            "content already present in S3 from a prior aborted run -- skipping re-upload (verify-remote)",
+          );
+          inFlightByHash.delete(hash);
+          for (let i = 0; i < job.sourceRows.length; i++) progress.rowResolved();
+          return;
+        }
+        // Either S3 doesn't have it, or it does but with no recorded
+        // checksum (declining the shortcut) -- either way, a real
+        // read-encrypt-write is still needed (for the mirror alone, if
+        // `remoteChecksum` ended up set; for both sinks otherwise).
+        // Escalated into the heavier, lower-concurrency upload pool only
+        // now that that's known -- not every HEAD check needs to occupy
+        // one of its slots.
+        await waitForRoom(streamPool, streamQueueLimit);
+        dispatchTracked(streamPool, streamPoolErrors, () => runUploadJob(remoteChecksum));
+        logger.debug(
+          { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+          "dispatched (from HEAD check)",
+        );
+      });
+      logger.debug(
+        { pool: "s3-metadata", inFlight: metadataPool.pending, queued: metadataPool.size },
+        "dispatched",
+      );
+    } else {
+      await waitForRoom(streamPool, streamQueueLimit);
+      dispatchTracked(streamPool, streamPoolErrors, () => runUploadJob(undefined));
+      // Logged after add(), not before -- add() synchronously starts the task
+      // (if capacity allows) before returning, so this reflects occupancy
+      // *including* the job just dispatched.
+      logger.debug(
+        { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+        "dispatched",
+      );
+    }
   }
 
+  // metadataPool drained *before* streamPool, not just alongside it: by
+  // the time every HEAD-check job has settled, every upload it might have
+  // triggered has already been enqueued into streamPool (the same
+  // ordering materialize.ts uses between its own s3Pool and streamPool,
+  // for the same reason). Draining streamPool first could otherwise go
+  // idle while a HEAD check was still about to escalate into it.
+  await metadataPool.onIdle();
+  throwIfPoolErrored(metadataPoolErrors);
   await streamPool.onIdle();
   throwIfPoolErrored(streamPoolErrors);
   // Drops the estimate back onto what actually happened: a row that turned

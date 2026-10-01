@@ -8,7 +8,7 @@ Internally runs `update_cache` first, so you never need to run that separately b
 ## Usage
 
 ```bash
-sync1 sync [--root <local-path>] [--json] [--verbose] [--hash-parallelism <n>] [--file-stream-parallelism <n>] [--no-progress] [--verify-remote] [--skip-mirror] [--on-mirror-max-retries <fail|ignore>]
+sync1 sync [--root <local-path>] [--json] [--verbose] [--hash-parallelism <n>] [--s3-metadata-parallelism <n>] [--file-stream-parallelism <n>] [--no-progress] [--verify-remote] [--skip-mirror] [--on-mirror-max-retries <fail|ignore>]
 ```
 
 ## Options
@@ -17,6 +17,7 @@ sync1 sync [--root <local-path>] [--json] [--verbose] [--hash-parallelism <n>] [
 | ---------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--root <path>`                          | no       | Local directory to sync. Must already be initialized (`init_remote`) or attached (`attach_remote`). Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward.           |
 | `--hash-parallelism <n>`                 | no       | Max concurrent file-hashing worker threads, used by `sync`'s internal `update_cache` scan. Default: CPU count.                                                                                                         |
+| `--s3-metadata-parallelism <n>`          | no       | Max concurrent `HEAD` calls during `--verify-remote`'s recovery pass, one dispatched per distinct not-yet-known content hash. Default 8. Has no effect otherwise -- an ordinary run makes no bare S3 metadata calls.   |
 | `--file-stream-parallelism <n>`          | no       | Max concurrent encrypt+upload / download+decrypt pipelines, used by the upload and remote-apply passes. Default 4.                                                                                                     |
 | `--verify-remote`                        | no       | HEAD-checks S3 for each not-yet-known object before uploading it, even without a prior aborted run's marker present. See **Recovering from an aborted run** below — normally this turns on by itself when it's needed. |
 | `--skip-mirror`                          | no       | Ignore the configured `mirror_path` entirely for this run. Does nothing if no mirror is configured.                                                                                                                    |
@@ -103,9 +104,9 @@ convergent encryption make this a sound check), so this run just records the row
 the PUT again. This is automatic; you never need to pass a flag for it.
 
 `--verify-remote` forces the same HEAD-before-upload behavior on for an ordinary run, marker or not --
-slower (a HEAD per not-yet-known upload), but useful if you have some other reason to suspect local
-state and S3 have drifted apart and want `sync` to double-check rather than trust cache.db/state.db at
-face value.
+slower (a HEAD per not-yet-known upload, bounded by `--s3-metadata-parallelism`), but useful if you have
+some other reason to suspect local state and S3 have drifted apart and want `sync` to double-check
+rather than trust cache.db/state.db at face value.
 
 ## Output
 

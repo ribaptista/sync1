@@ -42,9 +42,12 @@ sequenceDiagram
 
 ## Sequence — Pass 2: the decision ladder
 
-Decide-then-dispatch: only the actual object upload is handed to `streamPool` (see
-[`flow-pool-dispatch.md`](flow-pool-dispatch.md)); everything up to that point runs inline so the loop
-can advance to the next row immediately.
+Decide-then-dispatch: the job is claimed in `inFlightByHash` _before_ any async work starts (not after
+the HEAD resolves), so a same-batch row sharing a hash can attach to it whether that hash's own async
+work is a HEAD check still in flight or an upload already running. The HEAD check itself is dispatched
+to `metadataPool` (see [`flow-pool-dispatch.md`](flow-pool-dispatch.md)), separately from the upload
+pool it may escalate into -- a HEAD is metadata-only and cheap, and deserves its own, typically much
+higher, concurrency limit (`--s3-metadata-parallelism`).
 
 ```mermaid
 sequenceDiagram
@@ -52,11 +55,12 @@ sequenceDiagram
     participant Rules as decideLocalChange
     participant Candidate as candidate.db
     participant Mirror as mirror (fs)
+    participant Meta as metadataPool
     participant S3
 
     loop each remaining row
-        opt streamPoolErrors already holds an error
-            Loop--xLoop: break -- a dispatched job already failed fatally<br/>(MirrorRequiredError, or an unexpected candidate-DB write failure);<br/>no point feeding this doomed run more work
+        opt streamPoolErrors or metadataPoolErrors already holds an error
+            Loop--xLoop: break -- a dispatched job already failed fatally<br/>(MirrorRequiredError, S3UploadFatalError, an uncaught HEAD failure,<br/>or an unexpected candidate-DB write failure); no point feeding<br/>this doomed run more work
         end
         alt row.state = "created"
             Loop->>Candidate: findByNormalizedPath(collision key)
@@ -75,30 +79,56 @@ sequenceDiagram
             Loop->>Candidate: entriesRepo.upsert({hash:null, ...})
             Loop->>Loop: handledPaths.set(path, versionStamp); appliedCount++; next row
         else apply, row.type = "file"
-            alt same hash already in flight this batch
-                Loop->>Loop: attach to existingJob.sourceRows; no upload of its own
+            alt same hash already in flight this batch (a HEAD check or an upload)
+                Loop->>Loop: attach to existingJob.sourceRows; no HEAD/upload of its own
             else
                 Loop->>Mirror: mirrorObjectExists(mirrorObjectPath(hash), encryptedSize)?
                 Loop->>Candidate: objectsRepo.has(hash)?
                 alt known to S3 AND mirror doesn't need it
                     Loop->>Candidate: entriesRepo.upsert({hash, ...})
                     Loop->>Loop: dedupedObjects++; handledPaths.set(...); appliedCount++; next row
-                else verifyRemote enabled AND not already known locally
-                    Loop->>S3: headObject(objectKey(hash))
-                    alt found, with a recorded checksum
-                        opt mirror doesn't need it either
-                            Loop->>Candidate: objectsRepo.upsert(...); entriesRepo.upsert(...)
-                            Loop->>Loop: dedupedObjects++; appliedCount++; next row
-                        end
-                        note over Loop: else: remoteChecksum kept, dispatch below only needs the mirror
-                    else found, but with no recorded checksum
-                        Loop->>Loop: decline the shortcut -- fall through to a real re-upload
+                else
+                    Loop->>Loop: job = {sourceRows: [row]}; inFlightByHash.set(hash, job)<br/>-- claimed now, before anything async, so a same-batch<br/>attach can never race this hash's own classification
+                    Loop->>Loop: resolveHashTargetClass([row.path], policies) -- from this row's<br/>path alone, not re-resolved for a later same-batch dedup attach
+                    alt verifyRemote enabled AND not already known locally
+                        Loop->>Loop: waitForRoom(metadataPool); dispatchTracked(head-check job)
+                        Loop->>Loop: next row immediately -- does not wait for the HEAD
+                        note over Meta: (async, elsewhere) see the HEAD-check job below
+                    else
+                        Loop->>Loop: waitForRoom(streamPool); dispatchTracked(runUploadJob(undefined))<br/>-- see flow below
                     end
                 end
-                Loop->>Loop: resolveHashTargetClass([row.path], policies) -- from this row's<br/>path alone, not re-resolved for a later same-batch dedup attach
-                Loop->>Loop: waitForRoom(streamPool); dispatchTracked(job) -- see below
             end
         end
+    end
+```
+
+### The dispatched HEAD-check job (verifyRemote only)
+
+Runs in `metadataPool`, concurrently with every other row's own HEAD check -- up to
+`--s3-metadata-parallelism` at once, not one at a time. `job.sourceRows` may have grown since dispatch
+(a same-batch attach arriving while this HEAD is still outstanding), so a hit here resolves _every_ row
+riding on the job, not just the one that dispatched it.
+
+```mermaid
+sequenceDiagram
+    participant Meta as metadataPool job
+    participant S3
+    participant Candidate as candidate.db
+    participant Stream as streamPool
+
+    Meta->>S3: headObject(objectKey(hash))
+    note over Meta: not wrapped in withS3Retry -- an uncaught failure here<br/>(including a transient network error) lands in<br/>metadataPoolErrors and is fatal to the whole run,<br/>same severity as the pre-concurrency inline await had
+    alt found, with a recorded checksum, AND mirror doesn't need it
+        Meta->>Candidate: objectsRepo.upsert({hash, s3_key, size, ciphertext_checksum})
+        loop each row in job.sourceRows (every dedup attach included)
+            Meta->>Candidate: entriesRepo.upsert({path, type, hash, state_version})
+            Meta->>Meta: dedupedObjects++; handledPaths.set(...); appliedCount++
+        end
+        Meta->>Meta: inFlightByHash.delete(hash); rowResolved() per sourceRow
+    else found, but with no recorded checksum (declines the shortcut) OR not found at all
+        Meta->>Stream: waitForRoom(streamPool); dispatchTracked(runUploadJob(remoteChecksum))
+        note over Stream: remoteChecksum is set only if S3 had it (mirror-only write<br/>still needed); undefined if S3 has nothing at all
     end
 ```
 
@@ -201,11 +231,19 @@ sequenceDiagram
   (`objectsRepo.has(hash)`, keeps whatever class that object already has) or a `--verify-remote`
   adoption (keeps the class it was written with). See
   [`storage-class-policies.md`](../architecture/storage-class-policies.md).
-- **Concurrency:** Pass 1 has none. In Pass 2, only the upload/mirror job is dispatched to
-  `streamPool`, bounded by `streamQueueLimit` via `waitForRoom` (see
-  [`flow-pool-dispatch.md`](flow-pool-dispatch.md)). Inside one job, the tee's two branches
-  (`uploadTo`/`mirrorTo`) genuinely run concurrently — one read, one encryption, two sinks advancing in
-  lockstep, so S3 goes no faster than the mirror.
+- **Concurrency:** Pass 1 has none. In Pass 2, two pools run independently: `metadataPool` for
+  `verifyRemote`'s HEAD checks (bounded by `--s3-metadata-parallelism`, defaulting to `streamPool`
+  itself if the caller passes none) and `streamPool` for the actual upload/mirror job (bounded by
+  `streamQueueLimit`), both via `waitForRoom` (see [`flow-pool-dispatch.md`](flow-pool-dispatch.md)). A
+  HEAD-check job can itself dispatch into `streamPool` once it knows whether a real upload is still
+  needed -- nested dispatch, the same pattern `materialize.ts` uses between its own `s3Pool` and
+  `streamPool`. Inside one upload job, the tee's two branches (`uploadTo`/`mirrorTo`) genuinely run
+  concurrently — one read, one encryption, two sinks advancing in lockstep, so S3 goes no faster than
+  the mirror.
+- **`metadataPool` is drained before `streamPool`** in the join step after the loop, for the same reason
+  `materialize.ts` drains its own `s3Pool` first: by the time every HEAD-check job has settled, every
+  upload it might have triggered has already been enqueued into `streamPool` -- draining `streamPool`
+  first could otherwise find it idle while a HEAD check was still about to escalate into it.
 - **Only one retry budget lives at this level now:** `withMirrorRetry` wraps `runUnit` (the whole
   read-encrypt-write, since a `Readable` that already errored can't be replayed — a retried attempt
   re-reads from byte zero, and hands the abandoned partial back via `fileTracker.retrying()` so the

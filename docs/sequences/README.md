@@ -47,7 +47,7 @@ from rotting silently.
 | [flow-mirror-metadata.md](flow-mirror-metadata.md)           | The three small mirrored keys, and sync's eager/fail-fast vs. gc/policy_edit's lazy/swallow-on-error mirror-path resolution | sync, gc, policy_edit                          |
 | [flow-atomic-publish.md](flow-atomic-publish.md)             | The generic temp-sibling → rename idiom, and the `renameWithRetry`/bare-`renameSync` split                                  | materialize, thumbnail, mirror, stubify        |
 | [flow-archive-status.md](flow-archive-status.md)             | `classifyArchiveStatus`'s four states and the restore dance                                                                 | materialize, converge_status, mirror           |
-| [flow-apply-local-changes.md](flow-apply-local-changes.md)   | Sync's upload phase: the decision ladder, the tee, the two retry budgets                                                    | sync                                           |
+| [flow-apply-local-changes.md](flow-apply-local-changes.md)   | Sync's upload phase: the decision ladder, claim-before-dispatch, the concurrent verifyRemote HEAD checks, the tee           | sync                                           |
 | [flow-apply-remote-changes.md](flow-apply-remote-changes.md) | Sync's download phase: the merge-join, the stub-vs-download branch                                                          | sync                                           |
 
 ## Not diagrammed — prose only

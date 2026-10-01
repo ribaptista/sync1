@@ -379,6 +379,13 @@ export async function performSync(
           uploadTotals,
           verifyRemote,
           mirror,
+          // Metadata-only (a HEAD per not-yet-known object, during
+          // verifyRemote's recovery pass), so it gets its own pool sized
+          // by --s3-metadata-parallelism -- the same one converge/status/
+          // sanity_check use -- rather than sharing the upload pool's
+          // typically much lower concurrency.
+          pools.s3,
+          pools.s3.concurrency * 2,
         );
 
         // A version is only worth committing if something *actually*
