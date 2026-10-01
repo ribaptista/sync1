@@ -1380,14 +1380,310 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
       true, // verifyRemote
     );
 
-    // b.txt's own objectsRepo.has(hash) check finds what a.txt's HEAD
-    // check already wrote -- a second HEAD for the same hash in the same
-    // batch would just be wasted work.
+    // b.txt attaches to a.txt's job via inFlightByHash -- claimed
+    // synchronously, before a.txt's own HEAD check is even dispatched --
+    // rather than independently discovering the object itself. A second
+    // HEAD for the same hash in the same batch would just be wasted work.
+    // See the dedicated concurrency tests below for the case this guards:
+    // attaching while that HEAD is still outstanding, not merely already
+    // resolved.
     expect(headObjectMock).toHaveBeenCalledTimes(1);
     expect(putObjectStreamMock).not.toHaveBeenCalled();
     expect(result.dedupedObjects).toBe(2);
     expect(result.handledPaths.get("a.txt")).toBe("v1");
     expect(result.handledPaths.get("b.txt")).toBe("v1");
+
+    candidateDb.close();
+  });
+});
+
+/** Resolves once something else calls `resolve`/`reject` -- lets a test hold a HEAD check open deliberately. */
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (v: T) => void;
+  reject: (e: unknown) => void;
+} {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe("applyLocalChangesToCandidate: verifyRemote HEAD checks run concurrently", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-local-changes-head-concurrency-"));
+    putObjectStreamMock.mockReset();
+    putObjectStreamMock.mockImplementation(drainBody);
+    headObjectMock.mockReset();
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function touch(relPath: string, content: string, mtime = 1): void {
+    const absolute = path.join(root, relPath);
+    fs.writeFileSync(absolute, content);
+    fs.utimesSync(absolute, new Date(mtime), new Date(mtime));
+  }
+
+  /**
+   * The bug this whole describe block exists to pin: the old code awaited
+   * each HEAD inline, one row at a time, so this phase ran at a single
+   * connection's pace regardless of --s3-metadata-parallelism. A real sync
+   * doing a recovery pass over ~90,000 files at one HEAD at a time, rather
+   * than N at a time, is the difference between minutes and hours.
+   */
+  it("has more than one HEAD check in flight at once, bounded by metadataPool's own concurrency -- not streamPool's", async () => {
+    const released: Array<() => void> = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    headObjectMock.mockImplementation(() => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise((resolve) => {
+        released.push(() => {
+          inFlight--;
+          resolve({ etag: '"etag"' }); // no checksum -- falls through to a real upload
+        });
+      });
+    });
+
+    const dirtyRows = Array.from({ length: 5 }, (_, i) => {
+      const content = `distinct content #${i}`;
+      touch(`f${i}.txt`, content);
+      return {
+        path: `f${i}.txt`,
+        type: "file" as const,
+        mtime: 1,
+        hash: hashBufferHex(Buffer.from(content)),
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      };
+    });
+
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+
+    // streamPool deliberately small (1) and distinct from metadataPool (3)
+    // -- if the HEAD checks were still sharing streamPool's own budget
+    // (or running one at a time regardless of either), maxInFlight could
+    // never exceed 1.
+    const streamPool = new PQueue({ concurrency: 1 });
+    const metadataPool = new PQueue({ concurrency: 3 });
+
+    const resultPromise = applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      streamPool,
+      8,
+      undefined,
+      undefined,
+      true, // verifyRemote
+      undefined,
+      metadataPool,
+      8,
+    );
+
+    // Let every HEAD check that *can* start, start, bounded by a real
+    // deadline rather than a fixed tick count.
+    const deadline = Date.now() + 2000;
+    while (released.length < 3 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(maxInFlight).toBe(3);
+
+    while (released.length > 0) {
+      released.shift()!();
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const result = await resultPromise;
+    expect(result.uploadedObjects).toBe(5);
+
+    candidateDb.close();
+  });
+
+  it("attaches a same-batch dedup row while the HEAD check for its hash is still outstanding, and counts both once it resolves found", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "shared content, found on S3 by a slow HEAD";
+    const hash = hashBufferHex(Buffer.from(content));
+    touch("a.txt", content);
+    touch("b.txt", content);
+
+    const head = deferred<{ etag: string; checksumCrc64Nvme?: string }>();
+    headObjectMock.mockReturnValue(head.promise);
+
+    const dirtyRows = [
+      {
+        path: "a.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+      {
+        path: "b.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const resultPromise = applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      undefined,
+      undefined,
+      true, // verifyRemote
+    );
+
+    // Give both rows a chance to be decided -- a.txt dispatches the HEAD,
+    // b.txt (same hash) should find a.txt's job already claimed and attach
+    // to it, all before the HEAD below ever resolves.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(headObjectMock).toHaveBeenCalledTimes(1);
+
+    head.resolve({ etag: '"etag"', checksumCrc64Nvme: "crc-from-head" });
+    const result = await resultPromise;
+
+    expect(putObjectStreamMock).not.toHaveBeenCalled();
+    expect(result.dedupedObjects).toBe(2);
+    expect(result.handledPaths.get("a.txt")).toBe("v1");
+    expect(result.handledPaths.get("b.txt")).toBe("v1");
+    const objectsRepo = new ObjectsRepository(candidateDb);
+    expect(objectsRepo.get(hash)?.ciphertext_checksum).toBe("crc-from-head");
+
+    candidateDb.close();
+  });
+
+  it("attaches a same-batch dedup row while the HEAD check is outstanding, and rides along on the upload it escalates to when nothing is found", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "shared content, not found by a slow HEAD";
+    const hash = hashBufferHex(Buffer.from(content));
+    touch("a.txt", content);
+    touch("b.txt", content);
+
+    const head = deferred<null>();
+    headObjectMock.mockReturnValue(head.promise);
+
+    const dirtyRows = [
+      {
+        path: "a.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+      {
+        path: "b.txt",
+        type: "file" as const,
+        mtime: 1,
+        hash,
+        size: content.length,
+        state: "created" as const,
+        parent_state_version: "v0",
+      },
+    ];
+
+    const resultPromise = applyLocalChangesToCandidate(
+      candidateDb,
+      dirtyRows,
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      undefined,
+      undefined,
+      true, // verifyRemote
+    );
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(headObjectMock).toHaveBeenCalledTimes(1);
+
+    head.resolve(null); // not on S3 at all -- a real upload is needed
+    const result = await resultPromise;
+
+    // One real upload (whichever row dispatched the job), one dedup --
+    // b.txt never triggered a HEAD or an upload of its own.
+    expect(putObjectStreamMock).toHaveBeenCalledTimes(1);
+    expect(result.uploadedObjects).toBe(1);
+    expect(result.dedupedObjects).toBe(1);
+    expect(result.handledPaths.get("a.txt")).toBe("v1");
+    expect(result.handledPaths.get("b.txt")).toBe("v1");
+
+    candidateDb.close();
+  });
+
+  /**
+   * Parity with the pre-concurrency behavior: the old code awaited the
+   * HEAD with no try/catch around it at all, so any failure (a network
+   * blip included) propagated straight out of the whole function,
+   * uncaught. Dispatching it to a pool must not quietly soften that into
+   * a per-row "leave dirty, continue" case.
+   */
+  it("aborts the whole run, uncaught, when a HEAD check itself fails -- matching the pre-concurrency severity", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const content = "a HEAD that fails outright";
+    touch("a.txt", content);
+    headObjectMock.mockRejectedValue(new Error("simulated network failure"));
+
+    await expect(
+      applyLocalChangesToCandidate(
+        candidateDb,
+        [
+          {
+            path: "a.txt",
+            type: "file" as const,
+            mtime: 1,
+            hash: hashBufferHex(Buffer.from(content)),
+            size: content.length,
+            state: "created" as const,
+            parent_state_version: "v0",
+          },
+        ],
+        root,
+        Buffer.alloc(32),
+        "v1",
+        unusedS3,
+        silentLogger,
+        new PQueue({ concurrency: 4 }),
+        8,
+        undefined,
+        undefined,
+        true, // verifyRemote
+      ),
+    ).rejects.toThrow("simulated network failure");
 
     candidateDb.close();
   });

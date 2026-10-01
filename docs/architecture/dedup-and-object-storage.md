@@ -95,6 +95,26 @@ Deliberately conditional rather than always-on: a HEAD per uploaded file is a re
 many-small-files sync, and an ordinary clean run (no prior abort, no `--verify-remote`) pays zero extra
 round trips for a recovery mechanism it will never need.
 
+### The HEAD checks themselves run concurrently, not one at a time
+
+Each HEAD, in `applyLocalChangesToCandidate`'s Pass 2 loop, is dispatched to its own pool
+(`--s3-metadata-parallelism`, the same one `converge`/`status`/`sanity_check` use) rather than awaited
+inline -- a HEAD is metadata-only and cheap, and deserves its own, typically much higher, concurrency
+limit than the upload pool it occasionally escalates into. An earlier version of this code awaited each
+HEAD inline, one at a time, regardless of `--s3-metadata-parallelism`: correct, but on a real recovery
+pass over tens of thousands of files, the difference between one request in flight and dozens is the
+difference between hours and minutes.
+
+Making this concurrent reopens a race the inline version never had to consider: two rows sharing a
+content hash, both needing their own HEAD, could both decide "not already in flight" before either had
+recorded itself as such -- paying for two HEAD checks (and, if S3 doesn't have it yet, two separate
+uploads of identical bytes) instead of one. The fix is the same one `inFlightByHash` already uses for a
+same-batch dedup against an in-flight _upload_: the job is claimed **before** any async work starts, not
+after the HEAD resolves. A second row reaching the same hash while the first's HEAD is still outstanding
+finds the claim already there and attaches to it (`job.sourceRows`), exactly like attaching to an
+in-flight upload -- and once the HEAD resolves, every row riding on that job is written at once, not
+just the one that dispatched it.
+
 ## Every object carries a proof that S3 stored it correctly
 
 `objects.ciphertext_checksum` is **`NOT NULL`**, and that is a correctness property rather than a
