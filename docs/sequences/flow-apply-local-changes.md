@@ -121,6 +121,7 @@ sequenceDiagram
     note over Meta: not wrapped in withS3Retry -- an uncaught failure here<br/>(including a transient network error) lands in<br/>metadataPoolErrors and is fatal to the whole run,<br/>same severity as the pre-concurrency inline await had
     alt found, with a recorded checksum, AND mirror doesn't need it
         Meta->>Candidate: objectsRepo.upsert({hash, s3_key, size, ciphertext_checksum})
+        Meta->>Meta: progress.skipBytes(size) -- once per job, not per sourceRow:<br/>these bytes were counted toward the total at dispatch<br/>(expectBytes) but will never transfer, so they have to<br/>be credited back or the bar stalls short of 100%
         loop each row in job.sourceRows (every dedup attach included)
             Meta->>Candidate: entriesRepo.upsert({path, type, hash, state_version})
             Meta->>Meta: dedupedObjects++; handledPaths.set(...); appliedCount++

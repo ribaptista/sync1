@@ -1238,6 +1238,7 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
       checksumCrc64Nvme: "crc-from-head",
     });
 
+    const updates: ProgressUpdate[] = [];
     const result = await applyLocalChangesToCandidate(
       candidateDb,
       [
@@ -1258,7 +1259,7 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
       silentLogger,
       new PQueue({ concurrency: 4 }),
       8,
-      undefined,
+      (u) => updates.push({ ...u }),
       undefined,
       true, // verifyRemote
     );
@@ -1271,6 +1272,12 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
     expect(result.dedupedObjects).toBe(1);
     expect(result.appliedCount).toBe(1);
     expect(result.handledPaths.get("recovered.txt")).toBe("v1");
+
+    // The bar must not stall short of its own total: this file's bytes
+    // were counted toward bytesTotal (expectBytes, at dispatch time) but
+    // never transferred, so skipBytes has to credit them back or the run
+    // would end short of 100% forever.
+    expect(updates.at(-1)).toMatchObject({ bytesDone: content.length, bytesTotal: content.length });
 
     const entriesRepo = new EntriesRepository(candidateDb);
     expect(entriesRepo.get("recovered.txt")?.hash).toBe(hash);
@@ -1285,6 +1292,115 @@ describe("applyLocalChangesToCandidate: verifyRemote", () => {
       // object there already had S3 confirm this value, so reading it back
       // is reading a proof, not assuming one.
       ciphertext_checksum: "crc-from-head",
+    });
+
+    candidateDb.close();
+  });
+
+  /**
+   * The symptom this whole fix was written for: a real recovery run
+   * reported "15.7 GB/~843 GB, 91944/~91946 files" -- the file count
+   * advanced as verifyRemote's HEAD checks resolved, but the byte count
+   * never did, because commit.ts's own pre-run estimate (passed in here
+   * as `estimatedTotals`, mirroring what `enumerateUploadWork` produces)
+   * already counted these bytes and nothing ever completed them. This
+   * reproduces that mid-run, not just at the final settle()-driven update,
+   * with a second file still genuinely uploading alongside the dedup hit.
+   */
+  it("credits a verifyRemote dedup's bytes against a pre-run estimate while a real upload is still in flight", async () => {
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v0", new Date().toISOString());
+    const dedupedContent = "already on S3 from a prior run";
+    const uploadingContent = "genuinely new, still uploading";
+    const dedupedHash = hashBufferHex(Buffer.from(dedupedContent));
+    touch("recovered.txt", dedupedContent);
+    touch("new.txt", uploadingContent);
+
+    // Keyed on the requested object, not indiscriminate: verifyRemote
+    // applies to *every* not-yet-known hash in the batch, so a HEAD mock
+    // that always returns a checksum would make new.txt resolve as a
+    // dedup too, and never call uploadObjectStream at all.
+    const dedupedKey = objectKey(dedupedHash);
+    headObjectMock.mockImplementation(async (_client: unknown, _bucket: unknown, key: string) =>
+      key.includes(dedupedKey) ? { etag: '"deadbeef"', checksumCrc64Nvme: "crc-from-head" } : null,
+    );
+
+    const upload = deferred<string>();
+    putObjectStreamMock.mockImplementation(
+      async (_client: unknown, _bucket: unknown, _key: unknown, body: AsyncIterable<unknown>) => {
+        for await (const _chunk of body) {
+          // draining is the point
+        }
+        return upload.promise;
+      },
+    );
+
+    const updates: ProgressUpdate[] = [];
+    const resultPromise = applyLocalChangesToCandidate(
+      candidateDb,
+      [
+        {
+          path: "recovered.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash: dedupedHash,
+          size: dedupedContent.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+        {
+          path: "new.txt",
+          type: "file" as const,
+          mtime: 1,
+          hash: hashBufferHex(Buffer.from(uploadingContent)),
+          size: uploadingContent.length,
+          state: "created" as const,
+          parent_state_version: "v0",
+        },
+      ],
+      root,
+      Buffer.alloc(32),
+      "v1",
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      (u) => updates.push({ ...u }),
+      // Mirrors what commit.ts's enumerateUploadWork would have counted
+      // before this run started -- neither file is in objectsRepo yet,
+      // so both files' bytes are in the pre-run estimate, exactly like
+      // the real ~843 GB total that never moved.
+      { files: 2, bytes: dedupedContent.length + uploadingContent.length },
+      true, // verifyRemote
+    );
+
+    // Let the dedup resolve while new.txt's upload is still deliberately
+    // held open.
+    const deadline = Date.now() + 2000;
+    while (!updates.some((u) => u.bytesDone >= dedupedContent.length) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const midRun = updates.at(-1);
+    // The whole point: these bytes are already credited, mid-run -- not
+    // held back until the very end the way the bug left them. Checked
+    // before new.txt's deliberately-held-open upload promise is ever
+    // resolved, so this can only be the deduped file's own credit, not
+    // something settle() backfilled after the fact.
+    expect(midRun?.bytesDone).toBeGreaterThanOrEqual(dedupedContent.length);
+    expect(midRun?.bytesTotal).toBe(dedupedContent.length + uploadingContent.length);
+    // The run genuinely isn't over yet -- settle() (which always runs
+    // last) is what flips this, and it can't have run while new.txt's
+    // own upload is still deliberately stuck.
+    expect(midRun?.totalsFinal).toBe(false);
+
+    upload.resolve("fake-checksum");
+    const result = await resultPromise;
+
+    expect(result.dedupedObjects).toBe(1);
+    expect(result.uploadedObjects).toBe(1);
+    expect(updates.at(-1)).toMatchObject({
+      bytesDone: dedupedContent.length + uploadingContent.length,
+      bytesTotal: dedupedContent.length + uploadingContent.length,
     });
 
     candidateDb.close();
@@ -1546,6 +1662,7 @@ describe("applyLocalChangesToCandidate: verifyRemote HEAD checks run concurrentl
       },
     ];
 
+    const updates: ProgressUpdate[] = [];
     const resultPromise = applyLocalChangesToCandidate(
       candidateDb,
       dirtyRows,
@@ -1556,7 +1673,7 @@ describe("applyLocalChangesToCandidate: verifyRemote HEAD checks run concurrentl
       silentLogger,
       new PQueue({ concurrency: 4 }),
       8,
-      undefined,
+      (u) => updates.push({ ...u }),
       undefined,
       true, // verifyRemote
     );
@@ -1576,6 +1693,12 @@ describe("applyLocalChangesToCandidate: verifyRemote HEAD checks run concurrentl
     expect(result.handledPaths.get("b.txt")).toBe("v1");
     const objectsRepo = new ObjectsRepository(candidateDb);
     expect(objectsRepo.get(hash)?.ciphertext_checksum).toBe("crc-from-head");
+
+    // Only a.txt (the dispatcher) ever called expectBytes -- b.txt's
+    // attach contributes 0 bytes of its own, same as an ordinary dedup
+    // attach on an upload job. skipBytes must therefore run once per job,
+    // not once per sourceRow, or this would overshoot bytesTotal.
+    expect(updates.at(-1)).toMatchObject({ bytesDone: content.length, bytesTotal: content.length });
 
     candidateDb.close();
   });
