@@ -1,8 +1,10 @@
 # `sync1 thumbnail_policy`
 
 Manages **global thumbnail-generation policies**: a glob pattern (real `**` support — see
-[thumbnails.md](../architecture/thumbnails.md)) paired with a mime-type filter and a `skip`/`generate`
-disposition. Like `storage_policy`/`ignore`, these live in `state.db` — shared and versioned, so every
+[thumbnails.md](../architecture/thumbnails.md)) and a `skip`/`generate` disposition. A `generate` policy
+also carries a mime-type filter, since it needs to know which of the probed mime types its sizing/encoding
+actually applies to; a `skip` policy matches by glob alone — see "`--mime-types`" below. Like
+`storage_policy`/`ignore`, these live in `state.db` — shared and versioned, so every
 machine agrees on the same rules. Unlike `storage_policy`, there is **no mandatory default row**: a path
 matching no policy at all is simply not a thumbnail candidate. Unlike `storage_policy`, there is also
 **no priority**: every matching `generate` policy produces its own thumbnail, not just the "best" one —
@@ -75,18 +77,21 @@ carries over from the existing row (when the branch/mime is unchanged) or must b
 most browsers' clamping of a near-zero stored delay make the requested delay meaningless. GIF also
 rounds any delay to the nearest 10ms when stored (`33` → 30ms); animated WebP stores the value exactly.
 
-`create`/`edit` validate the `skip`/`generate`/media-type/sizing-branch/encoding combination before
-touching the network: a `skip` policy must not set `--media-type`, `--resizing-strategy`, `--output-type`,
-`--output-mime`, or any generation/encoding flag; a `generate` policy must set `--media-type`, then (for
-`image`) `--resizing-strategy` or (for `video`) `--output-type`, then `--output-mime` (legal for that
-sizing branch), then exactly that branch's own sizing and encoding fields and none of the other
-branches'/mimes'. `edit` re-validates the _merged_ result, so switching `--action generate` to
-`--action skip` (or back), switching `--media-type` (image↔video), switching `--resizing-strategy`/
-`--output-type` within a media type, or switching `--output-mime`, must also supply/clear the relevant
-fields as needed — a media-type switch also requires resupplying `--mime-types` to match the new type. A
-field survives a branch switch whenever the _new_ branch also uses it: `--shorter-side` survives any
-switch except one landing on `fit_to_box`; an encoding field (`--jpeg-quality`, etc.) survives any switch
-that leaves `--output-mime` unchanged.
+`create`/`edit` validate the `skip`/`generate`/mime-types/media-type/sizing-branch/encoding combination
+before touching the network: a `skip` policy must not set `--mime-types`, `--media-type`,
+`--resizing-strategy`, `--output-type`, `--output-mime`, or any generation/encoding flag — it matches by
+glob alone; a `generate` policy must set `--mime-types`, then `--media-type`, then (for `image`)
+`--resizing-strategy` or (for `video`) `--output-type`, then `--output-mime` (legal for that sizing
+branch), then exactly that branch's own sizing and encoding fields and none of the other branches'/mimes'.
+`edit` re-validates the _merged_ result, so switching `--action generate` to `--action skip` (or back),
+switching `--media-type` (image↔video), switching `--resizing-strategy`/`--output-type` within a media
+type, or switching `--output-mime`, must also supply/clear the relevant fields as needed — switching from
+`skip` to `generate` requires supplying `--mime-types` for the first time (a `skip` row never has one);
+switching from `generate` to `skip` drops whatever `--mime-types` the row had, even if `--mime-types` is
+also passed in that same `edit` call; a media-type switch (while staying `generate`) also requires
+resupplying `--mime-types` to match the new type. A field survives a branch switch whenever the _new_
+branch also uses it: `--shorter-side` survives any switch except one landing on `fit_to_box`; an encoding
+field (`--jpeg-quality`, etc.) survives any switch that leaves `--output-mime` unchanged.
 
 ## Usage
 
@@ -148,20 +153,21 @@ replacing it: the next `ensure` regenerates under the new name, and the next `cl
 name's now-orphaned file.
 
 `--mime-types` is a comma-separated list, e.g. `"image/jpeg,video/*"` — the subtype half of any entry may
-be a literal `*` wildcard, nothing else is a wildcard here. Required on `create` (even for a `skip`
-policy — mime type still gates what a skip actually applies to). For a `generate` policy, every entry's
-_type_ segment (`image`/`video`, never wildcarded) must match `--media-type` — `image/jpeg,video/*` is
-never valid on the same `generate` row, since a `generate` policy is always exactly one media type or the
-other, never both (a `skip` row has no such restriction: it legitimately mixes types, e.g.
-`image/*,video/*`, since matching a skip never needs to know a media type at all). This is entirely about
-the _source_ mime filter, unrelated to `--output-mime`, which is what a `generate` policy _produces_.
+be a literal `*` wildcard, nothing else is a wildcard here. Required on `create` for a `generate` policy,
+**forbidden** for a `skip` policy: a `skip` policy matches by glob alone, with no mime filter at all — it
+excludes a path the moment its glob matches, before anything is ever probed to find out its mime type (see
+[thumbnails.md](../architecture/thumbnails.md)). For a `generate` policy, every entry's _type_ segment
+(`image`/`video`, never wildcarded) must match `--media-type` — `image/jpeg,video/*` is never valid on the
+same `generate` row, since a `generate` policy is always exactly one media type or the other, never both.
+This is entirely about the _source_ mime filter, unrelated to `--output-mime`, which is what a `generate`
+policy _produces_.
 
 ## Output
 
 A `generate` row's shape depends on its `mediaType` and, within that, its `resizingStrategy`/`outputType`
 (sizing) plus its `outputMime` (encoding) — each combination carries only its own fields (see the tables
-above). A `skip` row carries none of them, and no `mediaType`/`outputMime` at all. Every row always
-carries `name`:
+above). A `skip` row carries none of them, and no `mimeTypes`/`mediaType`/`outputMime` at all — it matches
+by glob alone, so there's nothing in that key set for it to have. Every row always carries `name`:
 
 ```json
 {
@@ -218,7 +224,6 @@ carries `name`:
       "name": "skip_private",
       "glob": "private/**",
       "action": "skip",
-      "mimeTypes": ["image/*", "video/*"],
       "createdAt": "2026-01-01T00:00:00.000Z"
     }
   ]
@@ -262,7 +267,7 @@ sync1 thumbnail_policy create "**/*.mp4" generate --root ~/Pictures \
   --output-mime image/gif --gif-max-colors 256 --gif-dither sierra2_4a --json
 
 sync1 thumbnail_policy create "private/**" skip --root ~/Pictures \
-  --name skip_private --mime-types "image/*,video/*" --json
+  --name skip_private --json
 
 sync1 thumbnail_policy list --root ~/Pictures --json
 ```

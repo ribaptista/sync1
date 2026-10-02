@@ -291,7 +291,40 @@ describe("thumbnail_policy command", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("creates a skip policy with no generate fields and no media type", async () => {
+  it("creates a skip policy with no generate fields, no media type, and no mime types -- it matches by glob only", async () => {
+    const root = await initVault(localstack);
+
+    const create = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "private/**",
+        "skip",
+        "--root",
+        root,
+        "--name",
+        "skip_private",
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(create.exitCode).toBe(0);
+
+    expect(readThumbnailPolicies(root)).toEqual([
+      {
+        ...NULL_GENERATE_FIELDS,
+        id: expect.any(Number) as number,
+        name: "skip_private",
+        glob: "private/**",
+        action: "skip",
+        mime_types: null,
+      },
+    ]);
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("rejects --mime-types on a skip policy -- it matches by glob only", async () => {
     const root = await initVault(localstack);
 
     const create = await runCli(
@@ -310,18 +343,51 @@ describe("thumbnail_policy command", () => {
       ],
       { env: { SYNC1_PASSWORD: PASSWORD } },
     );
-    expect(create.exitCode).toBe(0);
+    expect(create.exitCode).not.toBe(0);
+    expect(JSON.parse(create.stdout) as { ok: boolean; error: string }).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("can't set --mime-types") as unknown as string,
+    });
+    expect(readThumbnailPolicies(root)).toEqual([]);
 
-    expect(readThumbnailPolicies(root)).toEqual([
-      {
-        ...NULL_GENERATE_FIELDS,
-        id: expect.any(Number) as number,
-        name: "skip_private",
-        glob: "private/**",
-        action: "skip",
-        mime_types: JSON.stringify(["image/*", "video/*"]),
-      },
-    ]);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("rejects a 'generate' policy with no --mime-types", async () => {
+    const root = await initVault(localstack);
+
+    const create = await runCli(
+      [
+        "thumbnail_policy",
+        "create",
+        "**/*.jpg",
+        "generate",
+        "--root",
+        root,
+        "--name",
+        "img_thumb",
+        "--media-type",
+        "image",
+        "--resizing-strategy",
+        "fit_to_box",
+        "--image-width",
+        "320",
+        "--image-height",
+        "240",
+        "--output-mime",
+        "image/jpeg",
+        "--jpeg-quality",
+        "80",
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    expect(create.exitCode).not.toBe(0);
+    expect(JSON.parse(create.stdout) as { ok: boolean; error: string }).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("needs --mime-types") as unknown as string,
+    });
+    expect(readThumbnailPolicies(root)).toEqual([]);
 
     fs.rmSync(root, { recursive: true, force: true });
   });
@@ -566,8 +632,6 @@ describe("thumbnail_policy command", () => {
         root,
         "--name",
         "p1",
-        "--mime-types",
-        "image/jpeg",
         "--jpeg-quality",
         "80",
         "--json",
@@ -667,8 +731,6 @@ describe("thumbnail_policy command", () => {
         root,
         "--name",
         "has-a-dash",
-        "--mime-types",
-        "image/jpeg",
         "--json",
       ],
       { env: { SYNC1_PASSWORD: PASSWORD } },

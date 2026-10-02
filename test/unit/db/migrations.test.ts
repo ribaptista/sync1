@@ -65,6 +65,7 @@ describe("migration runner", () => {
       { filename: "0009_thumbnail_output_mime_and_encoding.sql" },
       { filename: "0010_add_entry_deletions.sql" },
       { filename: "0011_object_ciphertext_checksum_not_null.sql" },
+      { filename: "0012_thumbnail_skip_glob_only.sql" },
     ]);
 
     // Running again must not error (e.g. re-executing CREATE TABLE) and must
@@ -144,11 +145,13 @@ describe("migration runner", () => {
      */
     function dirWithout0011(): string {
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-mig-"));
-      const files = fs
-        .readdirSync(STATE_MIGRATIONS_DIR)
-        .filter((f) => f.endsWith(".sql") && f < "0011");
-      // Guards against a future 0012 quietly making this a no-op subset.
-      expect(files.length).toBe(fs.readdirSync(STATE_MIGRATIONS_DIR).length - 1);
+      const allSqlFiles = fs.readdirSync(STATE_MIGRATIONS_DIR).filter((f) => f.endsWith(".sql"));
+      const files = allSqlFiles.filter((f) => f < "0011");
+      // Guards against this filter quietly becoming a no-op subset (e.g.
+      // every migration happening to sort before "0011") -- deliberately
+      // not an exact count, which a later migration (0012, 0013, ...)
+      // would otherwise have to keep bumping for no real coverage gain.
+      expect(files.length).toBeLessThan(allSqlFiles.length);
       for (const f of files) {
         fs.copyFileSync(path.join(STATE_MIGRATIONS_DIR, f), path.join(tmp, f));
       }
@@ -236,6 +239,176 @@ describe("migration runner", () => {
       // restores it in a `finally`, so a failed migration can't leave the
       // connection silently unprotected.
       expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+    });
+  });
+
+  /**
+   * Unlike 0007-0009's own thumbnail_policies reshapes, this one migrates
+   * real data: production vaults now have configured 'skip' rows, each
+   * carrying a mime_types filter that was always redundant for 'skip' --
+   * see src/db/repositories/thumbnail-policies-repository.ts's own
+   * Generate<> doc comment.
+   */
+  describe("0012: thumbnail_policies.mime_types nullable, skip-matches-by-glob-only CHECK", () => {
+    function dirWithout0012(): string {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-mig-"));
+      const allSqlFiles = fs.readdirSync(STATE_MIGRATIONS_DIR).filter((f) => f.endsWith(".sql"));
+      const files = allSqlFiles.filter((f) => f < "0012");
+      expect(files.length).toBeLessThan(allSqlFiles.length);
+      for (const f of files) {
+        fs.copyFileSync(path.join(STATE_MIGRATIONS_DIR, f), path.join(tmp, f));
+      }
+      return tmp;
+    }
+
+    function seededPre0012(): Database.Database {
+      const db = new Database(":memory:");
+      runMigrations(db, dirWithout0012());
+      db.prepare(
+        `INSERT INTO thumbnail_policies (name, glob, action, mime_types, created_at)
+         VALUES ('skip_private', 'private/**', 'skip', ?, 'now')`,
+      ).run(JSON.stringify(["image/*", "video/*"]));
+      return db;
+    }
+
+    it("nulls an existing skip row's mime_types and leaves the column nullable", () => {
+      const db = seededPre0012();
+      runMigrations(db, STATE_MIGRATIONS_DIR);
+
+      const mimeTypesColumn = db
+        .prepare<[], { name: string; notnull: number }>("PRAGMA table_info(thumbnail_policies)")
+        .all()
+        .find((c) => c.name === "mime_types");
+      expect(mimeTypesColumn?.notnull).toBe(0);
+      expect(db.prepare("SELECT name, action, mime_types FROM thumbnail_policies").all()).toEqual([
+        { name: "skip_private", action: "skip", mime_types: null },
+      ]);
+    });
+
+    interface RawGenerateColumns {
+      media_type: string | null;
+      resizing_strategy: string | null;
+      image_width: number | null;
+      image_height: number | null;
+      shorter_side: number | null;
+      output_type: string | null;
+      tile_row_count: number | null;
+      tile_column_count: number | null;
+      frame_count: number | null;
+      frame_delay_ms: number | null;
+      output_mime: string | null;
+      jpeg_quality: number | null;
+      png_compression_level: number | null;
+      webp_quality: number | null;
+      webp_lossless: number | null;
+      gif_max_colors: number | null;
+      gif_dither: string | null;
+    }
+
+    /** A full, otherwise-valid 'generate'/image/fit_to_box/jpeg row's own column values -- varied only by `mimeTypes` below, so a rejection can only be attributed to the one clause under test, never to some other, unrelated missing field. */
+    const VALID_GENERATE_COLUMNS: RawGenerateColumns = {
+      media_type: "image",
+      resizing_strategy: "fit_to_box",
+      image_width: 100,
+      image_height: 100,
+      shorter_side: null,
+      output_type: null,
+      tile_row_count: null,
+      tile_column_count: null,
+      frame_count: null,
+      frame_delay_ms: null,
+      output_mime: "image/jpeg",
+      jpeg_quality: 80,
+      png_compression_level: null,
+      webp_quality: null,
+      webp_lossless: null,
+      gif_max_colors: null,
+      gif_dither: null,
+    };
+
+    function insertRawPolicy(
+      db: Database.Database,
+      name: string,
+      action: "skip" | "generate",
+      mimeTypes: string[] | null,
+      generateColumns: RawGenerateColumns,
+    ): void {
+      db.prepare(
+        `INSERT INTO thumbnail_policies (
+          name, glob, action, mime_types, media_type, resizing_strategy, image_width, image_height,
+          shorter_side, output_type, tile_row_count, tile_column_count, frame_count, frame_delay_ms,
+          output_mime, jpeg_quality, png_compression_level, webp_quality, webp_lossless,
+          gif_max_colors, gif_dither, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        name,
+        "a/**",
+        action,
+        mimeTypes ? JSON.stringify(mimeTypes) : null,
+        generateColumns.media_type,
+        generateColumns.resizing_strategy,
+        generateColumns.image_width,
+        generateColumns.image_height,
+        generateColumns.shorter_side,
+        generateColumns.output_type,
+        generateColumns.tile_row_count,
+        generateColumns.tile_column_count,
+        generateColumns.frame_count,
+        generateColumns.frame_delay_ms,
+        generateColumns.output_mime,
+        generateColumns.jpeg_quality,
+        generateColumns.png_compression_level,
+        generateColumns.webp_quality,
+        generateColumns.webp_lossless,
+        generateColumns.gif_max_colors,
+        generateColumns.gif_dither,
+        "now",
+      );
+    }
+
+    const ALL_NULL_GENERATE_COLUMNS: RawGenerateColumns = {
+      media_type: null,
+      resizing_strategy: null,
+      image_width: null,
+      image_height: null,
+      shorter_side: null,
+      output_type: null,
+      tile_row_count: null,
+      tile_column_count: null,
+      frame_count: null,
+      frame_delay_ms: null,
+      output_mime: null,
+      jpeg_quality: null,
+      png_compression_level: null,
+      webp_quality: null,
+      webp_lossless: null,
+      gif_max_colors: null,
+      gif_dither: null,
+    };
+
+    it("rejects a 'skip' row with mime types -- otherwise fully valid, so only the new clause can be at fault", () => {
+      const db = new Database(":memory:");
+      runMigrations(db, STATE_MIGRATIONS_DIR);
+      expect(() =>
+        insertRawPolicy(db, "bad_skip", "skip", ["image/*"], ALL_NULL_GENERATE_COLUMNS),
+      ).toThrow(/CHECK constraint failed/);
+      // The same row with no mime types at all succeeds, confirming the
+      // rejection above was really about mime_types and not some other
+      // column this skip row also sets.
+      expect(() =>
+        insertRawPolicy(db, "ok_skip", "skip", null, ALL_NULL_GENERATE_COLUMNS),
+      ).not.toThrow();
+    });
+
+    it("rejects a 'generate' row with no mime types -- otherwise fully valid", () => {
+      const db = new Database(":memory:");
+      runMigrations(db, STATE_MIGRATIONS_DIR);
+      expect(() =>
+        insertRawPolicy(db, "bad_generate", "generate", null, VALID_GENERATE_COLUMNS),
+      ).toThrow(/CHECK constraint failed/);
+      expect(() =>
+        insertRawPolicy(db, "ok_generate", "generate", ["image/jpeg"], VALID_GENERATE_COLUMNS),
+      ).not.toThrow();
     });
   });
 });
