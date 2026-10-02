@@ -30,21 +30,35 @@ sequenceDiagram
     CLI->>Estimate: start enumerateThumbnailWork -- NOT awaited (same shape as flow-enumeration-pass.md,<br/>but hand-rolled here rather than sharing that helper)
 
     loop each file under walkRoot (or --glob's literal-prefix subtree)
-        Main->>Main: skip: under _thumbnail/, doesn't match --glob,<br/>matches an ignore policy, or no thumbnail policy's glob matches at all
-        Main->>Main: shouldProcessSource(mode, hash, policies)
-        alt mode=ensure AND already has every expected thumbnail file
-            Main->>Main: stats.upToDate++ per matching policy already present; skip
-        else representation = "stub"
-            Main->>Main: processStubSource(...) -- see below, fully synchronous, no pool
-        else representation = "real" or "both" (dangling stub)
-            Main->>Pool: waitForRoom; dispatchTracked(job) -- see below
+        Main->>Main: skip: under _thumbnail/, doesn't match --glob, or matches an ignore policy
+        alt hasMatchingSkipGlob(path, policies) -- wins outright, glob alone, no probe
+            Main->>Main: representation=stub: processStubSource(...) (unchanged, just not counted)
+            Main->>Main: representation=real/both: discardThumbnailsFor(...) -- toDelete++ per existing<br/>sibling thumbnail (deleted only in cleanup); NOT counted as a progress unit either way
+        else no thumbnail policy's glob matches at all
+            Main->>Main: skip (not a candidate)
+        else shouldProcessSource(mode, hash, policies)
+            alt mode=ensure AND already has every expected thumbnail file
+                Main->>Main: stats.upToDate++ per matching policy already present; skip
+            else representation = "stub"
+                Main->>Main: discoveredOne(); processStubSource(...) -- see below, fully synchronous, no pool; completedOne()
+            else representation = "real" or "both" (dangling stub)
+                Main->>Main: discoveredOne()
+                Main->>Pool: waitForRoom; dispatchTracked(job) -- see below; completedOne() in job's finally
+            end
         end
     end
 
     Main->>Pool: await pool.onIdle(); throwIfPoolErrored()
-    Main->>Sweep: sweepUnprocessedThumbnails -- a THIRD walk, for existing _thumbnail/<br/>entries whose original no longer exists or was excluded by glob/ignore/policy
+    Main->>Sweep: sweepUnprocessedThumbnails -- a THIRD walk, for existing _thumbnail/<br/>entries whose original no longer exists or was excluded by glob/ignore/policy<br/>(isSweepOrphan, the inverse of the old sourceWasProcessed check)
+    Note over Sweep: mode=cleanup: discoveredOne()/completedOne() per orphan (real, countable work --<br/>removeIfCleanup actually deletes). mode=ensure/state: stats.toDelete++ only, no progress-unit cost<br/>(removeIfCleanup is a no-op there) -- see #40
     CLI->>Estimate: control.stop = true; await estimation
 ```
+
+`enumerateThumbnailWork` mirrors every one of these gates with zero I/O beyond what it already does
+(`hasMatchingSkipGlob` before `shouldProcessSource`, same order as the real walk), so its estimate never
+counts a skip-glob match either, and -- under `cleanup` only -- separately predicts the sweep's own
+prospective orphans via the same `isSweepOrphan` check, so its total matches `cleanup`'s real final total
+from the start instead of growing once the sweep runs. See #29/#40.
 
 ## Sequence — per-source dispatch
 
@@ -66,15 +80,13 @@ sequenceDiagram
         else thumbnails exist but none match the stub's hash
             Job->>Job: every one -> stats.staleStubPreviews.push(...) -- NEVER auto-deleted<br/>unless mode=cleanup AND --delete-stale-stub-previews
         end
-    else real/dangling-both source (dispatched to the pool)
+    else real/dangling-both source (dispatched to the pool -- a skip-glob match never reaches here,<br/>resolved inline in the main loop before dispatch, see the orchestration diagram above)
         Job->>Prober: classifyProbed -> prober.detectMedia(absolutePath)
         alt unreadable
             Recon->>Recon: stats.unreadable++ -- logged, existing thumbnails left untouched (never swept)
-        else readable, but no policy's glob+mimeType matches
-            Recon->>FS: every existing thumbnail for this original -> stats.toDelete++ (cleanup only)
-        else resolution.action = "skip"
-            Recon->>FS: every existing thumbnail -> stats.toDelete++ (cleanup only)
-        else resolution.action = "generate" (one or more policies matched)
+        else readable, but no 'generate' policy's glob+mimeType matches (resolvePolicies only<br/>ever returns a 'generate' match now -- 'skip' is resolved before this is ever reached)
+            Recon->>FS: discardThumbnailsFor -- every existing thumbnail for this original -><br/>stats.toDelete++ (deleted only in cleanup)
+        else one or more 'generate' policies matched
             alt decision.cacheHash === null (no cache.db row at all)
                 Recon->>Recon: stats.missingCacheEntry++
             else
@@ -156,6 +168,20 @@ non-empty (an unregenerable preview sitting there, needing a human decision).
   concurrently with the authoritative walk, same pattern as
   [`flow-enumeration-pass.md`](flow-enumeration-pass.md) (hand-rolled here rather than sharing that
   exact helper, since thumbnail's own per-row predicate differs).
+- **A skip-glob match is resolved inline, in the main loop itself, before dispatch** —
+  `hasMatchingSkipGlob` wins outright over any coexisting generate match (same precedent as
+  `resolvePolicies`'s own skip-wins-outright rule), costing nothing beyond the glob match itself: no
+  `prober.detectMedia()` call, and not counted as a progress unit in either walk. A real file's existing
+  sibling thumbnails are cleared via `discardThumbnailsFor` (shared with the "no 'generate' policy
+  matches" branch below); a stub still goes through `processStubSource` unchanged, just uncounted. See
+  #29/#40 for the bug this fixed (a skip-matched tree used to be fully probed, and the estimate
+  undercounted by however many such files existed).
+- **The trailing orphan sweep only costs a progress unit under `cleanup`** — `ensure`/`state` still
+  tally `stats.toDelete` for every orphan `isSweepOrphan` finds, but never call `discoveredOne`/
+  `completedOne` for one, since `removeIfCleanup` is a no-op in those modes and counting a unit for zero
+  real work is what used to make the bar's total keep growing right as a run looked finished (#40). The
+  estimate walk mirrors this: it predicts `cleanup`'s own prospective orphans (same `isSweepOrphan`
+  check, no extra I/O), but never does for `ensure`/`state`.
 - **A stale stub preview is never auto-deleted**, even under `cleanup`, unless
   `--delete-stale-stub-previews` is also passed. It is the _last remaining copy_ of a preview whose
   source can no longer be read (a stub, by definition) to regenerate from — deleting it destroys

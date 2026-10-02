@@ -11,15 +11,21 @@ tracked file, so a user can browse _content_, not just names, without ever mater
 ## `thumbnail_policy`: deciding what gets a thumbnail
 
 `thumbnail_policy` (table `thumbnail_policies` in `state.db`, global and versioned like `storage_policy`
-and `ignore_policies`) pairs a glob with a mime-type filter and a `skip`/`generate` disposition. Unlike
-`storage_policy`, there is **no mandatory default row** — a path matching no policy glob at all is simply
-not a thumbnail candidate, the overwhelmingly common case for most of a tree. Unlike `storage_policy`,
-there is also **no priority** — every matching `generate` row produces its own thumbnail, not just the
-"best" one. Resolution, in order:
+and `ignore_policies`) pairs a glob with a `skip`/`generate` disposition; a `generate` row also carries a
+mime-type filter (see "Matching" below for why a `skip` row doesn't). Unlike `storage_policy`, there is
+**no mandatory default row** — a path matching no policy glob at all is simply not a thumbnail candidate,
+the overwhelmingly common case for most of a tree. Unlike `storage_policy`, there is also **no priority**
+— every matching `generate` row produces its own thumbnail, not just the "best" one. Resolution, in order:
 
 1. Any matching `skip` row wins outright — monotonic OR, no priority needed among skips, exactly like
    `ignore_policies` (see [ignore-and-storage-policies.md](ignore-and-storage-policies.md)) — and
-   suppresses generation from _every_ matching `generate` row, not just the "closest" one.
+   suppresses generation from _every_ matching `generate` row, not just the "closest" one. Resolved from
+   the glob alone, with **no media probe at all**: `scanThumbnails`' main loop checks
+   `hasMatchingSkipGlob` before a real file is ever dispatched for probing, so a skip-matched source costs
+   nothing beyond a glob match, however many files its glob covers (see "One shared scan, three modes"
+   below, and #29/#40 for the bug this fixed — a skip-matched tree used to be fully probed with
+   `identify`/`ffprobe` just to be told to skip it, which also made the progress bar's own estimate
+   undercount by however many such files existed).
 2. Otherwise, **every** matching `generate` row generates its own thumbnail (`resolvePolicies` in
    `src/fs/thumbnail.ts`), each one distinguished in the resulting filename by its policy's own `name`
    (see "Naming convention" below) — two overlapping policies for the same file are not a conflict to
@@ -36,10 +42,18 @@ name's now-unclaimed file) and one regeneration (the new name's fresh one), whic
 only way to react to a rename it has no other way to detect (see "Naming convention" below for how the
 name is recovered from an existing filename without needing to parse out any of the other fields).
 
-"Matching" requires **both** the glob and the mime-type filter to match — a `skip`/`generate` row's
-`mime_types` column (e.g. `["image/jpeg", "video/*"]`, the second segment may be a literal `*` wildcard)
-is not optional decoration, so a policy can say "skip _videos_ under `private/**`, but leave images
-there alone."
+"Matching" a `generate` row requires **both** the glob and the mime-type filter — its `mime_types`
+column (e.g. `["image/jpeg", "video/*"]`, the second segment may be a literal `*` wildcard) is not
+optional decoration, so one policy can target `image/jpeg` under a glob while another, separate policy
+targets `video/*` under the same glob, with different sizing/encoding for each. A `skip` row has no
+`mime_types` at all (`NULL`, enforced by a `CHECK` tying the two together) — it matches by **glob
+alone**, deliberately: unlike a `generate` row, a `skip` row's whole point is to be resolvable without
+ever needing to know a mime type, so it never costs a media probe (see point 1 above). An earlier design
+let a `skip` row carry a mime filter too (e.g. "skip _videos_ under `private/**`, but leave images there
+alone") — removed because it couldn't be honored without probing every glob-matched file first, which
+defeated the entire reason to write a broad `skip` glob (excluding a whole subtree cheaply) in the first
+place. The same effect is available today by giving the glob itself the narrower, file-type-specific
+shape instead (`private/**/*.{mp4,mov}` rather than `private/**` + a video-only mime filter).
 
 A `generate` row is also always **exactly one media type or the other**, via a `media_type` column
 (`image` or `video`, `NULL` for a `skip` row) — no policy carries fields belonging to the other type.
@@ -94,7 +108,10 @@ distributive mapped type — `Generate<A|B, C|D>` produces the genuine flat unio
 not a union nested inside an intersection, so ordinary discriminant narrowing on `resizingStrategy`/
 `outputType`/`outputMime` behaves exactly as ​it would for a hand-written union) rather than a hand-written
 14-arm union repeating every field across every arm that has it — a future fifth encoding format is one
-new declaration, not four new arms. `SIZING_FIELDS`/`ENCODING_FIELDS` (exported from the repository,
+new declaration, not four new arms. `mimeTypes` itself lives inside `Generate<>`, not on the shared base
+every row has — mirroring the schema, a `skip` row's type has no `mimeTypes` property at all, not merely
+an empty/null one, so `ThumbnailPolicyCreateInput`'s `skip` branch requires nothing but `name`/`glob` for
+free from the type system alone. `SIZING_FIELDS`/`ENCODING_FIELDS` (exported from the repository,
 reused verbatim by the CLI's own pre-network validation rather than duplicated) are the single source of
 truth for which fields belong to which axis value. Every `mimeTypes` entry's own type segment
 (`image`/`video`, never wildcarded) is validated to match a `generate` row's `mediaType`, which is what
@@ -288,16 +305,22 @@ this doesn't depend on probing either.
 (`scanThumbnails` in `src/fs/thumbnail.ts`). A fast advisory walk runs concurrently with the real walk.
 It only matches globs, reads a source's cache hash, derives deterministic expected thumbnail paths, and
 checks whether those paths exist; it never calls `identify` or `ffprobe`. Its count is therefore an
-estimate, rendered with `~`, and may include a source the later MIME check rejects.
+estimate, rendered with `~`, settling to the real walk's own total once both finish (see "Parallelism"
+below for exactly what each walk counts, and why they now agree).
 
-The real walk repeats the cheap filters and dispatches one bounded job per source. Before either
-classification path, a candidate matching any `ignore_policies` glob (`IgnorePoliciesRepository.listGlobs()`,
-same cheap in-memory pre-filter, same precedent as `update_cache`/`apply-remote-changes.ts` — see
+The real walk repeats the cheap filters, then resolves a skip-glob match immediately, from its glob
+alone (`hasMatchingSkipGlob`) -- no MIME probe, no dispatch, not counted as a unit. Everything else is
+dispatched as one bounded job per source. Before either classification path, a candidate matching any
+`ignore_policies` glob (`IgnorePoliciesRepository.listGlobs()`, same cheap in-memory pre-filter, same
+precedent as `update_cache`/`apply-remote-changes.ts` — see
 [ignore-and-storage-policies.md](ignore-and-storage-policies.md#what-matching-actually-gates)) is skipped
-outright. A real (or "both", real-with-dangling-stub) entry is then MIME-probed and policy-resolved
-inside its bounded job. That same job streams only the source's sibling `_thumbnail` directory and
-immediately generates, reports, or deletes as the selected mode requires. A stub is reconciled without
-probing. No whole-tree decision, generation-job, or existing-thumbnail collection is retained.
+outright. A real (or "both", real-with-dangling-stub) entry reaching a job is then MIME-probed and
+policy-resolved inside it -- by this point a 'generate' match is the only kind `resolvePolicies` can
+still produce, skip having already been resolved earlier. That same job streams only the source's
+sibling `_thumbnail` directory and immediately generates, reports, or deletes as the selected mode
+requires. A stub is reconciled without probing (and, for a skip match, without being counted as a unit
+either, same as a real file). No whole-tree decision, generation-job, or existing-thumbnail collection is
+retained.
 
 A "both"/real candidate reconciles **once per matching
 `generate` policy**, independently — an original matching two policies is decided twice, against the
@@ -311,13 +334,15 @@ same `existing` list, each decision keyed by that one policy's own name (see "Na
   rest of its params segment is stale (and, again, a real file, not a stub — for a stub this is
   `stale_stub_previews` instead, see "Stubbed originals").
 - **to delete** — after every matching policy has claimed its own up-to-date or stale match, anything
-  left over in `existing` is unclaimed: a `skip`-matched original's entire existing set (every matching
-  `generate` row is suppressed at once, so nothing is ever claimed for a skip-matched original), _or_ an
-  existing thumbnail naming a policy that no longer matches this original at all (deleted, renamed, or
-  its glob/mime-type edited away), _or_ its original was deleted/renamed, _or_ it simply fell outside
-  this run's own `--glob` (a narrower `--glob` than usual will flag out-of-scope-but-visited thumbnails
-  as orphans — a deliberate, documented consequence of scoping by directory, not a bug), _or_ it's a
-  genuine leftover duplicate alongside a stub's preserved or up-to-date match.
+  left over in `existing` is unclaimed: an existing thumbnail naming a policy that no longer matches this
+  original at all (deleted, renamed, or its glob/mime-type edited away), _or_ it's a genuine leftover
+  duplicate alongside a stub's preserved or up-to-date match. (A `skip`-matched original's entire existing
+  set is handled earlier and separately, before this per-policy reconciliation ever runs at all — see
+  "One streaming algorithm, three modes" below — so it never reaches this bullet in the first place.) A
+  thumbnail also lands here when its original was deleted/renamed, or simply fell outside this run's own
+  `--glob` (a narrower `--glob` than usual will flag out-of-scope-but-visited thumbnails as orphans — a
+  deliberate, documented consequence of scoping by directory, not a bug) — but those are found by the
+  separate trailing sweep described there, not by this per-source reconciliation.
 - **stubbed original / stubbed preserved / stale stub previews** — see "Stubbed originals" above; a stub
   is never a to-generate/to-regenerate candidate.
 
@@ -502,10 +527,20 @@ unit for this command.
 
 All three modes use one source file as the progress unit, even when several policies produce several
 outputs for it. The advisory walk supplies the provisional denominator; the real walk raises that total
-as it discovers work and advances the numerator in each job's `finally`, including MIME/skip rejection
-and handled generation failure. Once all source and orphan work settles, the observed total replaces the
-estimate and the `~` disappears. `processing`/`processed` activity is shown for classification-only work;
-actual generation shows `generating <path>` and `generated <path>` immediately beside the bar.
+as it discovers work and advances the numerator in each job's `finally`. A skip-glob match is resolved
+inline, from its glob alone, in neither walk at all -- it's never real generation work to begin with
+(see "`thumbnail_policy`" above and #29/#40), so it's never counted as a unit and never dispatched for
+probing. The one other source of growth, deliberately kept this way: the trailing orphan sweep (see
+"Reconciling existing thumbnails" below) only becomes real, countable work under `cleanup` -- `ensure`/
+`state` still tally an orphan into the final summary, but never move the bar for it, since
+`removeIfCleanup` is a no-op there and counting a unit for zero actual work is exactly what used to make
+the total keep growing right as a run looked finished. The advisory walk mirrors this: it predicts
+`cleanup`'s prospective orphans too, so its estimate matches `cleanup`'s own final total from the start,
+but never predicts one for `ensure`/`state`, where the sweep never counts one either. Once all counted
+work settles, the observed total replaces the estimate and the `~` disappears -- any remaining movement
+is ordinary estimate-vs-actual drift from the filesystem changing mid-run, not a systematic undercount.
+`processing`/`processed` activity is shown for classification-only work; actual generation shows
+`generating <path>` and `generated <path>` immediately beside the bar.
 
 Generation never writes directly to the deterministic thumbnail path. Each image, mosaic, or preview is
 written to an extension-preserving `sync1-tmp` sibling so ImageMagick/ffmpeg still infer the requested

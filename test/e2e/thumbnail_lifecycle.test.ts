@@ -157,8 +157,6 @@ describe("thumbnail lifecycle (end to end)", () => {
         root,
         "--name",
         "skip_secret",
-        "--mime-types",
-        "image/jpeg",
         "--json",
       ],
       { env: { SYNC1_PASSWORD: PASSWORD } },

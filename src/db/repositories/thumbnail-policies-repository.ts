@@ -24,7 +24,6 @@ interface Base {
   id: number;
   name: string;
   glob: string;
-  mimeTypes: string[];
   createdAt: string;
 }
 
@@ -79,10 +78,16 @@ type GifEncoding = { outputMime: "image/gif"; gifMaxColors: number; gifDither: T
  * a real `tsc --strict` compile before this file was written, including
  * that an illegal combination (e.g. `outputType: "mosaic"` with
  * `outputMime: "image/gif"`) is rejected at the type level.
+ *
+ * `mimeTypes` lives here, not on `Base` -- a 'skip' row matches by glob
+ * alone (see docs/architecture/thumbnails.md), so it carries no mime
+ * filter at all, not even an empty/wildcard one. Only a 'generate' row
+ * needs one, to know which of the probed mime types its sizing/encoding
+ * actually applies to.
  */
 type Generate<S, E> = S extends unknown
   ? E extends unknown
-    ? Base & { action: "generate" } & S & E
+    ? Base & { action: "generate"; mimeTypes: string[] } & S & E
     : never
   : never;
 
@@ -114,7 +119,8 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
  * frame's); `image/gif` is legal for a still image but not a mosaic (a
  * one-frame "animation" is strictly worse than any alternative), and
  * `image/jpeg`/`image/png` are legal for a still image or a mosaic but
- * never a preview (never animated) -- see `LEGAL_OUTPUT_MIMES`.
+ * never a preview (never animated) -- see `LEGAL_OUTPUT_MIMES`. `mimeTypes`
+ * is likewise 'generate'-only now, not a `Base` field -- see `Generate<>`.
  */
 export type ThumbnailPolicyRow =
   | (Base & { action: "skip" })
@@ -139,6 +145,7 @@ export interface ThumbnailPolicyUpdate {
   name?: string;
   glob?: string;
   action?: ThumbnailPolicyAction;
+  /** 'generate' only -- required when switching a 'skip' row to 'generate'; ignored (forced to null) when switching to 'skip'. */
   mimeTypes?: string[];
   mediaType?: ThumbnailPolicyMediaType;
   resizingStrategy?: ThumbnailResizingStrategy;
@@ -164,7 +171,8 @@ interface FlatPolicyFields {
   name: string;
   glob: string;
   action: ThumbnailPolicyAction;
-  mimeTypes: string[];
+  /** null for a 'skip' row, required for 'generate' -- see `Generate<>`'s own doc comment. */
+  mimeTypes: string[] | null;
   mediaType: ThumbnailPolicyMediaType | null;
   resizingStrategy: ThumbnailResizingStrategy | null;
   imageWidth: number | null;
@@ -300,11 +308,11 @@ function validateMimeTypes(mimeTypes: string[]): void {
  * This is what makes a matched policy's `mediaType` **provably** agree
  * with what actually got probed (policy resolution only ever returns a
  * policy whose `mimeTypes` matched the file's real, sniffed mime type) --
- * not just usually-true. Only meaningful for a 'generate' row; a 'skip'
- * row's `mimeTypes` legitimately mixes types (e.g. `["image/*",
- * "video/*"]"`), since matching it never needs a media type at all. Note
- * this is entirely about the *source* mime filter -- unrelated to
- * `outputMime`, which is what a 'generate' row *produces*.
+ * not just usually-true. Only ever called for a 'generate' row -- a
+ * 'skip' row has no `mimeTypes` at all now (see `Generate<>`), so there's
+ * nothing here to check for one. Note this is entirely about the *source*
+ * mime filter -- unrelated to `outputMime`, which is what a 'generate' row
+ * *produces*.
  */
 function validateMediaTypeMimeConsistency(
   mediaType: ThumbnailPolicyMediaType,
@@ -321,20 +329,24 @@ function validateMediaTypeMimeConsistency(
 }
 
 /**
- * Checks the action/media-type/resizing-strategy/output-type/output-mime/
- * generate-fields consistency invariant the `thumbnail_policies` table's
- * own three-way CHECK constraint (sizing, encoding, legality) also
- * enforces, but ahead of time with a friendly, field-naming error message.
- * A 'skip' row must have no media type, no output mime, and none of the
- * thirteen generate-only fields. A 'generate' row must pick a media type,
- * then (for 'image') a `resizingStrategy` or (for 'video') an
- * `outputType` -- together the SIZING branch -- then an `outputMime` legal
- * for that sizing branch (`LEGAL_OUTPUT_MIMES`) -- the ENCODING branch --
- * and carry exactly the union of both branches' own fields
- * (`SIZING_FIELDS` ∪ `ENCODING_FIELDS`) and no others.
+ * Checks the action/mime-types/media-type/resizing-strategy/output-type/
+ * output-mime/generate-fields consistency invariant the
+ * `thumbnail_policies` table's own CHECK constraints (mime-types-vs-
+ * action, sizing, encoding, legality) also enforce, but ahead of time
+ * with a friendly, field-naming error message. A 'skip' row matches by
+ * glob alone: no mime types, no media type, no output mime, and none of
+ * the thirteen generate-only fields. A 'generate' row needs mime types,
+ * then a media type, then (for 'image') a `resizingStrategy` or (for
+ * 'video') an `outputType` -- together the SIZING branch -- then an
+ * `outputMime` legal for that sizing branch (`LEGAL_OUTPUT_MIMES`) -- the
+ * ENCODING branch -- and carry exactly the union of both branches' own
+ * fields (`SIZING_FIELDS` ∪ `ENCODING_FIELDS`) and no others.
  */
 function validateActionConsistency(flat: FlatPolicyFields): void {
   if (flat.action === "skip") {
+    if (flat.mimeTypes != null) {
+      throw new Error("a 'skip' policy can't have mime types -- it matches by glob only");
+    }
     if (flat.mediaType != null) {
       throw new Error("a 'skip' policy can't have a media type");
     }
@@ -348,6 +360,9 @@ function validateActionConsistency(flat: FlatPolicyFields): void {
     return;
   }
 
+  if (flat.mimeTypes == null) {
+    throw new Error("a 'generate' policy needs mime types");
+  }
   if (flat.mediaType == null) {
     throw new Error("a 'generate' policy needs a media type");
   }
@@ -401,7 +416,7 @@ interface RawRow {
   name: string;
   glob: string;
   action: ThumbnailPolicyAction;
-  mime_types: string;
+  mime_types: string | null;
   media_type: ThumbnailPolicyMediaType | null;
   resizing_strategy: ThumbnailResizingStrategy | null;
   image_width: number | null;
@@ -456,7 +471,6 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
     id: row.id,
     name: row.name,
     glob: row.glob,
-    mimeTypes: JSON.parse(row.mime_types) as string[],
     createdAt: row.created_at,
   };
 
@@ -464,6 +478,9 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
     return { ...base, action: "skip" };
   }
 
+  // Non-null per the table's own CHECK tying 'generate' to a non-null
+  // mime_types -- see 0012's migration.
+  const mimeTypes = JSON.parse(row.mime_types!) as string[];
   const encoding = encodingFromRawRow(row);
 
   // Non-null assertions below rely on the table's own sizing CHECK
@@ -478,6 +495,7 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
       return {
         ...base,
         action: "generate",
+        mimeTypes,
         mediaType: "image",
         resizingStrategy: "fit_to_box",
         imageWidth: row.image_width!,
@@ -490,6 +508,7 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
     return {
       ...base,
       action: "generate",
+      mimeTypes,
       mediaType: "image",
       resizingStrategy: "resize_shorter_side",
       shorterSide: row.shorter_side!,
@@ -501,6 +520,7 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
     return {
       ...base,
       action: "generate",
+      mimeTypes,
       mediaType: "video",
       outputType: "mosaic",
       shorterSide: row.shorter_side!,
@@ -514,6 +534,7 @@ function fromRawRow(row: RawRow): ThumbnailPolicyRow {
   return {
     ...base,
     action: "generate",
+    mimeTypes,
     mediaType: "video",
     outputType: "preview",
     shorterSide: row.shorter_side!,
@@ -568,8 +589,11 @@ function flatEncodingFrom(
 
 /** The inverse of `fromRawRow`'s narrowing -- flattens a validated row back to the all-nullable shape `update()`'s merge and the SQL layer both need. */
 function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
-  const base = { name: row.name, glob: row.glob, mimeTypes: row.mimeTypes };
-  const empty: Omit<FlatPolicyFields, keyof typeof base | "action"> = {
+  const base = { name: row.name, glob: row.glob };
+  // null for 'skip' (no `mimeTypes` field at all on that branch), the
+  // row's own array for 'generate'.
+  const mimeTypes = row.action === "skip" ? null : row.mimeTypes;
+  const empty: Omit<FlatPolicyFields, keyof typeof base | "action" | "mimeTypes"> = {
     mediaType: null,
     resizingStrategy: null,
     imageWidth: null,
@@ -590,7 +614,7 @@ function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
   };
 
   if (row.action === "skip") {
-    return { ...base, ...empty, action: "skip" };
+    return { ...base, ...empty, action: "skip", mimeTypes };
   }
 
   const encoding = flatEncodingFrom(row);
@@ -601,6 +625,7 @@ function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
       ...empty,
       ...encoding,
       action: "generate",
+      mimeTypes,
       mediaType: "image",
       resizingStrategy: "fit_to_box",
       imageWidth: row.imageWidth,
@@ -613,6 +638,7 @@ function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
       ...empty,
       ...encoding,
       action: "generate",
+      mimeTypes,
       mediaType: "image",
       resizingStrategy: "resize_shorter_side",
       shorterSide: row.shorterSide,
@@ -624,6 +650,7 @@ function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
       ...empty,
       ...encoding,
       action: "generate",
+      mimeTypes,
       mediaType: "video",
       outputType: "mosaic",
       shorterSide: row.shorterSide,
@@ -636,6 +663,7 @@ function toFlatFields(row: ThumbnailPolicyRow): FlatPolicyFields {
     ...empty,
     ...encoding,
     action: "generate",
+    mimeTypes,
     mediaType: "video",
     outputType: "preview",
     shorterSide: row.shorterSide,
@@ -660,7 +688,12 @@ function flatFromCreateInput(input: ThumbnailPolicyCreateInput): FlatPolicyField
     name: input.name,
     glob: input.glob,
     action: input.action,
-    mimeTypes: input.mimeTypes,
+    // Not read off `input` directly like `name`/`glob`/`action` above --
+    // the skip branch of `ThumbnailPolicyCreateInput` has no `mimeTypes`
+    // field at all (see `Generate<>`), so it's only ever reachable
+    // through the same loose/untyped fallback every other optional field
+    // below already uses.
+    mimeTypes: loose.mimeTypes ?? null,
     mediaType: loose.mediaType ?? null,
     resizingStrategy: loose.resizingStrategy ?? null,
     imageWidth: loose.imageWidth ?? null,
@@ -733,8 +766,13 @@ export class ThumbnailPoliciesRepository {
     const flat = flatFromCreateInput(input);
     validateName(flat.name);
     validateActionConsistency(flat);
-    validateMimeTypes(flat.mimeTypes);
-    if (flat.mediaType) validateMediaTypeMimeConsistency(flat.mediaType, flat.mimeTypes);
+    // Guaranteed non-null for 'generate' (and null for 'skip') by the
+    // validateActionConsistency call just above -- see its own doc
+    // comment.
+    if (flat.action === "generate") {
+      validateMimeTypes(flat.mimeTypes!);
+      if (flat.mediaType) validateMediaTypeMimeConsistency(flat.mediaType, flat.mimeTypes!);
+    }
 
     const result = this.db
       .prepare<
@@ -742,7 +780,7 @@ export class ThumbnailPoliciesRepository {
           string,
           string,
           ThumbnailPolicyAction,
-          string,
+          string | null,
           ThumbnailPolicyMediaType | null,
           ThumbnailResizingStrategy | null,
           number | null,
@@ -774,7 +812,7 @@ export class ThumbnailPoliciesRepository {
         flat.name,
         flat.glob,
         flat.action,
-        JSON.stringify(flat.mimeTypes),
+        flat.mimeTypes ? JSON.stringify(flat.mimeTypes) : null,
         flat.mediaType,
         flat.resizingStrategy,
         flat.imageWidth,
@@ -827,7 +865,19 @@ export class ThumbnailPoliciesRepository {
     const action = changes.action ?? old.action;
     const name = changes.name ?? old.name;
     const glob = changes.glob ?? old.glob;
-    const mimeTypes = changes.mimeTypes ?? old.mimeTypes;
+    // Mirrors every other field below: switching *to* 'skip' forces it to
+    // null regardless of what `old`/`changes` held (a skip row never has
+    // one -- see `Generate<>`); switching *to* 'generate' needs a real
+    // value, from `changes` or (staying 'generate') carried over from
+    // `old` -- never from an `old` that was 'skip', which never had one
+    // to carry. `validateActionConsistency` below is what turns "still
+    // null after all that, but the new action is 'generate'" into the
+    // friendly "needs mime types" error, the same way it already does
+    // for a missing `mediaType`.
+    const mimeTypes =
+      action === "skip"
+        ? null
+        : (changes.mimeTypes ?? (old.action === "generate" ? old.mimeTypes : null));
     const mediaType =
       action === "generate"
         ? (changes.mediaType ?? (old.action === "generate" ? old.mediaType : null))
@@ -884,8 +934,12 @@ export class ThumbnailPoliciesRepository {
 
     validateName(flat.name);
     validateActionConsistency(flat);
-    validateMimeTypes(flat.mimeTypes);
-    if (flat.mediaType) validateMediaTypeMimeConsistency(flat.mediaType, flat.mimeTypes);
+    // See the matching comment in create() -- guaranteed non-null for
+    // 'generate' (null for 'skip') by validateActionConsistency above.
+    if (flat.action === "generate") {
+      validateMimeTypes(flat.mimeTypes!);
+      if (flat.mediaType) validateMediaTypeMimeConsistency(flat.mediaType, flat.mimeTypes!);
+    }
 
     const result = this.db
       .prepare<
@@ -893,7 +947,7 @@ export class ThumbnailPoliciesRepository {
           string,
           string,
           ThumbnailPolicyAction,
-          string,
+          string | null,
           ThumbnailPolicyMediaType | null,
           ThumbnailResizingStrategy | null,
           number | null,
@@ -925,7 +979,7 @@ export class ThumbnailPoliciesRepository {
         flat.name,
         flat.glob,
         flat.action,
-        JSON.stringify(flat.mimeTypes),
+        flat.mimeTypes ? JSON.stringify(flat.mimeTypes) : null,
         flat.mediaType,
         flat.resizingStrategy,
         flat.imageWidth,

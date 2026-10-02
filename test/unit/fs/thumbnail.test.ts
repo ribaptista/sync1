@@ -105,8 +105,8 @@ function createGeneratePolicy(glob: string, overrides: Partial<typeof GENERATE_J
 const IMAGE_PARAMS = "p2-img-iw320-ih240-fmtimage_jpeg-q80";
 const VIDEO_PARAMS = "p2-vid-ss48-tr3-tc3-fmtimage_jpeg-q80";
 
-function createSkipPolicy(glob: string, mimeTypes = ["image/jpeg"], name = "skip"): number {
-  return policiesRepo.create({ name, glob, action: "skip", mimeTypes });
+function createSkipPolicy(glob: string, name = "skip"): number {
+  return policiesRepo.create({ name, glob, action: "skip" });
 }
 
 /** A path absent from `entries` probes as unreadable -- what a corrupt or unmappable source does. */
@@ -464,7 +464,7 @@ describe("scanThumbnails", () => {
     expect(fs.existsSync(path.join(root, "_thumbnail/photo.jpg.abc123.jpg"))).toBe(true);
   });
 
-  it("reports toDelete for a skip-matched original with an existing thumbnail, and only cleanup removes it", async () => {
+  it("reports toDelete for a skip-matched original with an existing thumbnail, and only cleanup removes it -- never probing the source (#29/#40)", async () => {
     createSkipPolicy("private/**");
     writeFile("private/secret.jpg");
     seedCache("private/secret.jpg", "abc");
@@ -483,9 +483,15 @@ describe("scanThumbnails", () => {
     expect(
       fs.existsSync(path.join(root, `private/_thumbnail/secret.jpg.${IMAGE_PARAMS}.abc.jpg`)),
     ).toBe(false);
+
+    // A skip-glob match is resolved on the spot, from its glob alone, in
+    // both ensure and cleanup -- never dispatched for probing. This is
+    // the bug #29/#40 fixed: a skip-matched tree used to be fully probed
+    // with identify/ffprobe just to be told to skip it.
+    expect(prober.detectMedia).not.toHaveBeenCalled();
   });
 
-  it("skip beats generate even when a generate policy also matches", async () => {
+  it("skip beats generate even when a generate policy also matches, with no probe", async () => {
     createGeneratePolicy("secret.jpg");
     createSkipPolicy("secret.jpg");
     writeFile("secret.jpg");
@@ -497,6 +503,125 @@ describe("scanThumbnails", () => {
 
     expect(stats).toMatchObject({ toGenerate: 0, toRegenerate: 0, upToDate: 0 });
     expect(generator.imageCalls).toHaveLength(0);
+    expect(prober.detectMedia).not.toHaveBeenCalled();
+  });
+
+  it("a skip-matched stub keeps its preview, exactly like any other stub, and is never counted as a progress unit", async () => {
+    createSkipPolicy("private/**");
+    seedCache("private/secret.jpg", "abc");
+    writeStub("private/secret.jpg", "abc");
+    writeFile(`private/_thumbnail/secret.jpg.${IMAGE_PARAMS}.abc.jpg`);
+
+    const prober = fakeProber({});
+    const progress: { discovered: number; completed: number }[] = [];
+    const pool = new PQueue({ concurrency: 4 });
+    const stats = await scanThumbnails(
+      root,
+      "ensure",
+      undefined,
+      cacheRepo,
+      policiesRepo.list(),
+      ignorePoliciesRepo.listGlobs(),
+      prober,
+      fakeGenerator(),
+      silentLogger,
+      pool,
+      8,
+      false,
+      undefined,
+      (discovered, completed) => progress.push({ discovered, completed }),
+    );
+
+    expect(stats).toMatchObject({ stubbedPreserved: 1, toDelete: 0 });
+    expect(
+      fs.existsSync(path.join(root, `private/_thumbnail/secret.jpg.${IMAGE_PARAMS}.abc.jpg`)),
+    ).toBe(true);
+    expect(prober.detectMedia).not.toHaveBeenCalled();
+    // Never discovered/completed as a unit -- a skip match costs nothing
+    // beyond the glob test itself, same as a real source above.
+    expect(progress.every((p) => p.discovered === 0 && p.completed === 0)).toBe(true);
+  });
+
+  it("estimate never counts a skip-only-matched file -- the bar's final total matches it from the start (#40)", async () => {
+    createSkipPolicy("private/**");
+    createGeneratePolicy("*.jpg");
+    writeFile("private/secret.jpg"); // skip-only: matched by the skip glob, not the generate glob
+    seedCache("private/secret.jpg", "abc");
+    writeFile("public.jpg"); // genuine generate candidate -- the only thing that should ever be estimated
+    seedCache("public.jpg", "def");
+
+    const prober = fakeProber({ "public.jpg": JPEG_IMAGE });
+    const estimates: number[] = [];
+    const pool = new PQueue({ concurrency: 4 });
+    const stats = await scanThumbnails(
+      root,
+      "ensure",
+      undefined,
+      cacheRepo,
+      policiesRepo.list(),
+      ignorePoliciesRepo.listGlobs(),
+      prober,
+      fakeGenerator(),
+      silentLogger,
+      pool,
+      8,
+      false,
+      (total) => estimates.push(total),
+    );
+
+    expect(stats).toMatchObject({ toGenerate: 1, toDelete: 0 });
+    // Only "public.jpg" was ever a real candidate -- every estimate the
+    // advisory pass published (however many it got through, a race with
+    // the real pass) must already reflect that, never the skip-matched
+    // file too.
+    expect(estimates.length).toBeGreaterThan(0);
+    for (const total of estimates) expect(total).toBe(1);
+  });
+
+  it("the trailing orphan sweep costs a progress unit only under cleanup, never ensure/state, though both tally toDelete (#40)", async () => {
+    createGeneratePolicy("*.jpg");
+    writeFile(`_thumbnail/gone.jpg.${IMAGE_PARAMS}.abc.jpg`); // original never existed -- a plain orphan
+
+    const prober = fakeProber({});
+
+    const progressFor = async (
+      mode: "state" | "ensure" | "cleanup",
+    ): Promise<{
+      events: { discovered: number; completed: number }[];
+      stats: ThumbnailScanStats;
+    }> => {
+      const progress: { discovered: number; completed: number }[] = [];
+      const pool = new PQueue({ concurrency: 4 });
+      const stats = await scanThumbnails(
+        root,
+        mode,
+        undefined,
+        cacheRepo,
+        policiesRepo.list(),
+        ignorePoliciesRepo.listGlobs(),
+        prober,
+        fakeGenerator(),
+        silentLogger,
+        pool,
+        8,
+        false,
+        undefined,
+        (discovered, completed) => progress.push({ discovered, completed }),
+      );
+      return { events: progress, stats };
+    };
+
+    const stateResult = await progressFor("state");
+    expect(stateResult.stats).toMatchObject({ toDelete: 1 });
+    expect(stateResult.events.every((e) => e.discovered === 0 && e.completed === 0)).toBe(true);
+
+    writeFile(`_thumbnail/gone.jpg.${IMAGE_PARAMS}.abc.jpg`); // state never deletes -- still there for cleanup to find
+    const cleanupResult = await progressFor("cleanup");
+    expect(cleanupResult.stats).toMatchObject({ toDelete: 1 });
+    expect(cleanupResult.events.some((e) => e.discovered >= 1 && e.completed >= 1)).toBe(true);
+    expect(fs.existsSync(path.join(root, `_thumbnail/gone.jpg.${IMAGE_PARAMS}.abc.jpg`))).toBe(
+      false,
+    );
   });
 
   it("every matching 'generate' policy produces its own thumbnail -- no priority, no single winner", async () => {

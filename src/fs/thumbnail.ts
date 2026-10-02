@@ -255,8 +255,9 @@ function mimeTypeMatches(pattern: string, mimeType: string): boolean {
   return patternSubtype === "*" && patternType === actualType;
 }
 
+/** Only ever called on a 'generate' row -- a 'skip' row matches by glob alone (no `mimeTypes` field at all, see `Generate<>`) and is resolved inline before `resolvePolicies` is ever reached; see its own doc comment. */
 function policyMatches(
-  policy: ThumbnailPolicyRow,
+  policy: ThumbnailPolicyGenerateRow,
   relativePath: string,
   mimeType: string,
 ): boolean {
@@ -271,34 +272,30 @@ function anyGlobMatches(relativePath: string, policies: readonly ThumbnailPolicy
   return policies.some((p) => matchesAnyGlob(relativePath, [p.glob]).matched);
 }
 
-type PolicyResolution =
-  { action: "skip" } | { action: "generate"; policies: ThumbnailPolicyGenerateRow[] };
+interface PolicyResolution {
+  policies: ThumbnailPolicyGenerateRow[];
+}
 
 /**
- * Any matching 'skip' wins outright (monotonic OR, like ignore_policies)
- * and suppresses every 'generate' match, same as before -- there's still
- * no priority among 'skip' rows, since they all agree with each other by
- * construction. Unlike before, there's no winner among 'generate' matches
- * either: *every* matching 'generate' row produces its own thumbnail, one
- * per policy (see `expectedParamsSegment`, which is what keeps their
- * outputs from colliding). `undefined` = not a candidate at all (no
- * match, skip or generate).
+ * 'generate' matches only -- a 'skip' glob match is resolved inline in
+ * `scanThumbnails`' main loop (`hasMatchingSkipGlob`), before a real file
+ * is ever dispatched for probing, so by the time this runs it's already
+ * known that no skip glob matched (see #29/#40). *Every* matching
+ * 'generate' row produces its own thumbnail, one per policy (see
+ * `expectedParamsSegment`, which is what keeps their outputs from
+ * colliding) -- there's no priority among them, unlike `storage_policy`.
+ * `undefined` = not a 'generate' candidate at all (no match).
  */
 function resolvePolicies(
   relativePath: string,
   mimeType: string,
   policies: readonly ThumbnailPolicyRow[],
 ): PolicyResolution | undefined {
-  const skipMatch = policies.some(
-    (p) => p.action === "skip" && policyMatches(p, relativePath, mimeType),
-  );
-  if (skipMatch) return { action: "skip" };
-
   const generateMatches = policies.filter(
     (p): p is ThumbnailPolicyGenerateRow =>
       p.action === "generate" && policyMatches(p, relativePath, mimeType),
   );
-  return generateMatches.length > 0 ? { action: "generate", policies: generateMatches } : undefined;
+  return generateMatches.length > 0 ? { policies: generateMatches } : undefined;
 }
 
 /**
@@ -597,6 +594,15 @@ function hasMatchingSkipGlob(
   );
 }
 
+/**
+ * Whether a source needs real work this run -- a 'generate' candidate
+ * only; every caller excludes a skip-glob match before ever reaching this
+ * (see `hasMatchingSkipGlob` at each call site in `scanThumbnails`'s main
+ * loop and `enumerateThumbnailWork`), so `anyGlobMatches` here is in
+ * practice always asking "does some *generate* policy match" -- a skip
+ * match is resolved on the spot, from its glob alone, never counted as
+ * work in either pass. See #29/#40.
+ */
 function shouldProcessSource(
   mode: ThumbnailRunMode,
   root: string,
@@ -606,10 +612,62 @@ function shouldProcessSource(
 ): boolean {
   if (!anyGlobMatches(relativePath, policies)) return false;
   if (mode !== "ensure" || hash === null) return true;
-  if (hasMatchingSkipGlob(relativePath, policies)) return true;
   return matchingGenerateGlobs(relativePath, policies).some(
     (policy) => !expectedThumbnailExists(root, relativePath, hash, policy),
   );
+}
+
+/**
+ * Shared by every "no thumbnail should exist for this source" outcome --
+ * a skip-glob match (resolved inline in `scanThumbnails`'s main loop,
+ * before a real file is ever dispatched for probing) and a probed source
+ * that turns out to match no policy at all (an extension that lies, or a
+ * policy whose mime types were narrowed after the fact). Walks every
+ * sibling `_thumbnail` entry for this source and tallies/deletes each
+ * one, same as an ordinary orphan -- there's nothing left here to
+ * generate or preserve.
+ */
+async function discardThumbnailsFor(
+  root: string,
+  mode: ThumbnailRunMode,
+  relativePath: string,
+  stats: ThumbnailScanStats,
+): Promise<void> {
+  await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
+    stats.toDelete++;
+    removeIfCleanup(root, mode, thumbnail);
+  });
+}
+
+/**
+ * Whether an existing thumbnail file is a genuine orphan -- its source is
+ * gone, excluded by `--glob`/an ignore policy, or matches no thumbnail
+ * policy at all (the exact inverse of `sweepUnprocessedThumbnails`'s own
+ * `sourceWasProcessed`, factored out so `enumerateThumbnailWork` can
+ * predict the same orphans the real sweep will later find, without
+ * duplicating the logic). Deliberately checks `anyGlobMatches` (every
+ * policy, skip included) against the *original's* path, not the
+ * thumbnail's own -- a source now matching a skip glob was already
+ * resolved (and its thumbnails already counted/removed) earlier in this
+ * same run, so it must never also look like an orphan here, which would
+ * double-count or double-delete it.
+ */
+function isSweepOrphan(
+  root: string,
+  thumbnail: ExistingThumbnailFile,
+  glob: string | undefined,
+  ignoreGlobs: readonly string[],
+  policies: readonly ThumbnailPolicyRow[],
+): boolean {
+  const originalAbsolutePath = path.join(root, thumbnail.originalRelativePath);
+  const originalExists =
+    fs.existsSync(originalAbsolutePath) || fs.existsSync(`${originalAbsolutePath}.stub`);
+  const sourceWasProcessed =
+    originalExists &&
+    (!glob || matchesAnyGlob(thumbnail.originalRelativePath, [glob]).matched) &&
+    !matchesAnyGlob(thumbnail.originalRelativePath, ignoreGlobs).matched &&
+    anyGlobMatches(thumbnail.originalRelativePath, policies);
+  return !sourceWasProcessed;
 }
 
 async function enumerateThumbnailWork(
@@ -627,9 +685,6 @@ async function enumerateThumbnailWork(
 ): Promise<void> {
   if (!onEstimate) return;
 
-  const generatePolicies = policies.filter(
-    (p): p is ThumbnailPolicyGenerateRow => p.action === "generate",
-  );
   let estimated = 0;
   let sincePublish = 0;
 
@@ -639,19 +694,34 @@ async function enumerateThumbnailWork(
       if (fsEntry.type !== "file") continue;
 
       const relativePath = literalPrefix ? `${literalPrefix}/${fsEntry.path}` : fsEntry.path;
-      if (isUnderThumbnailDir(relativePath)) continue;
+
+      if (isUnderThumbnailDir(relativePath)) {
+        // Only `cleanup`'s trailing sweep does real, countable work on an
+        // orphaned thumbnail -- `ensure`/`state` just tally it into the
+        // final summary, never move the bar for it (see
+        // `sweepUnprocessedThumbnails`). Predicting one here for any
+        // other mode would reintroduce exactly the late-growth bug this
+        // estimate exists to prevent (#40).
+        if (mode === "cleanup") {
+          const thumbnail = parseThumbnailEntry(relativePath);
+          if (thumbnail && isSweepOrphan(root, thumbnail, glob, ignoreGlobs, policies)) {
+            estimated++;
+          }
+        }
+        continue;
+      }
+
       if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
       if (matchesAnyGlob(relativePath, ignoreGlobs).matched) continue;
+      // A skip-glob match is resolved on the spot, with no probe and no
+      // progress-unit cost, in both this estimate and the real pass (see
+      // `scanThumbnails`'s main loop) -- it was never generation work to
+      // begin with. See #29/#40.
+      if (hasMatchingSkipGlob(relativePath, policies)) continue;
 
       const cacheRow = cacheRepo.get(relativePath);
       const hash = cacheRow?.hash ?? null;
-      const relevantPolicies = generatePolicies.filter(
-        (policy) => matchesAnyGlob(relativePath, [policy.glob]).matched,
-      );
-      if (
-        relevantPolicies.length > 0 &&
-        shouldProcessSource(mode, root, relativePath, hash, policies)
-      ) {
+      if (shouldProcessSource(mode, root, relativePath, hash, policies)) {
         estimated++;
       }
 
@@ -797,22 +867,17 @@ async function reconcileProbedSource(
   // named .mpeg), or a policy whose mime types were narrowed. Either way no
   // thumbnail should exist for it, so this keeps sweeping, and stays quiet.
   if (classified.kind === "no-policy") {
-    await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
-      stats.toDelete++;
-      removeIfCleanup(root, mode, thumbnail);
-    });
+    await discardThumbnailsFor(root, mode, relativePath, stats);
     return false;
   }
 
+  // No 'skip' branch here -- `PolicyResolution` no longer has one to
+  // check. `scanThumbnails`' main loop resolves every skip-glob match
+  // inline (`discardThumbnailsFor`), before a real file is ever
+  // dispatched into the probe pool at all, so `resolvePolicies` (what
+  // produced this `decision`) is only ever reached for a path with no
+  // skip-glob match in the first place -- see #29/#40.
   const decision = classified.decision;
-  if (decision.resolution.action === "skip") {
-    await forEachThumbnailForOriginal(root, relativePath, (thumbnail) => {
-      stats.toDelete++;
-      removeIfCleanup(root, mode, thumbnail);
-    });
-    return false;
-  }
-
   if (decision.cacheHash === null) {
     stats.missingCacheEntry++;
     return false;
@@ -907,23 +972,26 @@ async function sweepUnprocessedThumbnails(
     const relativePath = literalPrefix ? `${literalPrefix}/${fsEntry.path}` : fsEntry.path;
     const thumbnail = parseThumbnailEntry(relativePath);
     if (!thumbnail) continue;
+    if (!isSweepOrphan(root, thumbnail, glob, ignoreGlobs, policies)) continue;
 
-    const originalAbsolutePath = path.join(root, thumbnail.originalRelativePath);
-    const originalExists =
-      fs.existsSync(originalAbsolutePath) || fs.existsSync(`${originalAbsolutePath}.stub`);
-    const sourceWasProcessed =
-      originalExists &&
-      (!glob || matchesAnyGlob(thumbnail.originalRelativePath, [glob]).matched) &&
-      !matchesAnyGlob(thumbnail.originalRelativePath, ignoreGlobs).matched &&
-      anyGlobMatches(thumbnail.originalRelativePath, policies);
-    if (sourceWasProcessed) continue;
-
-    onDiscovered();
-    onActivity?.("processing", thumbnail.relativePath);
+    // Only `cleanup` does real, countable work on an orphan --
+    // `ensure`/`state` still tally it into the final summary
+    // (`stats.toDelete`) below, just without moving the bar for it:
+    // `removeIfCleanup` is a no-op for them, so counting one as a
+    // progress unit there would stretch the total for zero actual work
+    // -- exactly what used to make the bar keep growing right as a run
+    // looked finished (#40). `enumerateThumbnailWork`'s own cleanup-only
+    // orphan count is what keeps the estimate matching this.
+    if (mode === "cleanup") {
+      onDiscovered();
+      onActivity?.("processing", thumbnail.relativePath);
+    }
     stats.toDelete++;
     removeIfCleanup(root, mode, thumbnail);
-    onActivity?.("processed", thumbnail.relativePath);
-    onCompleted();
+    if (mode === "cleanup") {
+      onActivity?.("processed", thumbnail.relativePath);
+      onCompleted();
+    }
   }
 }
 
@@ -1035,9 +1103,35 @@ export async function scanThumbnails(
       if (isUnderThumbnailDir(relativePath)) continue;
       if (glob && !matchesAnyGlob(relativePath, [glob]).matched) continue;
       if (matchesAnyGlob(relativePath, ignoreGlobs).matched) continue;
-      if (!anyGlobMatches(relativePath, policies)) continue;
 
       const cacheHash = cacheRepo.get(relativePath)?.hash ?? null;
+
+      // A skip match wins outright over any coexisting generate match
+      // (see `resolvePolicies`), and is resolved here, on the spot, from
+      // its glob alone -- no media probe, and not counted as a progress
+      // unit either (it was never real generation work, just a cheap
+      // path decision). A stub still goes through `processStubSource`
+      // unchanged (it was never probed either way -- only a *real* file
+      // under the old code paid for a probe just to be told "skip"). See
+      // #29/#40.
+      if (hasMatchingSkipGlob(relativePath, policies)) {
+        if (fsEntry.representation === "stub") {
+          await processStubSource(
+            root,
+            mode,
+            relativePath,
+            cacheHash,
+            stats,
+            deleteStaleStubPreviews,
+          );
+        } else {
+          await discardThumbnailsFor(root, mode, relativePath, stats);
+        }
+        continue;
+      }
+
+      if (!anyGlobMatches(relativePath, policies)) continue;
+
       if (!shouldProcessSource(mode, root, relativePath, cacheHash, policies)) {
         for (const policy of matchingGenerateGlobs(relativePath, policies)) {
           if (cacheHash && expectedThumbnailExists(root, relativePath, cacheHash, policy)) {

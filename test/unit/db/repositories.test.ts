@@ -932,7 +932,6 @@ const SKIP_INPUT = {
   name: "skip_private",
   glob: "private/**",
   action: "skip" as const,
-  mimeTypes: ["image/*", "video/*"],
 };
 
 describe("ThumbnailPoliciesRepository (state.db)", () => {
@@ -970,12 +969,13 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       createdAt: expect.any(String) as string,
     });
 
+    // No `mimeTypes` key at all -- a 'skip' row matches by glob alone (see
+    // Generate<>'s own doc comment), not merely an empty/null one.
     expect(repo.get(skipId)).toEqual({
       id: skipId,
       name: "skip_private",
       glob: "private/**",
       action: "skip",
-      mimeTypes: ["image/*", "video/*"],
       createdAt: expect.any(String) as string,
     });
 
@@ -1056,8 +1056,28 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
   it("round-trips mimeTypes through the JSON-encoded column, preserving order", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    const id = repo.create({ ...SKIP_INPUT, mimeTypes: ["video/*", "image/png", "image/jpeg"] });
-    expect(repo.get(id)?.mimeTypes).toEqual(["video/*", "image/png", "image/jpeg"]);
+    const id = repo.create({
+      ...IMAGE_GENERATE_INPUT,
+      mimeTypes: ["image/png", "image/jpeg"],
+    });
+    const row = repo.get(id);
+    if (row?.action !== "generate") throw new Error("expected a generate row");
+    expect(row.mimeTypes).toEqual(["image/png", "image/jpeg"]);
+  });
+
+  it("rejects a 'skip' policy that sets mime types -- it matches by glob only", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    // Doesn't type-check (the skip variant of ThumbnailPolicyCreateInput has
+    // no `mimeTypes` field at all -- see Generate<>'s own doc comment); the
+    // cast exercises the same runtime guard a non-TS caller could still
+    // trip.
+    expect(() =>
+      repo.create({
+        ...SKIP_INPUT,
+        mimeTypes: ["image/*"],
+      } as unknown as ThumbnailPolicyCreateInput),
+    ).toThrow(/can't have mime types/);
   });
 
   it("rejects a duplicate name", () => {
@@ -1147,19 +1167,33 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     expect(repo.create({ ...IMAGE_GENERATE_INPUT, mimeTypes: ["image/*"] })).toEqual(
       expect.any(Number),
     );
-    // A 'skip' row's mimeTypes legitimately mixes types -- no media type to
-    // check consistency against in the first place.
+    // A 'skip' row has no mimeTypes at all -- nothing to check consistency
+    // against in the first place (see the dedicated skip/mimeTypes test
+    // above).
     expect(repo.create(SKIP_INPUT)).toEqual(expect.any(Number));
   });
 
   it("rejects an invalid mime type, and requires at least one", () => {
     const db = openStateDb(":memory:");
     const repo = new ThumbnailPoliciesRepository(db);
-    expect(() => repo.create({ ...SKIP_INPUT, mimeTypes: ["not-a-mime-type"] })).toThrow(
+    expect(() => repo.create({ ...IMAGE_GENERATE_INPUT, mimeTypes: ["not-a-mime-type"] })).toThrow(
       /invalid mime type/,
     );
-    expect(() => repo.create({ ...SKIP_INPUT, mimeTypes: [] })).toThrow(/at least one mime type/);
-    expect(repo.create({ ...SKIP_INPUT, mimeTypes: ["video/*"] })).toEqual(expect.any(Number));
+    expect(() => repo.create({ ...IMAGE_GENERATE_INPUT, mimeTypes: [] })).toThrow(
+      /at least one mime type/,
+    );
+    expect(repo.create({ ...IMAGE_GENERATE_INPUT, mimeTypes: ["image/*"] })).toEqual(
+      expect.any(Number),
+    );
+  });
+
+  it("rejects a 'generate' policy missing mime types", () => {
+    const db = openStateDb(":memory:");
+    const repo = new ThumbnailPoliciesRepository(db);
+    const { mimeTypes: _mimeTypes, ...withoutMimeTypes } = IMAGE_GENERATE_INPUT;
+    expect(() => repo.create(withoutMimeTypes as unknown as ThumbnailPolicyCreateInput)).toThrow(
+      /needs mime types/,
+    );
   });
 
   it("update() re-validates the merged whole, catching an update that would leave it inconsistent", () => {
@@ -1177,29 +1211,42 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
     const repo = new ThumbnailPoliciesRepository(db);
     const generateId = repo.create(IMAGE_GENERATE_INPUT);
 
+    // Switching to 'skip' drops mimeTypes entirely, same as every other
+    // generate-only field -- a 'skip' row never has one to carry, even
+    // though nothing in this call touched mimeTypes itself.
     expect(repo.update(generateId, { action: "skip" })).toBe(true);
     expect(repo.get(generateId)).toEqual({
       id: generateId,
       name: "img_thumb",
       glob: "**/*.jpg",
       action: "skip",
-      mimeTypes: ["image/jpeg"],
       createdAt: expect.any(String) as string,
     });
 
     const skipId = repo.create(SKIP_INPUT);
     // Switching skip -> generate without supplying the newly-required fields
     // in the same call fails -- nothing carries over from the skip row's
-    // (all-null) generate fields. mediaType alone isn't enough for an
-    // 'image' row either -- resizingStrategy is checked before the fields
-    // that strategy itself would require.
+    // (all-null, mimeTypes-less) generate fields. mimeTypes is required
+    // unconditionally for 'generate' and checked ahead of every
+    // branch-specific field, so it's supplied from the very first call
+    // onward below -- what's left demonstrates each OTHER field's own
+    // requirement, same as before this policy gained mimeTypes-on-skip
+    // validation.
     expect(() => repo.update(skipId, { action: "generate", mediaType: "image" })).toThrow(
-      /resizing strategy/,
+      /needs mime types/,
     );
     expect(() =>
       repo.update(skipId, {
         action: "generate",
         mediaType: "image",
+        mimeTypes: ["image/jpeg"],
+      }),
+    ).toThrow(/resizing strategy/);
+    expect(() =>
+      repo.update(skipId, {
+        action: "generate",
+        mediaType: "image",
+        mimeTypes: ["image/jpeg"],
         resizingStrategy: "fit_to_box",
       }),
     ).toThrow(/output mime/);
@@ -1207,6 +1254,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       repo.update(skipId, {
         action: "generate",
         mediaType: "image",
+        mimeTypes: ["image/jpeg"],
         resizingStrategy: "fit_to_box",
         outputMime: "image/jpeg",
       }),
@@ -1216,7 +1264,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
         action: "generate",
         mediaType: "image",
         resizingStrategy: "fit_to_box",
-        mimeTypes: ["image/jpeg"], // must be resupplied -- the skip row's own mix of image/video types no longer matches 'image'
+        mimeTypes: ["image/jpeg"],
         imageWidth: 100,
         imageHeight: 100,
         outputMime: "image/jpeg",
@@ -1228,6 +1276,7 @@ describe("ThumbnailPoliciesRepository (state.db)", () => {
       mediaType: "image",
       resizingStrategy: "fit_to_box",
       imageWidth: 100,
+      mimeTypes: ["image/jpeg"],
     });
   });
 

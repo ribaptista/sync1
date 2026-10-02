@@ -54,7 +54,8 @@ interface GenerateFieldOptions {
 
 interface CreateOptions extends RootOption, GenerateFieldOptions {
   name: string;
-  mimeTypes: string;
+  /** Required for "generate", forbidden for "skip" -- a 'skip' policy matches by glob alone. */
+  mimeTypes?: string;
 }
 
 interface EditOptions extends RootOption, GenerateFieldOptions {
@@ -318,8 +319,9 @@ function parseGenerateFields(opts: GenerateFieldOptions): ParsedGenerateFields {
 
 /**
  * Fast, friendly, pre-network-round-trip check for `create`: a "skip"
- * policy must supply none of --media-type/--resizing-strategy/--output-
- * type/--output-mime or any generate flag; a "generate" policy must supply
+ * policy matches by glob alone -- it must supply none of --mime-types/
+ * --media-type/--resizing-strategy/--output-type/--output-mime or any
+ * generate flag; a "generate" policy must supply --mime-types, then
  * --media-type, then (for "image") --resizing-strategy or (for "video")
  * --output-type -- together the SIZING branch -- then --output-mime, then
  * that branch's own required fields (`SIZING_FIELDS` for sizing,
@@ -341,6 +343,7 @@ function assertGenerateFlagsConsistentForCreate(
       (name) => FIELD_INFO[name].flag,
     );
     const allPresent = [
+      ...(opts.mimeTypes !== undefined ? ["--mime-types"] : []),
       ...(opts.mediaType !== undefined ? ["--media-type"] : []),
       ...(opts.resizingStrategy !== undefined ? ["--resizing-strategy"] : []),
       ...(opts.outputType !== undefined ? ["--output-type"] : []),
@@ -348,11 +351,16 @@ function assertGenerateFlagsConsistentForCreate(
       ...present,
     ];
     if (allPresent.length > 0) {
-      throw new Error(`a "skip" policy can't set ${allPresent.join(", ")}`);
+      throw new Error(
+        `a "skip" policy can't set ${allPresent.join(", ")} -- it matches by glob only`,
+      );
     }
     return;
   }
 
+  if (opts.mimeTypes === undefined) {
+    throw new Error('a "generate" policy needs --mime-types');
+  }
   if (opts.mediaType === undefined) {
     throw new Error('a "generate" policy needs --media-type');
   }
@@ -542,16 +550,23 @@ function buildEncodingInput(outputMime: ThumbnailOutputMime, generateFields: Par
  * with a friendly error (see `assertGenerateFlagsConsistentForCreate` and
  * `ThumbnailPoliciesRepository.create`).
  */
+/**
+ * `mimeTypes` is `undefined` for a "skip" row (never read in that branch
+ * below) and guaranteed present for a "generate" row by
+ * `assertGenerateFlagsConsistentForCreate`, which already ran (and would
+ * have thrown) before this is ever called -- hence the `!` assertions on
+ * every generate branch, same precedent as `generateFields`' own fields.
+ */
 function buildCreateInput(
   name: string,
   glob: string,
   action: ThumbnailPolicyAction,
-  mimeTypes: string[],
+  mimeTypes: string[] | undefined,
   generateFields: ParsedGenerateFields,
   opts: CreateOptions,
 ): ThumbnailPolicyCreateInput {
   if (action === "skip") {
-    return { name, glob, action: "skip", mimeTypes };
+    return { name, glob, action: "skip" };
   }
 
   const mediaType = parseMediaType(opts.mediaType!);
@@ -567,7 +582,7 @@ function buildCreateInput(
         action: "generate",
         mediaType: "image",
         resizingStrategy: "fit_to_box",
-        mimeTypes,
+        mimeTypes: mimeTypes!,
         imageWidth: generateFields.imageWidth!,
         imageHeight: generateFields.imageHeight!,
         ...encoding,
@@ -579,7 +594,7 @@ function buildCreateInput(
       action: "generate",
       mediaType: "image",
       resizingStrategy: "resize_shorter_side",
-      mimeTypes,
+      mimeTypes: mimeTypes!,
       shorterSide: generateFields.shorterSide!,
       ...encoding,
     } as ThumbnailPolicyCreateInput;
@@ -593,7 +608,7 @@ function buildCreateInput(
       action: "generate",
       mediaType: "video",
       outputType: "mosaic",
-      mimeTypes,
+      mimeTypes: mimeTypes!,
       shorterSide: generateFields.shorterSide!,
       tileRowCount: generateFields.tileRowCount!,
       tileColumnCount: generateFields.tileColumnCount!,
@@ -606,7 +621,7 @@ function buildCreateInput(
     action: "generate",
     mediaType: "video",
     outputType: "preview",
-    mimeTypes,
+    mimeTypes: mimeTypes!,
     shorterSide: generateFields.shorterSide!,
     frameCount: generateFields.frameCount!,
     frameDelayMs: generateFields.frameDelayMs!,
@@ -622,7 +637,7 @@ async function runCreate(
 ): Promise<{ id: number; action: ThumbnailPolicyAction; versionStamp: string }> {
   const action = parseAction(actionRaw);
   assertGenerateFlagsConsistentForCreate(action, opts);
-  const mimeTypes = parseMimeTypes(opts.mimeTypes);
+  const mimeTypes = opts.mimeTypes !== undefined ? parseMimeTypes(opts.mimeTypes) : undefined;
   const generateFields = parseGenerateFields(opts);
 
   const { root, masterKey, s3 } = await setupMutationContext(opts);
@@ -700,8 +715,9 @@ export function registerThumbnailPolicyCommand(program: Command): void {
           emitJson({ ok: true, policies: rows });
         } else {
           for (const r of rows) {
+            const mime = r.action === "skip" ? "-" : r.mimeTypes.join(",");
             process.stdout.write(
-              `${r.id}\t${r.name}\t${r.glob}\t${r.action}\t${generateSummary(r)}\tmime=${r.mimeTypes.join(",")}\n`,
+              `${r.id}\t${r.name}\t${r.glob}\t${r.action}\t${generateSummary(r)}\tmime=${mime}\n`,
             );
           }
         }
@@ -725,7 +741,10 @@ export function registerThumbnailPolicyCommand(program: Command): void {
       "--name <name>",
       "unique identifier, letters/digits/underscore only -- appears in generated thumbnails' filenames",
     )
-    .requiredOption("--mime-types <csv>", 'comma-separated mime types, e.g. "image/jpeg,video/*"')
+    .option(
+      "--mime-types <csv>",
+      'comma-separated mime types, e.g. "image/jpeg,video/*" -- required for "generate", forbidden for "skip" (which matches by glob only)',
+    )
     .option("--media-type <image|video>", "generate policies only; which field set applies")
     .option(
       "--resizing-strategy <fit_to_box|resize_shorter_side>",
@@ -808,7 +827,10 @@ export function registerThumbnailPolicyCommand(program: Command): void {
     .option("--name <name>", "new unique identifier, letters/digits/underscore only")
     .option("--glob <glob>", "new glob pattern")
     .option("--action <action>", "new action: skip or generate")
-    .option("--mime-types <csv>", "new comma-separated mime types")
+    .option(
+      "--mime-types <csv>",
+      "new comma-separated mime types -- generate policies only; required when switching from skip to generate, ignored (forced to none) when switching to skip",
+    )
     .option("--media-type <image|video>", "new media type (generate policies only)")
     .option(
       "--resizing-strategy <fit_to_box|resize_shorter_side>",
