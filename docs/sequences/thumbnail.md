@@ -124,6 +124,7 @@ sequenceDiagram
         Recon->>Recon: stats.toRegenerate++
         opt mode = "ensure"
             Recon->>Gen: generateForDecision(..., staleThumbnail: state.stale)
+            Gen->>Gen: fitsWithStubSuffix(destBasename)? else throw ThumbnailGenerationError -- before any mkdir/render/generator work
             Gen->>FS: mkdirSync(dirname); render to inTreeTempPathPreservingExtension(dest)
             Gen->>FS: fs.renameSync(temp, dest) -- see flow-atomic-publish.md (no renameWithRetry here)
             Gen->>FS: THEN delete state.stale -- the old file is only removed after the new one lands
@@ -205,9 +206,10 @@ non-empty (an unregenerable preview sitting there, needing a human decision).
   temp sibling and renamed into place _before_ a stale one it's replacing is deleted — an interrupted
   regeneration never leaves zero valid thumbnails for a policy that already had one.
 - **On failure:** a per-file `ThumbnailGenerationError` (unwritable destination, a name too long for the
-  filesystem, an unsupported source) is caught, counted (`stats.errors`), logged with the path, and the
-  run continues — it never aborts the whole scan. Any _other_ thrown error (a probe crash, a real fs
-  error outside generation) propagates out of the dispatched job to `throwIfPoolErrored`, ending the run.
+  filesystem, a name that fits the filesystem but leaves no room for a future `.stub` suffix, an
+  unsupported source) is caught, counted (`stats.errors`), logged with the path, and the run continues —
+  it never aborts the whole scan. Any _other_ thrown error (a probe crash, a real fs error outside
+  generation) propagates out of the dispatched job to `throwIfPoolErrored`, ending the run.
 - **Sub-flows:** [`flow-pool-dispatch.md`](flow-pool-dispatch.md) (the per-source dispatch),
   [`flow-atomic-publish.md`](flow-atomic-publish.md) (thumbnail publish — the bare-`renameSync` variant,
   not `renameWithRetry`).

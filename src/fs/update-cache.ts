@@ -2,8 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../logger.js";
 import { walk, type WalkEntry } from "./walker.js";
-import { readStubHash, stubPathFor, StubFormatError } from "./stub.js";
-import { CorruptionError } from "../errors.js";
+import { readStubHash, stubPathFor, fitsWithStubSuffix, StubFormatError } from "./stub.js";
+import { CorruptionError, FilenameTooLongForStubError } from "../errors.js";
 import { tempSiblingPath } from "./temp-path.js";
 import type { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import {
@@ -456,6 +456,22 @@ async function dispatchHash(
   logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
 }
 
+/**
+ * Only a `"real"` file is checked: a `"stub"` or `"both"` entry already has
+ * a `.stub` sitting on disk next to (or instead of) it, so its name
+ * already proved it fits -- rechecking it here would just reject a name
+ * that's already working. Thrown synchronously, before this path is ever
+ * staged, so a vault can never pick up a name no other client could later
+ * stub for itself (see `apply-remote-changes.ts`'s `writeAsStub` path).
+ */
+function assertStubbableRealFile(fsEntry: WalkEntry): void {
+  if (fsEntry.type !== "file" || fsEntry.representation !== "real") return;
+  const basename = path.basename(fsEntry.path);
+  if (!fitsWithStubSuffix(basename)) {
+    throw new FilenameTooLongForStubError(fsEntry.path, Buffer.byteLength(basename));
+  }
+}
+
 async function dispatchCreatedRow(
   fsEntry: WalkEntry,
   root: string,
@@ -468,6 +484,7 @@ async function dispatchCreatedRow(
   staging: StagingRepository,
   progress: ProgressTracker,
 ): Promise<void> {
+  assertStubbableRealFile(fsEntry);
   const mtime = Math.round(fsEntry.mtimeMs);
   const resolution = classifyContent(fsEntry, root, objectsRepo, logger);
 
@@ -551,6 +568,7 @@ async function dispatchExistingRow(
   staging: StagingRepository,
   progress: ProgressTracker,
 ): Promise<void> {
+  assertStubbableRealFile(fsEntry);
   const newMtime = Math.round(fsEntry.mtimeMs);
 
   if (fsEntry.type === "dir") {

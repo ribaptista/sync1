@@ -78,6 +78,15 @@ thumbnails is that it was readable when they were generated, so each one is now 
 an image that can no longer be read, and deleting it is the hazard `--delete-stale-stub-previews` exists
 to guard against.
 
+`errors` also counts a source whose generated thumbnail name wouldn't leave room for a future `.stub`
+suffix — checked before any generator runs, so no ffmpeg/convert time is spent on it. This is a tighter
+check than "does the name fit on disk": the original's own filename dominates a thumbnail's name, so a
+long enough original can produce a thumbnail name that's legal on the filesystem (≤ 255 bytes) but still
+leaves no room for a stub (> 250 bytes) — which would otherwise break every other client's `sync` the
+first time it tried to materialize that thumbnail as a placeholder. The only fix is renaming the
+original to something shorter; see
+[stub-files.md](../architecture/stub-files.md#the-250-byte-name-budget).
+
 Per-file detail for both `errors` and `unreadable` — which path, and what the tool actually said — goes
 to the **log**, not to stdout, so the summary stays a fixed size no matter how many files are involved.
 While a progress bar owns stderr that log is written to file descriptor 3, so redirect it to see them:

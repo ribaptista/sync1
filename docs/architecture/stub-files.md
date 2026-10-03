@@ -14,6 +14,30 @@ backed up somewhere in the vault, you can create a new path referencing already-
 reorganize existing stubs into a different folder structure) purely by writing/moving `.stub` files —
 no bytes need to be downloaded or even exist locally to do this.
 
+## The 250-byte name budget
+
+A stub's path is always the real file's own name plus `.stub` (`stubPathFor`, `src/fs/stub.ts`), and
+Linux filesystems cap a single path component at 255 bytes (`MAX_FILENAME_BYTES`). So a real file's own
+name has to leave room for those 5 extra bytes: **250 bytes, not 255**, is the actual limit a trackable
+file's name has to stay under, since any tracked file might need a stub written for it later — by this
+machine's own `stubify`, or by some other client's `sync` materializing it as a placeholder for the first
+time (see below).
+
+`update_cache` enforces this directly: a real file (`representation === "real"`) whose name doesn't leave
+room for `.stub` (checked via `fitsWithStubSuffix`, `src/fs/stub.ts`) makes the whole run fail with
+`FilenameTooLongForStubError`, before the path is ever staged into `cache.db` — the only way such a name
+could reach the vault at all is by already being tracked from before this check existed. A path that's
+already backed by a stub is never checked: writing that stub already proved its name fits, and a stub by
+construction can never be more than 255 bytes itself.
+
+Thumbnail generation (`src/fs/thumbnail.ts`) enforces the same 250-byte budget on its own _output_ name
+before running any generator, for the same reason — see `docs/architecture/thumbnails.md`.
+
+Deliberately out of scope: a client applying a _remote_ change still aborts outright
+(`src/sync/apply-remote-changes.ts`) if it ever has to write a `.stub` for a name over the limit, and
+there's no repair tool for a too-long name already sitting in an existing vault from before this check
+existed — `update_cache`'s error is what surfaces that case for a person to rename.
+
 ## The four-state representation logic
 
 For any tracked path, the filesystem holds one of: absent, a real file, a stub, or both (a stub
