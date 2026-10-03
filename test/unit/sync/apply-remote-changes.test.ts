@@ -195,3 +195,78 @@ describe("applyRemoteChangesToLocal: download failure", () => {
     cacheDb.close();
   });
 });
+
+describe("applyRemoteChangesToLocal: periodic event-loop yield", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-apply-remote-changes-yield-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("yields to the event loop periodically, instead of running a stub-only pass as one synchronous block", async () => {
+    // Regression test for a frozen progress bar: cli-progress's MultiBar
+    // repaints off its own `setTimeout`, and every branch exercised here --
+    // a brand-new path defaulting to a stub -- resolves synchronously
+    // within applyRemoteContentChange. Without a periodic
+    // `await setImmediate()` in the merge-join loop (see YIELD_EVERY_ROWS in
+    // apply-remote-changes.ts), a run with no real downloads never yields
+    // at all, so nothing else queued on the event loop gets a turn until
+    // the whole pass finishes.
+    //
+    // Asserted with a `setImmediate` of our own, scheduled before the call,
+    // rather than a `setTimeout` -- `setTimeout`/`setImmediate` ordering
+    // isn't guaranteed across event-loop phases in general, but two
+    // `setImmediate` callbacks are always run in scheduling order within
+    // the same "check" phase. Since the production code's own yield also
+    // goes through `setImmediate` (node:timers/promises), this one -- being
+    // scheduled first -- is guaranteed to run before the production code's
+    // *first* yield fires, which can only happen if that first yield was
+    // actually reached (i.e. the loop didn't run start-to-finish first).
+    const candidateDb = openStateDb(":memory:");
+    new VersionsRepository(candidateDb).insert("v1", new Date().toISOString());
+    const objects = new ObjectsRepository(candidateDb);
+    const entries = new EntriesRepository(candidateDb);
+
+    // One more row than the yield interval, so the loop crosses the
+    // threshold at least once.
+    const ROW_COUNT = 33;
+    for (let i = 0; i < ROW_COUNT; i++) {
+      const hash = i.toString().padStart(64, "0");
+      objects.upsert({ hash, s3_key: `objects/${hash}`, size: 1, ciphertext_checksum: "crc-test" });
+      entries.upsert({ path: `file-${i}.bin`, type: "file", hash, state_version: "v1" });
+    }
+
+    const cacheDb = openCacheDb(":memory:");
+    const cacheRepo = new CacheEntriesRepository(cacheDb);
+
+    let timerFired = false;
+    setImmediate(() => {
+      timerFired = true;
+    });
+
+    await applyRemoteChangesToLocal(
+      candidateDb,
+      root,
+      Buffer.alloc(32),
+      cacheRepo,
+      new Set<string>(),
+      unusedS3,
+      silentLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+    );
+
+    expect(timerFired).toBe(true);
+    expect(cacheRepo.get("file-0.bin")?.hash).toBe("0".repeat(64));
+    expect(cacheRepo.get(`file-${ROW_COUNT - 1}.bin`)?.hash).toBe(
+      (ROW_COUNT - 1).toString().padStart(64, "0"),
+    );
+
+    candidateDb.close();
+    cacheDb.close();
+  });
+});

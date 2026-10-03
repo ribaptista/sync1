@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import Database from "better-sqlite3";
 import type PQueue from "p-queue";
 import type { S3Client } from "@aws-sdk/client-s3";
@@ -45,6 +46,19 @@ export interface ApplyRemoteChangesResult {
   deleted: number;
   ignoredButSynced: IgnoredButSyncedEntry[];
 }
+
+/**
+ * How many merge-join rows between yields to the event loop. A run
+ * dominated by directories, deletes, and stub writes (the common case right
+ * after an attach_remote restore) never awaits real I/O, so without this the
+ * loop runs start-to-finish as one synchronous block: cli-progress's
+ * MultiBar repaints off its own `setTimeout` (node_modules/cli-progress/lib/
+ * multi-bar.js), and a timer callback can't fire while a prior synchronous
+ * stretch still owns the event loop -- so the bar this function feeds via
+ * `progress` would never redraw until the whole pass finished. Same figure
+ * as stubify-enumerate.ts's own `PUBLISH_EVERY_ROWS`.
+ */
+const YIELD_EVERY_ROWS = 32;
 
 /**
  * Diffs cache.db's *current* content directly against the candidate
@@ -138,6 +152,8 @@ export async function applyRemoteChangesToLocal(
       ignoredButSynced: [],
     };
 
+    let sinceYield = 0;
+
     while (!cacheNext.done || !candidateNext.done) {
       const cacheEntry = cacheNext.done ? null : cacheNext.value;
       const candidateEntry = candidateNext.done ? null : candidateNext.value;
@@ -228,6 +244,15 @@ export async function applyRemoteChangesToLocal(
         }
         cacheNext = cacheIter.next();
         candidateNext = candidateIter.next();
+      }
+
+      // See YIELD_EVERY_ROWS's own doc comment -- placed here, at the very
+      // bottom of the loop body, so a yield only ever happens once a row is
+      // fully applied (disk, cache.db, and both progress counters all
+      // agree) and both iterators already point at the next unconsumed row.
+      if (++sinceYield >= YIELD_EVERY_ROWS) {
+        sinceYield = 0;
+        await yieldToEventLoop();
       }
     }
 

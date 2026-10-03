@@ -13,6 +13,14 @@ compare version stamps: right after `attach_remote`, `state.db` is already fully
 `cache.db` is empty, so a version-stamp comparison would say "nothing changed" while everything still
 needs materializing.
 
+Every branch below is synchronous except the dispatched download job, so a run dominated by stub
+writes, directory creation, and deletes (the common case right after `attach_remote`) never yields to
+the event loop on its own -- cli-progress's progress-bar repaint runs off a macrotask timer, which can
+only fire once the loop actually yields. `YIELD_EVERY_ROWS` (see the loop below) exists purely for
+that: every 32 rows, `await`s `node:timers/promises`' `setImmediate` after a row is fully applied, so
+the bar this phase feeds stays live instead of freezing for the whole pass. See
+[`concurrency-and-progress.md`](../architecture/concurrency-and-progress.md).
+
 ## Sequence — the merge-join
 
 ```mermaid
@@ -46,6 +54,9 @@ sequenceDiagram
             end
         else path in both, hashes equal
             Loop->>Loop: nothing to do
+        end
+        opt every 32 rows (YIELD_EVERY_ROWS)
+            Loop->>Loop: await setImmediate() -- lets the progress bar's own repaint timer fire
         end
     end
 

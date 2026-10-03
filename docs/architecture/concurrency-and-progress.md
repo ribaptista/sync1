@@ -210,13 +210,40 @@ measures:
   is driven by call _rate_, not burst size, so no fixed buffer resists an arbitrary thread count, and a
   big enough buffer to help would also blur the one place accuracy matters most — the run's final
   stretch, once only large files remain and the true rate genuinely drops. Instead,
-  `MultiBarBytesProgressSession` still updates its own bookkeeping on every call (cheap), but throttles
-  the push into the bar itself to once per 100ms — matched to `cli-progress`'s own redraw rate, so
-  nothing visible slows down — with three deliberate exceptions: the very first flush (so the bar isn't
-  blank and a cold-start activity label lands instantly), any update carrying a new `activity` (rare by
-  construction, so bypassing costs nothing), and `stop()` (which forces one last flush before
-  `MultiBar.stop()` re-renders each bar's current value, so a run
-  never ends on a stale throttled snapshot).
+  `MultiBarBytesProgressSession` still updates its own bookkeeping on every call (cheap), but batches
+  the push into the bar itself: a plain numeric update only marks the bar `dirty` and returns, and
+  `MultiBarBytesProgressSession` lands every dirty bar's latest state from a `redraw-pre` listener it
+  registers on construction — an event `MultiBar` emits immediately before each repaint
+  (`node_modules/cli-progress/lib/multi-bar.js`). This is driven by the repaint itself rather than by an
+  independent timer of this codebase's own, so it can never push more often than the bar actually
+  redraws (matching the old once-per-100ms rate exactly, with no extra bookkeeping to keep in sync with
+  `cli-progress`'s own `fps`), and, unlike a plain time-windowed throttle, it can never drop an update
+  outright: a push that arrives between repaints stays `dirty` until the next one, however long that
+  is, rather than being discarded if nothing later happens to re-trigger a flush. That gap is exactly
+  what let a bar sit frozen on `0/~0 files` through an entire HEAD-check-then-download pause in
+  `materialize` — every update landing inside the old 100ms window was thrown away the instant the
+  window closed, and nothing remained afterward to resend it.
+
+  Three cases still force an immediate push, bypassing the batching, same as before: the very first
+  flush (so the bar isn't blank and a cold-start activity label lands instantly), any update carrying a
+  new `activity` (rare by construction, so bypassing costs nothing), and `stop()` (`flushFinal`, which
+  forces one last push unconditionally before `MultiBar.stop()` re-renders each bar's current value, so
+  a run never ends on a stale snapshot — this can't rely on `redraw-pre` firing again, since `stop()` is
+  what ends the repaint loop in the first place).
+
+  A separate, equally real failure mode sits upstream of all of this: a bar can only repaint on
+  `redraw-pre` if the event loop ever gets back to `cli-progress`'s own render timer in the first place.
+  `applyRemoteChangesToLocal`'s merge-join loop (`src/sync/apply-remote-changes.ts`) does every
+  synchronous outcome — directory creation, a deleted-remotely row, and (the common case right after an
+  `attach_remote` restore) a brand-new path defaulting to a stub write — entirely synchronously, with
+  only a microtask-resolving `await` in between. A run dominated by that shape never actually yields to
+  the macrotask queue at all, so the render timer can never fire until the whole merge-join finishes —
+  the bar sits on whatever it last showed (often nothing at all, if it was only just born) for the
+  entire pass, however many thousands of rows that is. The fix is the same pattern
+  `stubify-enumerate.ts`'s own `PUBLISH_EVERY_ROWS` already uses for its own synchronous scan:
+  `YIELD_EVERY_ROWS` counts merge-join rows and `await`s `node:timers/promises`' `setImmediate` every 32
+  of them, placed at the very bottom of the loop body so a yield only ever happens once a row is fully
+  applied and both iterators already point at the next unconsumed row.
 
   `{activity}` is what replaced it: a single trailing label naming the file currently being worked on,
   written by whichever producer is running. It flips at **two** moments per file — `hashing <path>...`
@@ -230,7 +257,7 @@ measures:
   `src/cli/progress.ts` — the bar renders whatever word it is handed and knows nothing about hashing or
   S3, which is also what lets each of `sync`'s three phase bars carry its own verb.
 
-  A second, unrelated ETA failure used to show up regardless of the throttle above: the literal string
+  A second, unrelated ETA failure used to show up regardless of the batching above: the literal string
   `"NFs"` (or, on a rarer path, `"LLs"`), rendered instead of any duration at all. Not a flooding
   symptom — a genuine bug in `cli-progress`. When the ETA rate is structurally zero (nothing has moved
   yet, or two updates land in the same millisecond), `ETA.calculate`
@@ -251,8 +278,8 @@ on whether bars are actually rendering). A total arrives with a `final` flag: wh
 allowed to jitter downward), and the bar renders it as approximate — `~1.2 GB`, `~4/~9 files`,
 `~ETA 4m`. Once a total is declared final it's set absolutely, downward revisions included, clamped to
 what's already done so the bar can never render past 100%. Only the provisional→final edge forces a
-flush past the throttle described below, since that's where the format itself changes; ordinary
-revisions must not, or they'd reintroduce exactly the flood the throttle exists to damp.
+flush past the batching described above, since that's where the format itself changes; ordinary
+revisions must not, or they'd reintroduce exactly the flood the batching exists to damp.
 
 Downward revision is safe only because the tracker keeps _observation_ and _estimation_ in separate
 counters and emits `max(observed, estimated)`. An estimate revised down can therefore never drag the
