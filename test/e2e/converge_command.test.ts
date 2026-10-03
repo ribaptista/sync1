@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
+import crypto from "node:crypto";
 import path from "node:path";
 import { HeadObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import PQueue from "p-queue";
 import {
   startLocalStack,
   createTestS3Client,
@@ -10,6 +12,15 @@ import {
   type LocalStackHandle,
 } from "./helpers/localstack.js";
 import { runCli } from "./helpers/cli.js";
+import { createLogger } from "../../src/logger.js";
+import { createS3Client } from "../../src/s3/client.js";
+import { parseRemoteConfig } from "../../src/vault/remote-config.js";
+import { localRemoteConfigPath, localStateDbPath } from "../../src/vault/local-dir.js";
+import { normalizePrefix, type RemoteLocation } from "../../src/vault/paths.js";
+import { openStateDbReadOnly } from "../../src/db/connection.js";
+import { ObjectsRepository } from "../../src/db/repositories/objects-repository.js";
+import { convergeStoragePolicies } from "../../src/sync/converge-storage-policies.js";
+import { hashBufferHex } from "../../src/crypto/hash.js";
 
 const PASSWORD = "correct horse battery staple";
 
@@ -212,6 +223,124 @@ describe("converge", () => {
 
     const otherHead = await runCli(["status", "--root", root, "--filter", "other/*", "--json"]);
     expect(JSON.parse(otherHead.stdout)).toMatchObject({ changed_immediate: 1 }); // untouched by the scoped converge
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+/**
+ * `convergeStoragePolicies` is called directly here, not through a spawned
+ * CLI process, for the same reason `gc_retry.test.ts`/
+ * `materialize_progress.test.ts` do: `copyOverrides` (`thresholdBytes`/
+ * `partSizeBytes`) is a test-only seam with no CLI flag of its own, since
+ * production never needs anything but the real 5 GiB / 512 MiB defaults --
+ * see src/s3/copy-object.ts. This is what lets a ~12 MiB fixture exercise
+ * the real multipart-copy path (3 parts, at a forced 5 MiB threshold/part
+ * size) without an actual multi-GiB object.
+ */
+describe("converge: multipart storage-class copy for an object over the single-CopyObject limit", () => {
+  let localstack: LocalStackHandle;
+
+  beforeAll(async () => {
+    localstack = await startLocalStack();
+  });
+
+  afterAll(async () => {
+    await localstack.stop();
+  });
+
+  it("moves a >5MiB-forced-multipart object to a colder class, preserving its checksum and content byte-for-byte", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+
+    // ~12 MiB -- at the forced 5 MiB threshold/part size below, this is 3
+    // parts (two full 5 MiB parts, one shorter), enough to exercise real
+    // part-boundary behavior without an actual multi-GiB fixture.
+    const content = crypto.randomBytes(12 * 1024 * 1024);
+    const expectedHash = hashBufferHex(content);
+    fs.writeFileSync(path.join(root, "video.bin"), content);
+    await sync(root);
+    await createPolicy(root, "video.bin", "DEEP_ARCHIVE");
+
+    const remoteConfig = parseRemoteConfig(fs.readFileSync(localRemoteConfigPath(root)));
+    const client = createS3Client({ endpoint: remoteConfig.endpoint, region: remoteConfig.region });
+    const location: RemoteLocation = {
+      bucket: remoteConfig.bucket,
+      prefix: normalizePrefix(remoteConfig.prefix),
+    };
+    const logger = createLogger(false);
+
+    const stateDb = openStateDbReadOnly(localStateDbPath(root));
+    const objectRowBefore = new ObjectsRepository(stateDb).get(expectedHash);
+    stateDb.close();
+    expect(objectRowBefore).toBeDefined();
+    const expectedChecksum = objectRowBefore!.ciphertext_checksum;
+
+    const objectsBefore = await s3.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: "objects/" }),
+    );
+    const objectKey = objectsBefore.Contents?.[0]?.Key;
+    expect(objectKey).toBeDefined();
+    const headBefore = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: objectKey! }));
+    expect(headBefore.StorageClass ?? "STANDARD").toBe("STANDARD");
+    expect(headBefore.ContentLength).toBeGreaterThan(5 * 1024 * 1024); // confirms multipart will actually trigger below
+
+    const result = await convergeStoragePolicies(
+      root,
+      "**",
+      true,
+      { client, bucket: remoteConfig.bucket, location },
+      logger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      undefined,
+      undefined,
+      { thresholdBytes: 5 * 1024 * 1024, partSizeBytes: 5 * 1024 * 1024 },
+    );
+    expect(result.counts).toMatchObject({ alreadyCorrect: 0, changedImmediate: 1 });
+
+    // ChecksumMode "ENABLED" is required to get ChecksumCRC64NVME back at
+    // all -- without it S3 (and LocalStack, matching that behavior) omits
+    // the field even for an object that has one stored. Same requirement
+    // `headObject` (src/s3/client.ts) documents and sets by default.
+    const headAfter = await s3.send(
+      new HeadObjectCommand({ Bucket: bucket, Key: objectKey!, ChecksumMode: "ENABLED" }),
+    );
+    expect(headAfter.StorageClass).toBe("DEEP_ARCHIVE");
+    // The multipart copy's FULL_OBJECT checksum must be byte-identical to
+    // the one recorded at upload time -- not merely present, but the same
+    // value -- which is exactly what a composite (per-part) checksum could
+    // never guarantee across a different part layout. This is the real
+    // proof of byte-for-byte integrity available here: a direct `GetObject`
+    // to decrypt-and-compare against `content` isn't exercisable in this
+    // test the way it is for a warm object, because the object is now
+    // genuinely DEEP_ARCHIVE -- LocalStack enforces the same
+    // `InvalidObjectState` a real archived object would (confirmed
+    // directly: an un-restored `GetObject` against it fails exactly like
+    // real S3), and LocalStack doesn't simulate real restore timing (see
+    // docs/architecture/storage-classes-and-archive-restore.md), so a
+    // restore-then-read round trip isn't reliably testable here either.
+    // The checksum match is two independent confirmations of the same
+    // fact: S3 itself verified the combined parts against `expectedChecksum`
+    // at `CompleteMultipartUpload` time (inside `copyObjectStorageClass`),
+    // and this `HeadObject`, made fresh from the test's own client after
+    // the fact, independently confirms what S3 now has on record.
+    expect(headAfter.ChecksumCRC64NVME).toBe(expectedChecksum);
 
     fs.rmSync(root, { recursive: true, force: true });
   });

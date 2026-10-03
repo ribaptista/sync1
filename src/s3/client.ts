@@ -5,11 +5,9 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
-  CopyObjectCommand,
   RestoreObjectCommand,
   DeleteObjectCommand,
   type S3ClientConfig,
-  type StorageClass,
   type Tier,
 } from "@aws-sdk/client-s3";
 import type { Logger as SmithyLogger } from "@smithy/types";
@@ -237,6 +235,13 @@ export interface HeadResult {
    * asked for checksums at all has none to report.
    */
   checksumCrc64Nvme?: string;
+  /**
+   * The object's size in bytes. Added for `copyObjectStorageClass`
+   * (src/s3/copy-object.ts): converge already HEADs every object before
+   * deciding its action, so this is what lets it pick single-`CopyObject`
+   * vs. multipart without a second request.
+   */
+  contentLength?: number;
 }
 
 export async function headObject(
@@ -261,6 +266,9 @@ export async function headObject(
     if (result.ChecksumCRC64NVME !== undefined) {
       head.checksumCrc64Nvme = result.ChecksumCRC64NVME;
     }
+    if (result.ContentLength !== undefined) {
+      head.contentLength = result.ContentLength;
+    }
     return head;
   } catch (err) {
     if (err instanceof Error && err.name === "NotFound") return null;
@@ -268,7 +276,12 @@ export async function headObject(
   }
 }
 
-function encodeCopySource(bucket: string, key: string): string {
+/**
+ * Shared by the single-`CopyObject` path here and `copy-object.ts`'s
+ * multipart one -- both self-copy (same bucket/key as source and
+ * destination), so both need the same `CopySource` encoding.
+ */
+export function encodeCopySource(bucket: string, key: string): string {
   const encodedKey = key
     .split("/")
     .map((segment) => encodeURIComponent(segment))
@@ -277,27 +290,14 @@ function encodeCopySource(bucket: string, key: string): string {
 }
 
 /**
- * Self-copy (same bucket/key as source and destination) that only changes
- * the object's storage class -- the standard S3 mechanism for an in-place
- * class change, since there's no direct "set storage class" API. Metadata
- * is preserved (the default `MetadataDirective` behavior) since we're not
- * changing anything else about the object.
+ * S3's hard limit on a single `CopyObject`'s source size -- above this, a
+ * self-copy to change storage class has to go through the multipart
+ * copy path instead (`copyObjectStorageClass` in src/s3/copy-object.ts).
+ * Exactly the value S3 itself reports in `EntityTooLarge`'s error message
+ * ("The specified copy source is larger than the maximum allowable size
+ * for a copy source: 5368709120").
  */
-export async function copyObjectStorageClass(
-  client: S3Client,
-  bucket: string,
-  key: string,
-  storageClass: StorageClass,
-): Promise<void> {
-  await client.send(
-    new CopyObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      CopySource: encodeCopySource(bucket, key),
-      StorageClass: storageClass,
-    }),
-  );
-}
+export const COPY_MULTIPART_THRESHOLD_BYTES = 5 * 1024 ** 3;
 
 export interface RestoreOptions {
   days: number;

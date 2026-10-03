@@ -98,5 +98,11 @@ sequenceDiagram
   to cancel a part's request that is already in flight when the signal fires mid-upload — that request
   is simply left to settle on its own and discarded, which was deliberately not changed to cancel
   outright, since doing so changes nothing observable (see [`flow-apply-local-changes.md`](flow-apply-local-changes.md)).
+- **Shared, not duplicated:** `verifyStoredChecksum` and `abortMultipartUploadBestEffort` are exported
+  from `upload-object.ts` and reused as-is by the multipart storage-class copy path
+  (`src/s3/copy-object.ts`, see [`converge_status.md`](converge_status.md)'s own sub-sequence) — a
+  multipart copy left dangling after a failed part is exactly the same billed, orphaned state as a
+  multipart upload left dangling here, and a copy's completed-object checksum needs exactly the same
+  "present and byte-identical, or it's corruption" check this upload path already enforces.
 - **Sub-flows:** the body it reads is [`flow-encrypt-stream.md`](flow-encrypt-stream.md), which is where
   a size-mismatch or hash-mismatch failure actually originates.

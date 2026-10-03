@@ -78,7 +78,7 @@ export class S3UploadFatalError extends Error {
 const ABORT_MULTIPART_ATTEMPTS = 3;
 
 /** `exactOptionalPropertyTypes` forbids `{ abortSignal: undefined }`; omit the key entirely instead. */
-function abortSignalOption(
+export function abortSignalOption(
   signal: AbortSignal | undefined,
 ): { abortSignal: AbortSignal } | undefined {
   return signal ? { abortSignal: signal } : undefined;
@@ -125,9 +125,16 @@ export interface UploadObjectStreamOptions {
  *
  * CRC64NVME's single-value-either-way property (see checksum.ts) is what
  * lets this be one function for both upload paths, rather than a
- * full-object comparison for one and a composite comparison for the other.
+ * full-object comparison for one and a composite comparison for the other
+ * -- and, for the same reason, for the multipart storage-class copy path
+ * too (src/s3/copy-object.ts), which exports this rather than duplicating
+ * it.
  */
-function verifyStoredChecksum(key: string, expected: string, reported: string | undefined): void {
+export function verifyStoredChecksum(
+  key: string,
+  expected: string,
+  reported: string | undefined,
+): void {
   if (reported === expected) return;
   // Silence is a failure, not a compatibility affordance. This function
   // exists to make an upload prove itself rather than trust its 200, and a
@@ -192,8 +199,14 @@ async function putSmallObject(
   return expected;
 }
 
-/** Best-effort: never lets a cleanup failure replace the real error the caller is already propagating. */
-async function abortMultipartUploadBestEffort(
+/**
+ * Best-effort: never lets a cleanup failure replace the real error the
+ * caller is already propagating. Shared with the multipart storage-class
+ * copy path (src/s3/copy-object.ts) -- a multipart upload left dangling
+ * after a failed copy is exactly the same billed, orphaned state as one
+ * left after a failed upload.
+ */
+export async function abortMultipartUploadBestEffort(
   client: S3Client,
   bucket: string,
   key: string,

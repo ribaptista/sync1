@@ -37,6 +37,11 @@ classification) — but for each decided action, actually issues it:
 - **Ready to finalize** → the same self-copy, now that the temporary restored copy is available.
 - **Already correct** → nothing to do.
 
+The self-copy transparently goes through a multipart copy for any object over S3's 5 GiB single-copy
+limit, verifying the object's checksum is unchanged afterward — see
+[storage-classes-and-archive-restore.md](../architecture/storage-classes-and-archive-restore.md#colder-is-a-plain-copy-warmer-is-two-phase)
+for how. Nothing about the command's own usage changes for a large object.
+
 A dedup warmest-wins conflict (two paths sharing an object but implying different classes) is still
 converged to the warmest of the disagreeing targets — an object is never archived colder than any path
 that wants it kept warm — and the disagreement is still reported alongside the counts, exactly like

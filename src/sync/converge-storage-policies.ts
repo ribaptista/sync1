@@ -1,7 +1,8 @@
 import type PQueue from "p-queue";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { Logger } from "../logger.js";
-import { headObject, copyObjectStorageClass, restoreObject } from "../s3/client.js";
+import { headObject, restoreObject } from "../s3/client.js";
+import { copyObjectStorageClass, type CopyObjectStorageClassOptions } from "../s3/copy-object.js";
 import {
   classifyArchiveStatus,
   isSupportedStorageClass,
@@ -15,6 +16,8 @@ import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { StoragePoliciesRepository } from "../db/repositories/storage-policies-repository.js";
 import { CorruptionError } from "../errors.js";
+import { encryptedSize } from "../crypto/streaming-codec.js";
+import { HASH_BYTES } from "../crypto/hash.js";
 import {
   waitForRoom,
   createPoolErrorBox,
@@ -81,6 +84,13 @@ export async function convergeStoragePolicies(
    * trip, however long the run itself takes.
    */
   onTotalKnown?: (total: number) => void,
+  /**
+   * Test-only seam: forces `copyObjectStorageClass` (src/s3/copy-object.ts)
+   * onto its multipart path for a small fixture, rather than needing a
+   * real multi-GiB object to exercise it. Never set in production, where
+   * the function's own defaults (5 GiB / 512 MiB) apply.
+   */
+  copyOverrides?: Pick<CopyObjectStorageClassOptions, "thresholdBytes" | "partSizeBytes">,
 ): Promise<ConvergeResult> {
   const db = openStateDbReadOnly(localStateDbPath(root));
   const counts: ConvergeCounts = {
@@ -153,13 +163,30 @@ export async function convergeStoragePolicies(
           "classified object against storage policy",
         );
 
+        // `head.contentLength` is the real, encrypted S3 object size --
+        // what the 5 GiB single-`CopyObject` limit actually measures.
+        // `objectRow.size` is the *plaintext* size recorded at upload time
+        // (see apply-local-changes.ts), so it's only ever a fallback for a
+        // HEAD response that, unexpectedly, omitted ContentLength.
+        const copySizeBytes = head.contentLength ?? encryptedSize(objectRow.size, HASH_BYTES);
+
         switch (action.kind) {
           case "already-correct":
             counts.alreadyCorrect++;
             break;
           case "immediate-copy":
             counts.changedImmediate++;
-            if (apply) await copyObjectStorageClass(s3.client, s3.bucket, key, targetClass);
+            if (apply) {
+              await copyObjectStorageClass(
+                s3.client,
+                s3.bucket,
+                key,
+                targetClass,
+                copySizeBytes,
+                objectRow.ciphertext_checksum,
+                { logger, ...copyOverrides },
+              );
+            }
             break;
           case "needs-restore-request":
             counts.restoreRequested++;
@@ -175,7 +202,17 @@ export async function convergeStoragePolicies(
             break;
           case "finalize-copy":
             counts.finalized++;
-            if (apply) await copyObjectStorageClass(s3.client, s3.bucket, key, targetClass);
+            if (apply) {
+              await copyObjectStorageClass(
+                s3.client,
+                s3.bucket,
+                key,
+                targetClass,
+                copySizeBytes,
+                objectRow.ciphertext_checksum,
+                { logger, ...copyOverrides },
+              );
+            }
             break;
         }
         logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "completed");
