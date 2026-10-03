@@ -41,11 +41,38 @@ materializing never changes an object's permanent storage class.
 ## Colder is a plain copy; warmer is two-phase
 
 S3 has no direct "set storage class" API — the standard mechanism is a same-bucket, same-key
-`CopyObject` naming the new `StorageClass`, which `copyObjectStorageClass` wraps. Moving to a colder
-class is always exactly that one call. Moving to a warmer class needs `RestoreObject` first (to get a
-temporary readable copy off the archived original) and only _then_ the same finalizing copy, once the
-restore is `ready` — the copy is what actually, permanently changes the class; a completed restore by
-itself does not.
+`CopyObject` naming the new `StorageClass`, which `copyObjectStorageClass` (`src/s3/copy-object.ts`)
+wraps. Moving to a colder class is always exactly that one call. Moving to a warmer class needs
+`RestoreObject` first (to get a temporary readable copy off the archived original) and only _then_ the
+same finalizing copy, once the restore is `ready` — the copy is what actually, permanently changes the
+class; a completed restore by itself does not.
+
+**Above 5 GiB, that one call doesn't exist.** A single `CopyObject`'s source is capped at
+`COPY_MULTIPART_THRESHOLD_BYTES` (5 GiB, S3's own `EntityTooLarge` limit) — every object larger than
+that, colder or warmer alike, failed both the `immediate-copy` and `finalize-copy` paths outright until
+this was fixed, which aborted the whole `converge` run (the error is fatal to the dispatched `s3Pool`
+job), leaving every object after it in the run unconverged too. A `finalize-copy` failure was worse than
+an `immediate-copy` one: the restore it was finishing had already been paid for, and was silently
+re-requested on every subsequent `converge` run since the finalize never actually landed.
+
+Above the threshold, `copyObjectStorageClass` does the multipart equivalent instead:
+`CreateMultipartUpload` on the same key (carrying the target `StorageClass`), one `UploadPartCopy` per
+~512 MiB range (each a genuinely server-side copy — no object bytes ever cross the caller's own link),
+then `CompleteMultipartUpload`. `ChecksumType: "FULL_OBJECT"` throughout is what keeps the object's own
+CRC64NVME identical to what it was before the copy (a composite, per-part checksum would differ purely
+because the part boundaries changed, breaking every later comparison against
+`objects.ciphertext_checksum`) — S3 itself verifies the combined parts against the expected value at
+completion, and the result is checked again on this end
+(`verifyStoredChecksum`, shared with the upload path in `src/s3/upload-object.ts`). A failure at any
+point issues a best-effort `AbortMultipartUploadCommand` before rethrowing, so a failed copy never
+leaves a billed, half-finished upload sitting on the object's own key.
+
+Each object's own parts run on a queue private to that one copy call, never the caller's shared
+`s3Pool` — `convergeStoragePolicies` dispatches one job per object into `s3Pool`, and that job is what
+calls `copyObjectStorageClass`, so by the time a multipart copy's own parts would need pool capacity,
+the job itself is already occupying a slot in the very pool it would be asking for more of. Queuing the
+parts into that same pool would deadlock the run the moment enough large objects are converged at once
+to fill every slot with such a job.
 
 ## Dedup interaction
 

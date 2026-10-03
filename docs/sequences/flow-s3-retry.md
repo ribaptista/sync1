@@ -4,9 +4,12 @@
 
 **Used by:** [`sync.md`](sync.md) (via [`flow-put-object-stream.md`](flow-put-object-stream.md),
 sync's upload path, and [`flow-apply-remote-changes.md`](flow-apply-remote-changes.md), its download
-path), [`materialize.md`](materialize.md)
+path), [`materialize.md`](materialize.md), and, as of the multipart storage-class copy fix,
+[`converge_status.md`](converge_status.md)'s own `copyObjectStorageClass` sub-sequence (`src/s3/copy-object.ts`)
+-- but only that one sub-path; see below for the rest of that command's calls.
 
-**Deliberately not used by:** `gc.md`, `converge_status.md`, `policy_edit.md` — see below.
+**Deliberately not used by:** `gc.md`, `policy_edit.md`, and every _other_ call `converge_status.md`
+makes (`headObject`/`restoreObject`/the at-or-below-threshold single `CopyObject`) — see below.
 
 `withS3Retry` wraps one S3 request and retries it **forever** on a fixed set of transient AWS SDK error
 names, node socket/DNS errnos, and HTTP status codes, with exponential backoff capped at a maximum
@@ -71,10 +74,18 @@ sequenceDiagram
     network blip. Wrapping that loop's own S3 calls in an _additional_, unbounded retry would make a
     genuinely stuck five-attempt loop indistinguishable from a healthy one still working through
     transient errors.
-  - `converge`/`status` HEAD/copy/restore calls have no retry wrapper at all — a transient failure there
-    simply fails that one object's dispatched job, counted as a pool error, and the command reports what
-    it managed before the failure. This is a plainer, less resilient design than sync's, and nothing in
-    the code notes why; it is stated here because the asymmetry is otherwise invisible.
+  - `converge`/`status`'s own `headObject`/`restoreObject` calls, and the at-or-below-threshold single
+    `CopyObject`, have no retry wrapper at all — a transient failure there simply fails that one
+    object's dispatched job, counted as a pool error, and the command reports what it managed before the
+    failure. This is a plainer, less resilient design than sync's, and nothing in the code notes why; it
+    is stated here because the asymmetry is otherwise invisible. The one exception, added with the
+    multipart storage-class copy fix: once an object is large enough that `copyObjectStorageClass`
+    (`src/s3/copy-object.ts`) falls back to a multipart copy, each of its own
+    `CreateMultipartUpload`/`UploadPartCopy`/`CompleteMultipartUpload` requests _is_ wrapped in
+    `withS3Retry`, same as the upload path's own multipart requests — a copy spanning many parts over a
+    possibly-long time is exactly the case this module's unbounded-retry rationale was written for, and
+    there was no reason to leave it as fragile as the rest of this command's calls once it needed
+    building anyway.
 - **Visibility:** because a retry loop looks identical at minute one and at minute sixty, `onRetry`
   always carries both the attempt count and elapsed time, and every caller logs it — the diagram in
   [`sync.md`](sync.md) shows exactly where those log lines land relative to the progress bar (fd 3).
