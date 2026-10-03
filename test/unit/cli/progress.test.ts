@@ -39,6 +39,21 @@ const multibarCreateMock = vi.fn((..._createArgs: unknown[]) => {
 });
 const multibarStopMock = vi.fn();
 const multibarRemoveMock = vi.fn();
+// MultiBarBytesProgressSession registers a `redraw-pre` listener on
+// construction to drive each bar's batched-push mechanism (see
+// MultiBarByteBar's `dirty`/`flushPending` in progress.ts) -- captured here
+// so tests can simulate "the next repaint is about to happen" without a
+// real cli-progress timer. `startProgressSession`'s session (the plain
+// item-count bar) registers no listener at all -- it has no batching to
+// drive, see its own describe block below -- so this stays unused there.
+const redrawPreListeners: Array<() => void> = [];
+const multibarOnMock = vi.fn((event: string, listener: () => void) => {
+  if (event === "redraw-pre") redrawPreListeners.push(listener);
+});
+/** Simulates the MultiBar's own repaint tick, landing any batched push. */
+function triggerRedrawPre(): void {
+  for (const listener of redrawPreListeners) listener();
+}
 
 // formatEtaTime's own default-formatter delegation path (see progress.ts)
 // calls through Format.TimeFormat -- mocked here as a spy rather than
@@ -164,7 +179,9 @@ describe("startBytesProgressSession", () => {
     multibarCreateMock.mockClear();
     multibarStopMock.mockClear();
     multibarRemoveMock.mockClear();
+    multibarOnMock.mockClear();
     createdBars.length = 0;
+    redrawPreListeners.length = 0;
     // createLoggerForRun's own beforeEach (above) calls vi.restoreAllMocks(),
     // which wipes this mock's .mockImplementation() back to a no-op for the
     // rest of the file -- reinstated here so these tests don't depend on
@@ -175,6 +192,7 @@ describe("startBytesProgressSession", () => {
           create: multibarCreateMock,
           stop: multibarStopMock,
           remove: multibarRemoveMock,
+          on: multibarOnMock,
         }) as unknown as MultiBar,
     );
     ({ startBytesProgressSession } = await import("../../../src/cli/progress.js"));
@@ -232,57 +250,49 @@ describe("startBytesProgressSession", () => {
   });
 
   it("drops the approximate marker once totals are final", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      session.setOverallTotals({ bytes: 1000, files: 10 });
-      vi.setSystemTime(Date.now() + 100);
-      session.setOverallProgress({ bytes: 500, files: 5 });
-      expect(barUpdateMock).toHaveBeenLastCalledWith(
-        500,
-        expect.objectContaining({ sizeTotal: `~${prettyBytes(1000)}`, etaPrefix: "~" }),
-      );
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 1000, files: 10 });
+    session.setOverallProgress({ bytes: 500, files: 5 });
+    // Neither call above carries an activity or a final total, so both are
+    // only batched -- landing them needs the next simulated repaint.
+    triggerRedrawPre();
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      500,
+      expect.objectContaining({ sizeTotal: `~${prettyBytes(1000)}`, etaPrefix: "~" }),
+    );
 
-      // The provisional->final edge force-flushes: the rendered format
-      // itself changes, so it must not wait out the throttle window.
-      session.setOverallTotals({ bytes: 1000, files: 10, final: true });
-      expect(barUpdateMock).toHaveBeenLastCalledWith(
-        500,
-        expect.objectContaining({ sizeTotal: prettyBytes(1000), etaPrefix: "" }),
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+    // The provisional->final edge force-flushes: the rendered format
+    // itself changes, so it must not wait for the next repaint.
+    session.setOverallTotals({ bytes: 1000, files: 10, final: true });
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      500,
+      expect.objectContaining({ sizeTotal: prettyBytes(1000), etaPrefix: "" }),
+    );
   });
 
   it("setOverallProgress sets an absolute value and updates the payload with pretty-printed sizes", () => {
-    // Fake timers, scoped to Date only: every setOverallProgress/Totals call
-    // now goes through the flush throttle (see FLUSH_INTERVAL_MS in
-    // progress.ts), so proving the *asserted* call actually reaches the bar
-    // means clearing that window first -- the throttle itself is a separate
+    // Neither call below carries an activity or a final total, so both are
+    // only batched (see MultiBarByteBar's `dirty`/`flushPending` in
+    // progress.ts) -- proving the *asserted* call actually reaches the bar
+    // means simulating a repaint first. The batching itself is a separate
     // describe below.
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      session.setOverallTotals({ bytes: 2_000_000, files: 10 });
-      vi.setSystemTime(Date.now() + 100);
-      session.setOverallProgress({ bytes: 1_000_000, files: 5 });
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 2_000_000, files: 10 });
+    session.setOverallProgress({ bytes: 1_000_000, files: 5 });
+    triggerRedrawPre();
 
-      expect(barUpdateMock).toHaveBeenLastCalledWith(1_000_000, {
-        filesDone: "5",
-        // "~" because nothing has declared these totals final yet.
-        filesTotal: "~10",
-        sizeDone: prettyBytes(1_000_000),
-        sizeTotal: `~${prettyBytes(2_000_000)}`,
-        etaPrefix: "~",
-        // Empty unless a producer reported per-sink bytes -- every bar but
-        // sync's upload phase renders exactly as it did before.
-        rates: "",
-        activity: "", // no activity reported yet
-      });
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(barUpdateMock).toHaveBeenLastCalledWith(1_000_000, {
+      filesDone: "5",
+      // "~" because nothing has declared these totals final yet.
+      filesTotal: "~10",
+      sizeDone: prettyBytes(1_000_000),
+      sizeTotal: `~${prettyBytes(2_000_000)}`,
+      etaPrefix: "~",
+      // Empty unless a producer reported per-sink bytes -- every bar but
+      // sync's upload phase renders exactly as it did before.
+      rates: "",
+      activity: "", // no activity reported yet
+    });
   });
 
   /**
@@ -298,9 +308,13 @@ describe("startBytesProgressSession", () => {
       session.setOverallTotals({ bytes: 10_000_000, files: 1, final: true });
 
       // First sample establishes the baseline; there is no interval yet,
-      // so nothing is claimed about a rate.
+      // so nothing is claimed about a rate. Each setOverallProgress call
+      // below is only batched (no activity), so a simulated repaint lands
+      // it -- the rate math inside the push reads Date.now() at that point,
+      // so advancing the fake clock first is what controls the interval.
       vi.setSystemTime(Date.now() + 100);
       session.setOverallProgress({ bytes: 0, sinkBytes: { s3: 0, mirror: 0 } });
+      triggerRedrawPre();
 
       // One second of wall clock, 1 MB to s3 and 500 KB to the mirror.
       vi.setSystemTime(Date.now() + 1000);
@@ -308,6 +322,7 @@ describe("startBytesProgressSession", () => {
         bytes: 1_000_000,
         sinkBytes: { s3: 1_000_000, mirror: 500_000 },
       });
+      triggerRedrawPre();
 
       const payload = barUpdateMock.mock.lastCall?.[1] as { rates: string };
       expect(payload.rates).toMatch(/^ \[s3 .+\/s, mirror .+\/s\]$/);
@@ -321,43 +336,33 @@ describe("startBytesProgressSession", () => {
   });
 
   it("omits the rates segment entirely when no sink bytes are reported", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "hashing" });
-      session.setOverallTotals({ bytes: 1000, files: 1, final: true });
-      vi.setSystemTime(Date.now() + 100);
-      session.setOverallProgress({ bytes: 500 });
+    const session = startBytesProgressSession({ show: true, overallLabel: "hashing" });
+    session.setOverallTotals({ bytes: 1000, files: 1, final: true });
+    session.setOverallProgress({ bytes: 500 });
+    triggerRedrawPre();
 
-      const payload = barUpdateMock.mock.lastCall?.[1] as { rates: string };
-      expect(payload.rates).toBe("");
-    } finally {
-      vi.useRealTimers();
-    }
+    const payload = barUpdateMock.mock.lastCall?.[1] as { rates: string };
+    expect(payload.rates).toBe("");
   });
 
   it("a partial update leaves the other field's last-known value unchanged", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      session.setOverallTotals({ bytes: 1000, files: 10 });
-      vi.setSystemTime(Date.now() + 100);
-      session.setOverallProgress({ bytes: 500, files: 5 });
-      barUpdateMock.mockClear();
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 1000, files: 10 });
+    session.setOverallProgress({ bytes: 500, files: 5 });
+    triggerRedrawPre();
+    barUpdateMock.mockClear();
 
-      vi.setSystemTime(Date.now() + 100);
-      session.setOverallProgress({ bytes: 700 }); // files omitted
-      expect(barUpdateMock).toHaveBeenLastCalledWith(700, {
-        filesDone: "5", // unchanged from the previous call
-        filesTotal: "~10",
-        sizeDone: prettyBytes(700),
-        sizeTotal: `~${prettyBytes(1000)}`,
-        etaPrefix: "~",
-        rates: "",
-        activity: "",
-      });
-    } finally {
-      vi.useRealTimers();
-    }
+    session.setOverallProgress({ bytes: 700 }); // files omitted
+    triggerRedrawPre();
+    expect(barUpdateMock).toHaveBeenLastCalledWith(700, {
+      filesDone: "5", // unchanged from the previous call
+      filesTotal: "~10",
+      sizeDone: prettyBytes(700),
+      sizeTotal: `~${prettyBytes(1000)}`,
+      etaPrefix: "~",
+      rates: "",
+      activity: "",
+    });
   });
 
   it("stop() stops the underlying multibar", () => {
@@ -424,27 +429,22 @@ describe("startBytesProgressSession", () => {
   });
 
   it("stop() flushes every phase bar, not just the last one", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "syncing" });
-      const scanning = session.startPhase("scanning");
-      const uploading = session.startPhase("uploading");
-      // Both bars flushed once on construction; these land inside that
-      // window and are throttled away on both.
-      scanning.setOverallProgress({ bytes: 7 });
-      uploading.setOverallProgress({ bytes: 9 });
+    const session = startBytesProgressSession({ show: true, overallLabel: "syncing" });
+    const scanning = session.startPhase("scanning");
+    const uploading = session.startPhase("uploading");
+    // Both bars flushed once on construction; these calls carry no activity
+    // and no final total, so both are only batched, on both bars.
+    scanning.setOverallProgress({ bytes: 7 });
+    uploading.setOverallProgress({ bytes: 9 });
 
-      const [scanBar, uploadBar] = createdBars;
-      expect(scanBar!.update).toHaveBeenCalledTimes(1);
-      expect(uploadBar!.update).toHaveBeenCalledTimes(1);
+    const [scanBar, uploadBar] = createdBars;
+    expect(scanBar!.update).toHaveBeenCalledTimes(1);
+    expect(uploadBar!.update).toHaveBeenCalledTimes(1);
 
-      session.stop();
+    session.stop();
 
-      expect(scanBar!.update).toHaveBeenLastCalledWith(7, expect.anything());
-      expect(uploadBar!.update).toHaveBeenLastCalledWith(9, expect.anything());
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(scanBar!.update).toHaveBeenLastCalledWith(7, expect.anything());
+    expect(uploadBar!.update).toHaveBeenLastCalledWith(9, expect.anything());
   });
 
   it("renders whatever caller-supplied verb it's given, with no vocabulary of its own", () => {
@@ -465,109 +465,109 @@ describe("startBytesProgressSession", () => {
   });
 
   it("a later update omitting activity leaves the previously shown label in place", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      session.setOverallTotals({ bytes: 100 });
-      session.setOverallProgress({ bytes: 10, activity: { verb: "hashing", path: "a.jpg" } });
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 100 });
+    session.setOverallProgress({ bytes: 10, activity: { verb: "hashing", path: "a.jpg" } });
 
-      // The activity-bearing call above flushed immediately regardless of
-      // any window (activity bypasses the throttle) -- only this follow-up
-      // plain numeric call needs the clock advanced to actually land.
-      vi.setSystemTime(Date.now() + 100);
-      session.setOverallProgress({ bytes: 20 }); // activity omitted
+    // The activity-bearing call above pushed immediately (activity bypasses
+    // the batching) -- only this follow-up plain numeric call needs a
+    // simulated repaint to actually land.
+    session.setOverallProgress({ bytes: 20 }); // activity omitted
+    triggerRedrawPre();
 
-      expect(barUpdateMock).toHaveBeenLastCalledWith(
-        20,
-        expect.objectContaining({ activity: "hashing a.jpg..." }),
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      20,
+      expect.objectContaining({ activity: "hashing a.jpg..." }),
+    );
   });
 
   it("flushes once immediately when a bar is born, before any real progress exists", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      session.setOverallTotals({ bytes: 100 });
-      // One call, not two: the bar's birth flush renders it straight away
-      // (carrying zeroes -- nothing has happened yet), and the update that
-      // triggered that birth lands inside its own throttle window.
-      expect(barUpdateMock).toHaveBeenCalledTimes(1);
-      expect(barUpdateMock).toHaveBeenLastCalledWith(0, expect.anything());
-    } finally {
-      vi.useRealTimers();
-    }
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 100 });
+    // One call, not two: the bar's birth flush renders it straight away
+    // (carrying zeroes -- nothing has happened yet), and the update that
+    // triggered that birth is only batched, not forced.
+    expect(barUpdateMock).toHaveBeenCalledTimes(1);
+    expect(barUpdateMock).toHaveBeenLastCalledWith(0, expect.anything());
   });
 
-  it("throttles a burst of numeric-only updates, flushing again only once the interval elapses", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      session.setOverallProgress({ bytes: 0 }); // births the bar
-      barUpdateMock.mockClear(); // clear the bar's own immediate birth flush
+  it("batches a burst of numeric-only updates, flushing again only on the next repaint", () => {
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallProgress({ bytes: 0 }); // births the bar
+    barUpdateMock.mockClear(); // clear the bar's own immediate birth flush
 
-      session.setOverallProgress({ bytes: 10 });
-      session.setOverallProgress({ bytes: 20 });
-      session.setOverallProgress({ bytes: 30 });
-      expect(barUpdateMock).not.toHaveBeenCalled(); // all three landed inside the same window
+    session.setOverallProgress({ bytes: 10 });
+    session.setOverallProgress({ bytes: 20 });
+    session.setOverallProgress({ bytes: 30 });
+    session.setOverallProgress({ bytes: 40 });
+    expect(barUpdateMock).not.toHaveBeenCalled(); // all four are only batched
 
-      vi.setSystemTime(Date.now() + 100);
-      session.setOverallProgress({ bytes: 40 });
+    triggerRedrawPre();
 
-      // Exactly one new call, once the interval elapses -- and it carries
-      // the *latest* state, not the first value the throttle suppressed.
-      expect(barUpdateMock).toHaveBeenCalledTimes(1);
-      expect(barUpdateMock).toHaveBeenLastCalledWith(
-        40,
-        expect.objectContaining({ sizeDone: prettyBytes(40) }),
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+    // Exactly one new call, on the next repaint -- and it carries the
+    // *latest* state, not the first value the batching held back.
+    expect(barUpdateMock).toHaveBeenCalledTimes(1);
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      40,
+      expect.objectContaining({ sizeDone: prettyBytes(40) }),
+    );
   });
 
-  it("flushes immediately when an update carries a new activity, even inside another update's throttle window", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      session.setOverallProgress({ bytes: 0 }); // births the bar
-      barUpdateMock.mockClear();
+  it("never drops a batched update, however many repaints pass before another real event arrives", () => {
+    // Regression test for the bug this batching replaced: a plain
+    // time-windowed throttle dropped a call that landed inside its own
+    // window unless something later re-triggered a flush -- fine during a
+    // busy burst, but exactly what left a bar frozen at `0/~0 files`
+    // through an entire HEAD-check-then-download pause with nothing left
+    // to resend the dropped update once the window had passed. Driving the
+    // push off the repaint itself instead means it is still there to be
+    // picked up no matter how many repaints go by first.
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallProgress({ bytes: 0 });
+    barUpdateMock.mockClear();
 
-      session.setOverallProgress({ bytes: 10 }); // no activity, no clock advance -- throttled away
-      expect(barUpdateMock).not.toHaveBeenCalled();
+    session.setOverallProgress({ bytes: 99 });
+    triggerRedrawPre(); // lands it
+    triggerRedrawPre(); // nothing new since -- must not re-push stale state
+    triggerRedrawPre();
 
-      session.setOverallProgress({ bytes: 10, activity: { verb: "hashing", path: "a.jpg" } });
-      expect(barUpdateMock).toHaveBeenCalledTimes(1);
-      expect(barUpdateMock).toHaveBeenLastCalledWith(
-        10,
-        expect.objectContaining({ activity: "hashing a.jpg..." }),
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(barUpdateMock).toHaveBeenCalledTimes(1);
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      99,
+      expect.objectContaining({ sizeDone: prettyBytes(99) }),
+    );
   });
 
-  it("stop() flushes a throttled-away update's true values, not a stale mid-throttle snapshot", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      const session = startBytesProgressSession({ show: true, overallLabel: "x" });
-      session.setOverallTotals({ bytes: 1000 });
-      barUpdateMock.mockClear();
+  it("flushes immediately when an update carries a new activity, even with another update still batched", () => {
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallProgress({ bytes: 0 }); // births the bar
+    barUpdateMock.mockClear();
 
-      session.setOverallProgress({ bytes: 999 }); // no clock advance -- throttled away
-      expect(barUpdateMock).not.toHaveBeenCalled();
+    session.setOverallProgress({ bytes: 10 }); // no activity -- only batched
+    expect(barUpdateMock).not.toHaveBeenCalled();
 
-      session.stop();
+    session.setOverallProgress({ bytes: 10, activity: { verb: "hashing", path: "a.jpg" } });
+    expect(barUpdateMock).toHaveBeenCalledTimes(1);
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      10,
+      expect.objectContaining({ activity: "hashing a.jpg..." }),
+    );
+  });
 
-      expect(barUpdateMock).toHaveBeenLastCalledWith(
-        999,
-        expect.objectContaining({ sizeDone: prettyBytes(999) }),
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+  it("stop() flushes a batched update's true values, not a stale snapshot", () => {
+    const session = startBytesProgressSession({ show: true, overallLabel: "x" });
+    session.setOverallTotals({ bytes: 1000 });
+    barUpdateMock.mockClear();
+
+    session.setOverallProgress({ bytes: 999 }); // no activity -- only batched
+    expect(barUpdateMock).not.toHaveBeenCalled();
+
+    session.stop();
+
+    expect(barUpdateMock).toHaveBeenLastCalledWith(
+      999,
+      expect.objectContaining({ sizeDone: prettyBytes(999) }),
+    );
   });
 });
 

@@ -328,26 +328,27 @@ class MultiBarByteBar implements BytesProgressTarget {
   private totalsFinal = false;
   private activity: { verb: string; path: string } | undefined;
 
-  // How often our state is actually pushed into the underlying bar -- and
-  // therefore into cli-progress's own ETA ring buffer (a fixed 10-sample
-  // window, node_modules/cli-progress/lib/eta.js). Matched to cli-progress's
-  // own `fps: 10` redraw rate, so this never slows down what's visible:
-  // MultiBar repaints every bar off its own independent ~100ms timer
-  // regardless of how often we call `.update()` (multi-bar.js), so pushing
-  // state in faster than that buys nothing on screen while still feeding
-  // that 10-sample buffer far faster than a representative rate needs --
-  // which is exactly what produced a premature "0s" with tens of GB still
-  // left: dozens of file-discovery/-resolution events plus every in-flight
-  // hash's 100ms byte-counter poll (see hash-runner.ts) can otherwise flood
-  // all 10 samples within a handful of milliseconds, so the "recent rate"
-  // computed over that sliver is essentially noise. A separate, structural
-  // bug -- not fixed by this throttle, since the rate is genuinely zero
-  // rather than merely noisy -- produced the literal string `NFs`; see
-  // `formatEtaTime` above.
-  private static readonly FLUSH_INTERVAL_MS = 100;
-  // `null`, not `0`, so "never flushed yet" can't be confused with "flushed
-  // at Date.now() === 0" (a frozen/fake clock in a test, say).
-  private lastFlushedAt: number | null = null;
+  // Whether setOverallTotals/setOverallProgress has recorded state since
+  // the last time it actually reached the underlying bar. Pushing on every
+  // call -- rather than batching into the next tick -- is what produced a
+  // premature "0s" with tens of GB still left: dozens of file-discovery/
+  // -resolution events plus every in-flight hash's 100ms byte-counter poll
+  // (see hash-runner.ts) can flood cli-progress's own 10-sample ETA ring
+  // buffer (node_modules/cli-progress/lib/eta.js) within a handful of
+  // milliseconds, so the "recent rate" computed over that sliver is
+  // essentially noise. A separate, structural bug -- not related to this
+  // flag -- produced the literal string `NFs`; see `formatEtaTime` above.
+  //
+  // `flushIfDirty` (driven by the MultiBar's own `redraw-pre` event, see
+  // `MultiBarBytesProgressSession`) is what actually lands a dirty push,
+  // at most once per repaint -- matching cli-progress's own `fps: 10`
+  // redraw rate exactly, since it's triggered by that same repaint rather
+  // than by an independent timer. This also guarantees every update
+  // eventually reaches the bar: unlike a plain time-windowed throttle, a
+  // push that arrives mid-window is never simply dropped if nothing later
+  // arrives to carry it -- it stays dirty until the next repaint, however
+  // long that is.
+  private dirty = false;
   /**
    * Weight given to the newest sample. Low enough that a brief stall
    * doesn't read as a crash, high enough that a real one shows within a
@@ -434,32 +435,34 @@ class MultiBarByteBar implements BytesProgressTarget {
 
   /**
    * Pushes the session's current state into the underlying bar -- the only
-   * thing that feeds cli-progress's own ETA sample buffer, see
-   * `FLUSH_INTERVAL_MS` above. `setTotal` always runs (cheap, and doesn't
-   * touch the eta buffer itself -- only `.update()`'s *value* does); the
-   * `.update()` call itself is what's throttled, unless `force` is set for
-   * one of three cases that must never wait out the window: the very first
-   * flush (so the bar isn't blank, and so a cold-start activity label
-   * reaches it instantly), any update carrying a new `activity` (rare by
-   * construction -- at most two per file, start and finish -- so bypassing
-   * them costs nothing toward the flood this exists to suppress, and a user
+   * thing that feeds cli-progress's own ETA sample buffer, see `dirty`
+   * above. `setTotal` always runs (cheap, and doesn't touch the eta buffer
+   * itself -- only `.update()`'s *value* does); the `.update()` call itself
+   * is skipped unless `force` is set, for one of three cases that must
+   * never wait for the next repaint: the very first flush (so the bar
+   * isn't blank, and so a cold-start activity label reaches it instantly),
+   * any update carrying a new `activity` (rare by construction -- at most
+   * two per file, start and finish -- so bypassing the batching costs
+   * nothing toward the flood that batching exists to suppress, and a user
    * watching the label for proof-of-life shouldn't wait on it), and
    * `stop()`'s final flush (`MultiBar.stop()` re-renders each bar's
    * *current* value one last time with `clearOnComplete: false`, so a
-   * throttled-away update must land before that happens, or the run could
-   * end on a stale mid-throttle snapshot).
+   * not-yet-landed update must land before that happens, or the run could
+   * end on a stale snapshot).
    */
   private flush(force: boolean): void {
     this.overall.setTotal(Math.max(this.bytesTotal, 1));
+    // Non-forced calls only mark `dirty` (above, in the two setters) and
+    // leave the actual push for `flushPending` -- see that method's own
+    // doc comment for why pushing here too would reintroduce the bug this
+    // batching exists to fix.
+    if (!force) return;
+    this.push();
+  }
+
+  private push(): void {
+    this.dirty = false;
     const now = Date.now();
-    if (
-      !force &&
-      this.lastFlushedAt !== null &&
-      now - this.lastFlushedAt < MultiBarByteBar.FLUSH_INTERVAL_MS
-    ) {
-      return;
-    }
-    this.lastFlushedAt = now;
     const approx = this.totalsFinal ? "" : "~";
     this.overall.update(this.bytesDone, {
       filesDone: String(this.filesDone),
@@ -470,6 +473,24 @@ class MultiBarByteBar implements BytesProgressTarget {
       rates: this.ratesLabel(now),
       activity: this.activityLabel(),
     });
+  }
+
+  /**
+   * Lands a push that a non-forced `flush` left batched, if `dirty` is
+   * still set. Called from `MultiBarBytesProgressSession`'s own
+   * `redraw-pre` listener -- fired by the underlying `MultiBar` immediately
+   * before every repaint (node_modules/cli-progress/lib/multi-bar.js) --
+   * so this can never run more often than the bar actually redraws, and it
+   * also can never be starved the way the previous design was: that design
+   * threw away any update that landed inside its own 100ms window unless
+   * something later re-triggered a flush, which is exactly what left a bar
+   * showing `0/~0 files` through an entire HEAD-check-then-download pause
+   * with nothing left afterward to resend the dropped update. Driving the
+   * push off the repaint itself instead means there is always a next
+   * repaint to carry whatever is still dirty.
+   */
+  flushPending(): void {
+    if (this.dirty) this.push();
   }
 
   setOverallTotals(totals: { files?: number; bytes?: number; final?: boolean }): void {
@@ -495,7 +516,8 @@ class MultiBarByteBar implements BytesProgressTarget {
     // Forced only on the provisional->final edge, never on an ordinary
     // revision: the format itself changes there (the "~" disappears), and
     // a revision-driven force would reintroduce exactly the flood of
-    // `.update()` calls FLUSH_INTERVAL_MS exists to suppress.
+    // `.update()` calls the batching above exists to suppress.
+    this.dirty = true;
     this.flush(becameFinal);
   }
 
@@ -510,14 +532,17 @@ class MultiBarByteBar implements BytesProgressTarget {
     if (current.sinkBytes !== undefined) this.sinkBytes = current.sinkBytes;
     const isNewActivity = current.activity !== undefined;
     if (isNewActivity) this.activity = current.activity;
+    this.dirty = true;
     this.flush(isNewActivity);
   }
 
   /**
-   * Lands any update the throttle was still holding. `MultiBar.stop()`
-   * re-renders each bar's *current* value one last time (with
-   * `clearOnComplete: false`), so without this a run could end on a stale
-   * mid-throttle snapshot.
+   * Lands any update that was still batched, unconditionally.
+   * `MultiBar.stop()` re-renders each bar's *current* value one last time
+   * (with `clearOnComplete: false`), so without this a run could end on a
+   * stale snapshot -- `flushPending` alone would do the same thing, but
+   * only this method's unconditional push is guaranteed to run before
+   * `stop()`'s own render rather than racing the next `redraw-pre`.
    */
   flushFinal(): void {
     this.flush(true);
@@ -539,6 +564,16 @@ class MultiBarBytesProgressSession implements BytesProgressSession {
       { clearOnComplete: false, hideCursor: true, formatTime: formatEtaTime },
       Presets.shades_classic,
     );
+    // Drives every bar's own batched-push mechanism (see MultiBarByteBar's
+    // `dirty`/`flushPending`) off the MultiBar's actual repaint rather than
+    // an independent timer of our own -- `redraw-pre` fires immediately
+    // before each repaint (node_modules/cli-progress/lib/multi-bar.js), so
+    // this lands the latest state exactly once per repaint, never more
+    // often, and never leaves a bar stalled on stale numbers between
+    // bursts of activity.
+    this.multibar.on("redraw-pre", () => {
+      for (const bar of this.bars) bar.flushPending();
+    });
   }
 
   private own(): MultiBarByteBar {
