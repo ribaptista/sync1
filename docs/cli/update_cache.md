@@ -47,6 +47,11 @@ known in `cache.db`, in lockstep sorted order:
   (`dropped_ignored` in `--json`, by path) rather than left to be uploaded on the next `sync`. Only ever
   a not-yet-synced (`created`) row — a path already shared with the vault is never un-tracked this way;
   see [ignore-and-storage-policies.md](../architecture/ignore-and-storage-policies.md).
+- **A real (non-stub) file whose name doesn't leave room for a future `.stub` suffix** → the whole run
+  fails immediately, naming the offending path; nothing from the run is staged, not even an unrelated
+  healthy file discovered in the same scan. See
+  [stub-files.md](../architecture/stub-files.md#the-250-byte-name-budget) for why this limit exists and
+  how to fix it (rename the file to something shorter, then rerun).
 
 ## Output
 
@@ -57,7 +62,8 @@ known in `cache.db`, in lockstep sorted order:
 ## Exit codes
 
 - `0` — success (even if nothing changed).
-- `1` — root not initialized/attached, or a filesystem error.
+- `1` — root not initialized/attached, a filesystem error, or a tracked file's name leaves no room for a
+  future `.stub` suffix.
 
 ## Example
 

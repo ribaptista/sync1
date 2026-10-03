@@ -9,8 +9,25 @@ import { CorruptionError } from "../errors.js";
 import { inTreeTempPath } from "./temp-path.js";
 import { durableRename } from "./durable.js";
 
+/** Linux filesystems (ext4, btrfs, xfs, ...) cap a single path component at this many bytes. */
+export const MAX_FILENAME_BYTES = 255;
+
+export const STUB_SUFFIX = ".stub";
+
 export function stubPathFor(realAbsolutePath: string): string {
-  return `${realAbsolutePath}.stub`;
+  return `${realAbsolutePath}${STUB_SUFFIX}`;
+}
+
+/**
+ * True when `basename` (the real file's own name) still fits under
+ * `MAX_FILENAME_BYTES` once `STUB_SUFFIX` is appended -- the actual
+ * constraint a trackable file's name has to satisfy, since every tracked
+ * file can be stubbed at any time (by `stubify`, or by a pulling client
+ * materializing it as a placeholder via `sync`). The single place this
+ * budget is computed; nothing else should hardcode the 255/5 numbers.
+ */
+export function fitsWithStubSuffix(basename: string): boolean {
+  return Buffer.byteLength(basename) + STUB_SUFFIX.length <= MAX_FILENAME_BYTES;
 }
 
 export class StubFormatError extends CorruptionError {

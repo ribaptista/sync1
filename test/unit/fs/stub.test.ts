@@ -2,7 +2,12 @@ import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readStubHash, writeStubAtomic, StubFormatError } from "../../../src/fs/stub.js";
+import {
+  readStubHash,
+  writeStubAtomic,
+  StubFormatError,
+  fitsWithStubSuffix,
+} from "../../../src/fs/stub.js";
 
 const tempDirs: string[] = [];
 function mkTempDir(): string {
@@ -58,5 +63,24 @@ describe("stub read/write", () => {
     const stubPath = path.join(dir, "empty.stub");
     fs.writeFileSync(stubPath, "");
     expect(() => readStubHash(stubPath)).toThrow(StubFormatError);
+  });
+});
+
+describe("fitsWithStubSuffix", () => {
+  it("accepts a 250-byte basename (leaves exactly room for '.stub')", () => {
+    expect(fitsWithStubSuffix("a".repeat(250))).toBe(true);
+  });
+
+  it("rejects a 251-byte basename", () => {
+    expect(fitsWithStubSuffix("a".repeat(251))).toBe(false);
+  });
+
+  it("counts UTF-8 bytes, not characters", () => {
+    // Each "é" is 2 bytes in UTF-8, so 126 of them is 252 bytes -- over the
+    // limit even though the string is only 126 characters long.
+    const basename = "é".repeat(126);
+    expect(basename.length).toBe(126);
+    expect(Buffer.byteLength(basename)).toBe(252);
+    expect(fitsWithStubSuffix(basename)).toBe(false);
   });
 });

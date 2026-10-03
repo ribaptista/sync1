@@ -29,6 +29,7 @@ sequenceDiagram
             alt matches an ignore policy
                 Loop->>Loop: stats.ignored++ -- never staged at all
             else
+                Loop->>Loop: assertStubbableRealFile -- real file only; throws FilenameTooLongForStubError<br/>and aborts the whole run if the name leaves no room for a future ".stub"
                 Loop->>Loop: classifyContent (dir / stub / real-or-dangling-both)
                 alt resolved synchronously (dir, or a valid stub)
                     Loop->>Staging: staging.insert({state:"created", ...})
@@ -48,21 +49,24 @@ sequenceDiagram
             alt cache row is uncommitted ('created') AND now matches an ignore policy
                 Loop->>Cache: cacheRepo.delete(path) -- immediate, not staged
                 Loop->>Loop: stats.droppedIgnored.push(path)
-            else type = dir
-                alt cache row was 'deleted' (recreated)
-                    Loop->>Staging: staging.insert({state:"created", ...})
-                else
-                    Loop->>Loop: stats.unchanged++
-                end
-            else mtime unchanged AND not a dangling stub
-                Loop->>Loop: stats.unchanged++ -- never rehashed
             else
-                Loop->>Loop: classifyContent
-                alt resolved synchronously (a valid stub)
-                    Loop->>Loop: finalize(hash, size) -- see below
-                else needs a real hash
-                    Loop->>Hash: dispatchHash
-                    Hash-->>Loop: onResolved(hash) -> finalize(hash, size)
+                Loop->>Loop: assertStubbableRealFile -- same check as the fs-only branch above,<br/>run once up front for every sub-case below
+                alt type = dir
+                    alt cache row was 'deleted' (recreated)
+                        Loop->>Staging: staging.insert({state:"created", ...})
+                    else
+                        Loop->>Loop: stats.unchanged++
+                    end
+                else mtime unchanged AND not a dangling stub
+                    Loop->>Loop: stats.unchanged++ -- never rehashed
+                else
+                    Loop->>Loop: classifyContent
+                    alt resolved synchronously (a valid stub)
+                        Loop->>Loop: finalize(hash, size) -- see below
+                    else needs a real hash
+                        Loop->>Hash: dispatchHash
+                        Hash-->>Loop: onResolved(hash) -> finalize(hash, size)
+                    end
                 end
             end
         end
@@ -149,9 +153,12 @@ never applied to `cache.db` at all (only counted), so they need renaming and a r
   tombstone). Only a genuinely brand-new path gets `lastSyncedVersion` as its baseline. This is the
   invariant `conflict-rules.ts` depends on — see
   [`flow-apply-local-changes.md`](flow-apply-local-changes.md).
-- **On failure:** a thrown error (a corrupt stub, an unknown-object stub reference, a hash job's own
-  failure) propagates out of the merge-join loop; the enumeration pass is still cut short and joined in
-  the `finally`, and the staging DB is still closed and removed — nothing durable in `cache.db` itself
-  has been touched yet, since every write is deferred to the apply pass after the loop.
+- **On failure:** a thrown error (a corrupt stub, an unknown-object stub reference, a real file's name
+  leaving no room for a future `.stub` suffix (`FilenameTooLongForStubError`), a hash job's own failure)
+  propagates out of the merge-join loop; the enumeration pass is still cut short and joined in the
+  `finally`, and the staging DB is still closed and removed — nothing durable in `cache.db` itself has
+  been touched yet, since every write is deferred to the apply pass after the loop. The name-length check
+  runs synchronously, before `classifyContent`/hashing, so it's the cheapest possible rejection for an
+  offending path.
 - **Sub-flows:** [`flow-pool-dispatch.md`](flow-pool-dispatch.md) (the `BoundedTaskTracker` hash
   dispatch), [`flow-enumeration-pass.md`](flow-enumeration-pass.md) (the concurrent estimate walk).

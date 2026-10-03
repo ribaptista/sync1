@@ -13,6 +13,7 @@ import {
 } from "../concurrency/pools.js";
 import type { EnumerationControl } from "./update-cache-enumerate.js";
 import type { CacheEntriesRepository } from "../db/repositories/cache-entries-repository.js";
+import { fitsWithStubSuffix } from "./stub.js";
 import type {
   ThumbnailPolicyRow,
   ThumbnailPolicyGenerateRow,
@@ -87,14 +88,15 @@ export function isUnderThumbnailDir(relativePath: string): boolean {
  * produces exactly one deletion and one regeneration, which is the
  * correct reaction to a rename it has no other way to detect.
  *
- * Literal abbreviated fields rather than a hash of them: worst case still
- * leaves plenty of the 255-byte path-component limit spare even after the
- * hash and extension, so length was never the binding constraint -- a
- * human being able to `ls _thumbnail/` and read off what config produced a
- * file, with no database cross-reference, is worth far more than the bytes
- * a hash would reclaim. `PARAMS_VERSION` exists so a future incompatible
- * change to this segment's own shape can be told apart from today's,
- * rather than silently misparsed.
+ * Literal abbreviated fields rather than a hash of them: a human being
+ * able to `ls _thumbnail/` and read off what config produced a file, with
+ * no database cross-reference, is worth far more than the bytes a hash
+ * would reclaim -- the real budget this spends against is the original's
+ * own name, checked and enforced separately (see `fitsWithStubSuffix` and
+ * its call site in `generateForDecision`), not something this segment
+ * needs to economize on itself. `PARAMS_VERSION` exists so a future
+ * incompatible change to this segment's own shape can be told apart from
+ * today's, rather than silently misparsed.
  */
 const PARAMS_VERSION = "p2";
 /**
@@ -467,6 +469,12 @@ async function generateForDecision(
     thumbExt,
   );
   const destAbsolutePath = path.join(root, destRelativePath);
+  const destBasename = path.basename(destAbsolutePath);
+  if (!fitsWithStubSuffix(destBasename)) {
+    throw new ThumbnailGenerationError(
+      `thumbnail filename would be ${Buffer.byteLength(destBasename)} bytes -- too long for a pulling client to ever stub it (max 250, to leave room for ".stub") -- rename the source to something shorter`,
+    );
+  }
   prepareThumbnailDir(destAbsolutePath);
   const tempAbsolutePath = inTreeTempPathPreservingExtension(destAbsolutePath);
   const sourceAbsolutePath = path.join(root, decision.relativePath);

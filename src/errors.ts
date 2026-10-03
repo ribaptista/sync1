@@ -25,3 +25,21 @@ export class VaultLockedError extends Error {
     this.name = "VaultLockedError";
   }
 }
+
+/**
+ * A real file whose name is too long for a stub to ever be written for it
+ * (see `fitsWithStubSuffix`, src/fs/stub.ts) -- raised by `update_cache` so
+ * such a name is refused before it's ever staged into cache.db, rather
+ * than only surfacing later when some other client's `sync` tries to
+ * write the stub and gets ENAMETOOLONG. A usage problem, not a corruption
+ * of anything already in the vault, so it gets the generic exit code
+ * rather than `CorruptionError`'s.
+ */
+export class FilenameTooLongForStubError extends Error {
+  constructor(entryPath: string, basenameBytes: number) {
+    super(
+      `"${entryPath}" has a ${basenameBytes}-byte filename, which leaves no room for a ".stub" suffix within the 255-byte filesystem limit (max 250 bytes) -- rename it to something shorter`,
+    );
+    this.name = "FilenameTooLongForStubError";
+  }
+}

@@ -224,12 +224,13 @@ full-segment comparison is still what "up to date" itself means (see "One shared
 below): a config edit changes the segment, so the old file no longer satisfies the stricter up-to-date
 check even though it's still recognized as this policy's own prior output.
 
-A literal encoding was a deliberate choice over hashing the parameters together: worked the actual byte
-budget rather than guessing — worst case still leaves plenty of the 255-byte-per-path-component limit
-spare even after the content hash (64 hex chars) and extension, so length was never close to binding. A
-human being able to `ls _thumbnail/` and read off exactly which policy, and what config, produced a file
-— no database cross-reference needed — is worth far more than the handful of bytes a hash-of-params
-scheme would reclaim.
+A literal encoding was a deliberate choice over hashing the parameters together: a human being able to
+`ls _thumbnail/` and read off exactly which policy, and what config, produced a file — no database
+cross-reference needed — is worth far more than the handful of bytes a hash-of-params scheme would
+reclaim. This isn't spending against a tight byte budget in the first place: the params segment and
+content hash are a small, roughly fixed cost (well under 128 bytes combined), and the real budget this
+whole name has to fit is dominated by the _original's own filename_, which generation doesn't control at
+all. See "The 250-byte name budget" below for how that's actually enforced.
 
 `<thumb-ext>` is a pure function of the policy's own `outputMime` — `jpg`/`png`/`webp`/`gif` (never
 `jpeg` — one single spelling for "this is a JPEG" everywhere a thumbnail filename gets reverse-parsed) —
@@ -245,6 +246,21 @@ filename comparison, no need to open or re-hash anything. A thumbnail whose embe
 segment doesn't match the original's current `cache.db` hash / current policy is stale; if the original's
 hash isn't in `cache.db` at all yet (never scanned by `update_cache`), the file is counted under
 `missing_cache_entry` and skipped — reported, never blocking the rest of the run.
+
+### The 250-byte name budget
+
+A thumbnail's destination name is `<original-basename>.<params-segment>.<hash-hex>.<thumb-ext>` —
+dominated by the _original's_ own filename, which generation has no control over and (correctly) never
+limits on its own. What generation does have to enforce is the combined result: before running any
+generator (`generateForDecision`, `src/fs/thumbnail.ts`), it checks the full destination basename against
+`fitsWithStubSuffix` (`src/fs/stub.ts`) and raises `ThumbnailGenerationError` — a per-file failure,
+tallied and logged, the run continues — if the name wouldn't leave room for a future `.stub` suffix.
+
+That's a tighter check than "does this name fit on disk" (255 bytes): the actual requirement is 250
+bytes, because any client materializing this original for the first time writes a stub for it before
+downloading anything (see `docs/architecture/stub-files.md`), and a thumbnail is tracked and stubbed the
+same as any other file. A name that fits in 255 bytes but not 250 would generate and upload fine on this
+machine, then break every _other_ client's `sync` the moment it tried to write that stub.
 
 `parseThumbnailEntry` requires at least four dot-separated parts and validates the params segment's shape
 (`PARAMS_SEGMENT_RE`) before accepting a file as a recognized thumbnail at all — this is deliberately

@@ -15,6 +15,7 @@ import {
 import type { HashRunner } from "../../../src/concurrency/hash-runner.js";
 import { hashBufferHex } from "../../../src/crypto/hash.js";
 import { writeStubAtomic } from "../../../src/fs/stub.js";
+import { FilenameTooLongForStubError } from "../../../src/errors.js";
 import type { OnProgress } from "../../../src/progress-types.js";
 
 vi.mock("../../../src/fs/hash-file.js", async (importOriginal) => {
@@ -576,6 +577,81 @@ describe("performUpdateCache: stub files", () => {
       caseCollisions: [],
       ignored: 0,
     });
+  });
+});
+
+describe("performUpdateCache: names too long to ever take a .stub suffix", () => {
+  it("tracks a real file whose name is exactly at the 250-byte stubbable limit", async () => {
+    const name = `${"a".repeat(246)}.txt`; // 250 bytes
+    expect(Buffer.byteLength(name)).toBe(250);
+    touch(name, "hello");
+    const repo = makeRepo();
+
+    const stats = await run(repo);
+    expect(stats.created).toBe(1);
+    expect(repo.get(name)?.state).toBe("created");
+  });
+
+  it("rejects a new real file whose name is 251 bytes, without staging anything", async () => {
+    const tooLong = `${"a".repeat(247)}.txt`; // 251 bytes
+    expect(Buffer.byteLength(tooLong)).toBe(251);
+    touch(tooLong, "hello");
+    touch("fine.txt", "hello");
+    const repo = makeRepo();
+
+    await expect(run(repo)).rejects.toThrow(FilenameTooLongForStubError);
+    // Nothing from this run was applied -- not even the unrelated healthy
+    // file discovered in the same walk.
+    expect(repo.get(tooLong)).toBeUndefined();
+    expect(repo.get("fine.txt")).toBeUndefined();
+  });
+
+  it("rejects a previously-tracked file whose name is 251 bytes when it's touched again", async () => {
+    const tooLong = `${"a".repeat(247)}.txt`; // 251 bytes
+    touch(tooLong, "hello", 1_700_000_000_000);
+    const repo = makeRepo();
+    // Seeded directly, as if tracked by a version of sync1 that predates
+    // this check -- exercises the existing-row path (dispatchExistingRow),
+    // not the new-path one above (dispatchCreatedRow).
+    repo.upsert({
+      path: tooLong,
+      type: "file",
+      mtime: 1_700_000_000_000,
+      hash: hashBufferHex(Buffer.from("hello")),
+      size: 5,
+      state: "unchanged",
+      parent_state_version: "v0",
+    });
+
+    touch(tooLong, "goodbye", 1_700_000_001_000);
+    await expect(run(repo, { version: "v1" })).rejects.toThrow(FilenameTooLongForStubError);
+  });
+
+  it("never rejects a stub-backed name at the 250-byte limit (the check only applies to real files)", async () => {
+    // A stub for this name is itself a 255-byte file -- the most a stub
+    // can ever legally be. A real file of the same name is only checked
+    // because writing *its* stub is a step still ahead of it; a path
+    // that's already stub-backed already proved that step works.
+    const name = `${"a".repeat(246)}.jpg`; // 250 bytes
+    const hash = "c".repeat(64);
+    objectsRepo.upsert({ hash, s3_key: `objects/${hash}`, size: 42, ciphertext_checksum: "x" });
+    writeStubAtomic(path.join(root, `${name}.stub`), hash);
+    const repo = makeRepo();
+
+    const stats = await run(repo);
+    expect(stats.created).toBe(1);
+    expect(repo.get(name)?.hash).toBe(hash);
+  });
+
+  it("never rejects a too-long name matching an ignore policy", async () => {
+    ignorePoliciesRepo.create("*.tmp");
+    const tooLong = `${"a".repeat(247)}.tmp`; // 251 bytes
+    touch(tooLong, "throwaway");
+    const repo = makeRepo();
+
+    const stats = await run(repo);
+    expect(stats.ignored).toBe(1);
+    expect(repo.get(tooLong)).toBeUndefined();
   });
 });
 

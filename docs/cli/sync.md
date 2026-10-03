@@ -28,7 +28,10 @@ Bucket/prefix/endpoint/region are read from `.sync1/remote.json`, written by `in
 
 ## What it does, at a high level
 
-1. Runs `update_cache` to bring `cache.db` up to date with the filesystem.
+1. Runs `update_cache` to bring `cache.db` up to date with the filesystem. If a real (non-stub) file's
+   name doesn't leave room for a future `.stub` suffix, this step fails the whole run before anything is
+   uploaded — see [update_cache.md](update_cache.md) and
+   [stub-files.md](../architecture/stub-files.md#the-250-byte-name-budget).
 2. Fetches `/current` to see whether the remote vault has moved since this machine's last sync.
 3. Folds every locally-dirty cache row into a candidate copy of state.db, applying the
    create/modified/deleted conflict rules (see
@@ -134,10 +137,10 @@ When there are unresolved conflicts, `ok` is `false` and `conflicts` is a non-em
 
 - `0` — success, no conflicts, no failed uploads.
 - `1` — either a hard failure that aborted the run before anything committed (a non-transient S3 error,
-  corrupt vault, missing password, or a mirror write that exhausted its retries under the default
-  `--on-mirror-max-retries fail` — see **Uploads and transient S3 failures** and **Mirroring to a second
-  copy** above/below), or a run that completed with one or more failed uploads (see **Failed uploads**
-  above) and no conflicts.
+  corrupt vault, missing password, a real file whose name leaves no room for a future `.stub` suffix, or
+  a mirror write that exhausted its retries under the default `--on-mirror-max-retries fail` — see
+  **Uploads and transient S3 failures** and **Mirroring to a second copy** above/below), or a run that
+  completed with one or more failed uploads (see **Failed uploads** above) and no conflicts.
 - `2` — completed with one or more unresolved conflicts (whether or not any uploads also failed), or the
   remote moved on mid-attempt (a CAS race against another machine's concurrent commit) — in the
   CAS-race case, just run `sync` again.

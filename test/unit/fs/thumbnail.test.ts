@@ -269,13 +269,14 @@ describe("scanThumbnails", () => {
    * became a 258-byte temp, past the 255-byte filename limit, and that
    * file could never be generated on any run, ever.
    */
-  it("generates for a source whose thumbnail name sits just inside the 255-byte filename limit", async () => {
+  it("generates for a source whose thumbnail name sits just inside the 250-byte stubbable limit", async () => {
     // 196 + ".jpg" = a 200-byte source name, so the final thumbnail name
-    // lands at 245 bytes -- legal, but only 10 bytes of headroom.
+    // lands at 245 bytes -- legal (and still room for a future ".stub"),
+    // but only 5 bytes of headroom.
     const sourceName = `${"x".repeat(196)}.jpg`;
     const thumbnailName = `${sourceName}.${IMAGE_PARAMS}.longhash.jpg`;
     expect(Buffer.byteLength(thumbnailName)).toBeGreaterThan(237);
-    expect(Buffer.byteLength(thumbnailName)).toBeLessThanOrEqual(255);
+    expect(Buffer.byteLength(thumbnailName)).toBeLessThanOrEqual(250);
 
     createGeneratePolicy("*.jpg");
     writeFile(sourceName);
@@ -291,6 +292,47 @@ describe("scanThumbnails", () => {
 
     expect(stats).toMatchObject({ toGenerate: 1, errors: 0 });
     expect(fs.existsSync(path.join(root, "_thumbnail", thumbnailName))).toBe(true);
+  });
+
+  /**
+   * A thumbnail name can be legal on the filesystem (<= 255 bytes) while
+   * still being un-stubbable (> 250 bytes) -- the gap `.stub` needs. A
+   * pulling client's `sync` would never be able to materialize this
+   * thumbnail as a placeholder, so generation has to refuse it just as it
+   * refuses a name over the filesystem's own 255-byte limit.
+   */
+  it("refuses a source whose thumbnail name is legal on disk but leaves no room for .stub", async () => {
+    // 204 (source) + 1 + 36 (params) + 1 + 5 ("hash3") + 1 + 3 ("jpg") = 251
+    // bytes -- one over the 250-byte stubbable limit, but still well under
+    // the 255-byte filesystem limit.
+    const sourceName = `${"z".repeat(200)}.jpg`;
+    const thumbnailName = `${sourceName}.${IMAGE_PARAMS}.hash3.jpg`;
+    expect(Buffer.byteLength(thumbnailName)).toBe(251);
+    expect(Buffer.byteLength(thumbnailName)).toBeLessThanOrEqual(255);
+
+    createGeneratePolicy("*.jpg");
+    writeFile(sourceName);
+    writeFile("fine2.jpg");
+    seedCache(sourceName, "hash3");
+    seedCache("fine2.jpg", "hash4");
+
+    const generator = fakeGenerator();
+    const stats = await run(
+      "ensure",
+      undefined,
+      fakeProber({ [sourceName]: JPEG_IMAGE, "fine2.jpg": JPEG_IMAGE }),
+      generator,
+    );
+
+    expect(stats.errors).toBe(1);
+    // The generator is never even called for the over-the-stubbable-limit
+    // source -- the check runs before any temp file or generator call.
+    expect(generator.imageCalls).toHaveLength(1);
+    expect(generator.imageCalls[0]!.sourcePath).toContain("fine2.jpg");
+    expect(fs.existsSync(path.join(root, "_thumbnail", thumbnailName))).toBe(false);
+    expect(fs.existsSync(path.join(root, `_thumbnail/fine2.jpg.${IMAGE_PARAMS}.hash4.jpg`))).toBe(
+      true,
+    );
   });
 
   /**
