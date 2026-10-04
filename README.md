@@ -51,7 +51,9 @@ walkthroughs below assume the built binary is available as `sync1` on your `PATH
 
 Prefer not to install Node/ImageMagick/ffmpeg on your host at all? `docker build -t sync1 .` builds a
 self-contained image with the CLI and both external media tools already installed — see
-[Docker](docs/platform-setup.md#docker) for how to run it.
+[Docker](docs/platform-setup.md#docker) for how to run it, or pull an already-built multi-arch image
+from a [tagged release](docs/platform-setup.md#pulling-a-published-image) instead
+(`docker pull ghcr.io/ribaptista/sync1`).
 
 ## Walkthroughs
 

@@ -1,0 +1,286 @@
+name: release
+
+# Triggered by pushing a tag -- never by hand. `npm version <bump>` is the
+# only supported way to create one (see docs/architecture/release.md): it
+# bumps package.json/package-lock.json, commits, and tags `v<version>` in
+# one atomic step, which is what check-version below depends on to prove
+# the tag and package.json can never disagree. The GitHub Release itself
+# is created by the `release` job below, only after every image has
+# actually landed -- never by hand beforehand, so a release page can never
+# point at images that failed to publish.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the ref (the tag), not cancel-in-progress: a half-finished
+  # multi-registry push left cancelled mid-way is worse than one run
+  # queuing behind another for the rare case of a re-pushed tag.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Fails the whole run before anything is built if the pushed tag and
+  # package.json's own version disagree -- the one invariant this workflow
+  # exists to enforce. See docs/architecture/release.md.
+  check-version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22"
+
+      - id: check
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag '${GITHUB_REF_NAME}' (version ${TAG_VERSION}) does not match package.json's version (${PKG_VERSION}). Cut releases with \`npm version <patch|minor|major>\`, never a bare \`git tag\` -- see docs/architecture/release.md." >&2
+            exit 1
+          fi
+          echo "version=${PKG_VERSION}" >> "$GITHUB_OUTPUT"
+          case "$PKG_VERSION" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # Same gate a PR has to pass -- a release must never publish an image
+  # that hasn't been through it.
+  verify:
+    needs: check-version
+    uses: ./.github/workflows/verify.yml
+
+  # One job per architecture, each on a *native* runner (no QEMU
+  # emulation), pushing its single-platform image to GHCR only, by digest.
+  # The merge job below fans that same content out to Docker Hub and ECR
+  # Public too, via a cross-registry `docker buildx imagetools create` --
+  # see that job's own comment for why.
+  build:
+    needs: [check-version, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record build timestamp
+        id: ts
+        run: echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=sync1
+            org.opencontainers.image.description=E2E-encrypted, deduplicated, incremental backup CLI
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.check-version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.ts.outputs.created }}
+          # push-by-digest + name-canonical: no human-readable tag is
+          # applied at this stage at all -- just the content, addressable
+          # by its digest. Real tags (:1.2.3, :latest, ...) are only ever
+          # applied once, in the merge job, to the already-assembled
+          # multi-arch manifest list -- never per-architecture, which
+          # would otherwise leave a tag transiently pointing at a
+          # single-platform image between the two matrix jobs finishing.
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assembles the amd64 + arm64 digests built above into one multi-arch
+  # manifest list, and pushes it -- under every real tag this release gets
+  # -- to all three registries.
+  #
+  # The build job above only ever pushed to GHCR. `docker buildx imagetools
+  # create` can reference source digests in one registry while pushing the
+  # resulting manifest list to several different `-t` targets in *other*
+  # registries -- it copies whatever blobs the destination doesn't already
+  # have, the same mechanism a registry-to-registry mirroring tool would
+  # use. Doing the Docker Hub / ECR Public fan-out here, once, instead of
+  # from both matrix jobs, means only this job needs those two registries'
+  # credentials at all.
+  merge:
+    needs: [check-version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+      PRERELEASE: ${{ needs.check-version.outputs.prerelease }}
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+      DOCKERHUB_IMAGE: docker.io/${{ vars.DOCKERHUB_REPO }}
+      ECR_IMAGE: public.ecr.aws/${{ vars.ECR_PUBLIC_ALIAS }}/sync1
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Configure AWS credentials (ECR Public's own API lives only in us-east-1)
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to ECR Public
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+        with:
+          registry-type: public
+
+      - name: Create and push the multi-arch manifest list to all three registries
+        working-directory: /tmp/digests
+        run: |
+          MAJOR="${VERSION%%.*}"
+          REST="${VERSION#*.}"
+          MINOR="${REST%%.*}"
+
+          # Every release gets :<version> and :<major>.<minor>. A bare
+          # :<major> is added too, but only once major > 0 -- ":0" reads as
+          # meaningless (or wrong) on a pre-1.0 package, whereas ":1",
+          # ":2", ... are genuinely useful floating tags once they exist.
+          VERSION_TAGS=("$VERSION" "${MAJOR}.${MINOR}")
+          if [ "$MAJOR" != "0" ]; then
+            VERSION_TAGS+=("$MAJOR")
+          fi
+          # :latest only for a real release, never a prerelease -- a bare
+          # `docker pull <image>` must never resolve to an -rc/-beta build.
+          if [ "$PRERELEASE" != "true" ]; then
+            VERSION_TAGS+=("latest")
+          fi
+
+          TAG_ARGS=()
+          for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE" "$ECR_IMAGE"; do
+            for tag in "${VERSION_TAGS[@]}"; do
+              TAG_ARGS+=(-t "${image}:${tag}")
+            done
+          done
+
+          # Source refs: the two per-architecture digests the build job
+          # exported, as filenames, into this job's /tmp/digests (this
+          # step's own working-directory).
+          SOURCE_REFS=()
+          for digest_file in *; do
+            SOURCE_REFS+=("${GHCR_IMAGE}@sha256:${digest_file}")
+          done
+
+          set -x
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCE_REFS[@]}"
+
+      - name: Verify both platforms actually landed, in every registry
+        run: |
+          for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE" "$ECR_IMAGE"; do
+            echo "=== ${image}:${VERSION} ==="
+            docker buildx imagetools inspect "${image}:${VERSION}" | tee /tmp/inspect.out
+            grep -q 'linux/amd64' /tmp/inspect.out
+            grep -q 'linux/arm64' /tmp/inspect.out
+          done
+
+  # Created last, and only from here -- a release page must never exist
+  # pointing at images that failed to publish. `--verify-tag` refuses to
+  # run at all if the tag somehow isn't actually there.
+  release:
+    needs: [check-version, merge]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+      PRERELEASE: ${{ needs.check-version.outputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Create the GitHub Release
+        run: |
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "Multi-arch (\`linux/amd64\`, \`linux/arm64\`) image published to:"
+            echo
+            echo '```'
+            echo "docker pull ghcr.io/${{ github.repository }}:${VERSION}"
+            echo "docker pull docker.io/${{ vars.DOCKERHUB_REPO }}:${VERSION}"
+            echo "docker pull public.ecr.aws/${{ vars.ECR_PUBLIC_ALIAS }}/sync1:${VERSION}"
+            echo '```'
+          } > "$NOTES_FILE"
+
+          ARGS=(--verify-tag --notes-file "$NOTES_FILE" --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then
+            ARGS+=(--prerelease)
+          else
+            ARGS+=(--latest)
+          fi
+
+          gh release create "$GITHUB_REF_NAME" "${ARGS[@]}"
