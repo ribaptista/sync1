@@ -45,6 +45,21 @@ jobs:
       # `container:` job key doesn't accept extra `docker run` flags like
       # this, hence a plain step driving `docker run` directly rather than
       # that key.
+      #
+      # `npm run verify` itself must NOT run as root inside this container
+      # (the default for a plain `docker run` with no `--user`): several
+      # unit tests sabotage a directory's permissions (`chmod 0o555`, no
+      # write even for the owner) to exercise a real EACCES failure path --
+      # root bypasses Unix permission checks entirely, so those tests
+      # silently "pass" by not actually failing the write they're supposed
+      # to. `apt-get install` above still needs to run as root, so
+      # privileges are dropped only for the `npm` steps, to a user created
+      # (or reused, if `node:22-trixie`'s own built-in `node` user happens
+      # to already have that uid) at whatever uid/gid the bind-mounted
+      # checkout already has -- matching ownership exactly, with no `chown`
+      # of the mounted tree needed. `chmod 666` on the mounted docker
+      # socket is what then lets that same non-root user drive LocalStack
+      # -- acceptable here since this container never outlives the job.
       - name: npm run verify (inside node:22-trixie, for a real ImageMagick 7)
         run: |
           docker run --rm --network host \
@@ -53,7 +68,17 @@ jobs:
             -e CI \
             node:22-trixie bash -euo pipefail -c '
               apt-get update -qq
-              apt-get install -y --no-install-recommends imagemagick ffmpeg docker.io
-              npm ci
-              npm run verify
+              apt-get install -y --no-install-recommends imagemagick ffmpeg docker-cli
+              chmod 666 /var/run/docker.sock
+
+              HOST_UID="$(stat -c "%u" /w)"
+              HOST_GID="$(stat -c "%g" /w)"
+              RUN_USER="$(getent passwd "$HOST_UID" | cut -d: -f1)"
+              if [ -z "$RUN_USER" ]; then
+                groupadd -g "$HOST_GID" ci 2>/dev/null || true
+                useradd -m -u "$HOST_UID" -g "$HOST_GID" ci
+                RUN_USER=ci
+              fi
+
+              su "$RUN_USER" -c "cd /w && npm ci && npm run verify"
             '
