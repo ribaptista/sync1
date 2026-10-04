@@ -73,7 +73,12 @@ jobs:
 
               HOST_UID="$(stat -c "%u" /w)"
               HOST_GID="$(stat -c "%g" /w)"
-              RUN_USER="$(getent passwd "$HOST_UID" | cut -d: -f1)"
+              # `|| true`: getent exits 2 (not 0) when nothing matches --
+              # genuinely expected whenever the checkout uid is not
+              # already taken, so under `set -e -o pipefail` an unguarded
+              # lookup here would abort the whole script right here, with
+              # no further output, on exactly that ordinary case.
+              RUN_USER="$(getent passwd "$HOST_UID" | cut -d: -f1 || true)"
               if [ -z "$RUN_USER" ]; then
                 groupadd -g "$HOST_GID" ci 2>/dev/null || true
                 useradd -m -u "$HOST_UID" -g "$HOST_GID" ci
