@@ -191,6 +191,20 @@ omit it (and add `--push`) when building for a registry instead. Emulated cross-
 slower than a native build on that architecture — the `apt-get install` step alone ran several minutes
 longer under emulation in testing — but produce a bit-identical result to a native arm64 build.
 
+### Pulling a published image
+
+Every tagged release publishes a multi-arch (`linux/amd64` + `linux/arm64`) image built from this
+same `Dockerfile` — no local build needed at all:
+
+```bash
+docker pull ghcr.io/ribaptista/sync1:latest       # or docker.io/<dockerhub-repo>, public.ecr.aws/<alias>/sync1
+```
+
+`:latest` always points at the newest non-prerelease version; a specific release is also available as
+`:<version>` (e.g. `:1.2.3`), `:<major>.<minor>`, and (once past `0.x`) `:<major>`. See
+[`docs/architecture/release.md`](architecture/release.md) for exactly how and when these get built and
+tagged.
+
 ## Running without building
 
 `npm run dev` (all platforms) runs the CLI directly from TypeScript source via `tsx`, without a build

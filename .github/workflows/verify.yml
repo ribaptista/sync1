@@ -1,0 +1,59 @@
+name: verify
+
+# Reusable: called by release.yml so a release can never publish an image
+# that hasn't passed the exact same checks a PR has to pass. Also runs
+# directly on push/pull_request so ordinary development gets CI for free.
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # The e2e thumbnail suites need a real ImageMagick >= 7
+      # (docs/platform-setup.md) -- ubuntu-24.04's own apt ImageMagick is 6,
+      # so `npm run verify` runs inside a node:22-trixie container instead
+      # (the same base the production Dockerfile uses, which does carry
+      # IM 7.1.1). Pre-pulled here, before LocalStack races several workers
+      # into pulling it independently.
+      - name: Pull images used by this job
+        run: |
+          docker pull node:22-trixie
+          docker pull localstack/localstack:4.9
+
+      # `--network host`: test/e2e/helpers/localstack.ts starts LocalStack
+      # as a *sibling* container (via the mounted host docker socket) and
+      # connects to it at `http://localhost:<port>`. A sibling container's
+      # published port lands in the *host's* network namespace, not this
+      # trixie container's own -- so without `--network host` here,
+      # "localhost" inside this container would never reach it. Running
+      # this container with the host's network namespace is what makes
+      # "localhost" mean the same thing in both places. GitHub's own
+      # `container:` job key doesn't accept extra `docker run` flags like
+      # this, hence a plain step driving `docker run` directly rather than
+      # that key.
+      - name: npm run verify (inside node:22-trixie, for a real ImageMagick 7)
+        run: |
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":/w -w /w \
+            -e CI \
+            node:22-trixie bash -euo pipefail -c '
+              apt-get update -qq
+              apt-get install -y --no-install-recommends imagemagick ffmpeg docker.io
+              npm ci
+              npm run verify
+            '

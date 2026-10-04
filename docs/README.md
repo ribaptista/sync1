@@ -72,6 +72,7 @@ pool-dispatch idioms, etc.) that those commands compose.
 | [concurrency-and-progress.md](architecture/concurrency-and-progress.md)                       | The decide-sequentially/dispatch-concurrently pattern, the keyset-pagination foundation, the worker-thread-vs-async-pool split, backpressure, and how progress bars share a terminal with `--verbose` logging. |
 | [locking.md](architecture/locking.md)                                                         | The per-vault lock file: shape, staleness detection, the `preAction`/`postAction` hook wiring, and Ctrl+C behavior.                                                                                            |
 | [thumbnails.md](architecture/thumbnails.md)                                                   | `thumbnail_policy`'s skip/generate resolution, the naming convention, the `**` glob support it needed, resize math, video mosaics, and the shared state/ensure/cleanup scan.                                   |
+| [release.md](architecture/release.md)                                                         | How a tagged release publishes a multi-arch Docker image to GHCR/Docker Hub/ECR Public, the version/tag-sync invariant, one-time registry setup, and the apt-pin staleness canary.                             |
 
 ## Conventions across all commands
 
