@@ -4,7 +4,8 @@
 
 **Used by:** [`flow-apply-local-changes.md`](flow-apply-local-changes.md) (sync's upload, via
 [`flow-put-object-stream.md`](flow-put-object-stream.md)), [`mirror.md`](mirror.md) (`mirror catchup`'s
-local-recovery path)
+local-recovery path), [`sanity_check.md`](sanity_check.md) (re-encrypting a local file to checksum
+its ciphertext, discarding the bytes)
 
 Encrypts a plaintext stream chunk-by-chunk under a per-object key derived from the master key and a
 `context` (the object's content hash, for content objects — see

@@ -6,7 +6,7 @@ import { walk, type WalkEntry } from "./walker.js";
 import { readStubHash, stubPathFor, StubFormatError } from "./stub.js";
 import { matchesAnyGlob } from "./glob-match.js";
 import type { EntriesRepository, EntryRow } from "../db/repositories/entries-repository.js";
-import type { ObjectsRepository } from "../db/repositories/objects-repository.js";
+import type { ObjectsRepository, ObjectRow } from "../db/repositories/objects-repository.js";
 import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
 import {
   BoundedTaskTracker,
@@ -20,6 +20,7 @@ import type { HashRunner } from "../concurrency/hash-runner.js";
 import { createProgressTracker, type OnProgress, type ProgressTracker } from "../progress-types.js";
 import { enumerateSanityCheckWork } from "./sanity-check-enumerate.js";
 import type { EnumerationControl } from "./update-cache-enumerate.js";
+import type { LocalCiphertextChecksumResult } from "./ciphertext-checksum.js";
 
 export interface HashMismatch {
   path: string;
@@ -37,12 +38,40 @@ export interface MissingInS3 {
   hash: string;
 }
 
+/**
+ * The CRC64NVME checksum S3 reports for an object (a `HEAD`) disagrees with
+ * the one state.db recorded when it was uploaded -- `s3Checksum` is null
+ * when S3 reports none at all.
+ */
+export interface S3ChecksumMismatch {
+  path: string;
+  hash: string;
+  recordedChecksum: string;
+  s3Checksum: string | null;
+}
+
+/**
+ * Re-encrypting the local real file produced a ciphertext whose CRC64NVME
+ * checksum differs from the one S3 reports -- or couldn't be computed at all
+ * (`localChecksum` null, `reason` saying why, e.g. the file changed while
+ * being read).
+ */
+export interface LocalChecksumMismatch {
+  path: string;
+  hash: string;
+  s3Checksum: string;
+  localChecksum: string | null;
+  reason: string | null;
+}
+
 export interface SanityCheckResult {
   /** Both a stub and the real file present for the same path -- a bad state, never auto-cleaned here. */
   bothStubAndReal: string[];
   hashMismatch: HashMismatch[];
   stubMismatch: StubProblem[];
   missingInS3: MissingInS3[];
+  s3ChecksumMismatch: S3ChecksumMismatch[];
+  localChecksumMismatch: LocalChecksumMismatch[];
   /** Tracked in state.db, but neither a stub nor a real file exists locally at all. */
   missingLocally: string[];
   /** Present locally, not tracked in state.db, and not matched by any ignore policy. */
@@ -66,13 +95,31 @@ export interface StaleTempFile {
   size: number;
 }
 
+/** What a `HEAD` on an object reports, as far as this check cares. */
+export interface ObjectHead {
+  /** Full-object CRC64NVME, base64; absent when S3 has none recorded. */
+  checksumCrc64Nvme?: string;
+}
+
 /**
- * Checks whether the object a hash refers to still verifiably exists in
- * S3 -- injected rather than taking an S3 client directly, so the merge-
- * join's classification logic (this module's actual complexity) can be
+ * `HEAD`s the object at `s3Key`, resolving null when it doesn't exist --
+ * injected rather than taking an S3 client directly, so the merge-join's
+ * classification logic (this module's actual complexity) can be
  * unit-tested without a real or mocked S3 client.
  */
-export type ObjectExistsChecker = (s3Key: string) => Promise<boolean>;
+export type ObjectHeadChecker = (s3Key: string) => Promise<ObjectHead | null>;
+
+/**
+ * Re-encrypts a local file and checksums the ciphertext -- in production
+ * `localCiphertextChecksum` (src/fs/ciphertext-checksum.ts) bound to the
+ * master key; injected for the same reason as `ObjectHeadChecker`.
+ */
+export type LocalChecksummer = (
+  absolutePath: string,
+  hash: string,
+  size: number,
+  onBytes: (n: number) => void,
+) => Promise<LocalCiphertextChecksumResult>;
 
 function emptyResult(): SanityCheckResult {
   return {
@@ -80,6 +127,8 @@ function emptyResult(): SanityCheckResult {
     hashMismatch: [],
     stubMismatch: [],
     missingInS3: [],
+    s3ChecksumMismatch: [],
+    localChecksumMismatch: [],
     missingLocally: [],
     untracked: [],
     ignoredCount: 0,
@@ -92,28 +141,33 @@ function emptyResult(): SanityCheckResult {
  * state.db's sorted entries -- structurally the same streaming comparison
  * update-cache.ts's performUpdateCache uses, but this never writes
  * anything: it exists purely to surface bugs (a corrupt/dangling stub, a
- * tampered file, an entry whose object vanished from S3, an untracked
- * file) that update_cache/materialize would otherwise silently repair or
- * never notice at all. See docs/architecture/ignore-and-storage-policies.md
- * for why ignore-policy matching happens in-memory rather than via SQL.
+ * tampered file, an entry whose object vanished from S3 or no longer
+ * carries the checksum it was uploaded with, an untracked file) that
+ * update_cache/materialize would otherwise silently repair or never notice
+ * at all. See docs/architecture/ignore-and-storage-policies.md for why
+ * ignore-policy matching happens in-memory rather than via SQL.
  *
- * A real file's content hash is *dispatched* to `hashRunner` (worker
- * threads, via `hashJobs`) rather than awaited inline, same as
- * update_cache's classify/dispatch/join split -- the merge-join loop
- * advances immediately, hash jobs run concurrently in the background, and
- * `hashJobs.onIdle()` joins them all before this function returns. A stub's
- * declared hash never needs the hash pool at all (`readStubHash` is a
- * cheap synchronous read), so it's checked inline as always. Either path,
- * once a path's hash is known to match state.db, dispatches its S3
- * existence check to `s3Pool` (a plain bounded async pool -- this is
- * network I/O, not CPU work) rather than awaiting it inline too; a hash
- * job's own completion is what enqueues its follow-on S3 check, so
- * `hashJobs.onIdle()` must be drained *before* `s3Pool.onIdle()` -- only
- * then has every S3 job it will ever enqueue actually been enqueued.
+ * Each tracked file runs a chain of up to three stages, each on its own
+ * bounded pool, each dispatched (not awaited) by the one before:
  *
- * Because of this, `hashMismatch` and `missingInS3` are no longer
- * necessarily in merge-join (path) order by the time this returns -- both
- * are sorted by path before being handed back.
+ * 1. **Hash** (`hashRunner`, via `hashJobs`) -- a real file's BLAKE2b,
+ *    compared against state.db. A stub skips this: its declared hash is a
+ *    cheap synchronous read, checked inline.
+ * 2. **HEAD** (`s3Pool`) -- once the hash matches, the object must exist
+ *    and S3's CRC64NVME checksum must equal state.db's recorded one.
+ * 3. **Re-encrypt** (`streamPool`) -- a real file only, once S3 has
+ *    reported a checksum: the local plaintext is encrypted exactly as an
+ *    upload would (convergent encryption makes that deterministic) and the
+ *    ciphertext's checksum must equal S3's. This is the one check that
+ *    proves the local file would reproduce the stored object byte for byte.
+ *
+ * Every stage's dispatch waits for room in the next pool first, so
+ * backpressure runs all the way back to the merge-join itself. Because each
+ * stage's own completion is what enqueues the next, the pools must be
+ * drained in chain order -- `hashJobs`, then `s3Pool`, then `streamPool` --
+ * since only then has every job a stage will ever enqueue been enqueued.
+ * All the stage-reported buckets are sorted by path before returning, since
+ * completion order isn't merge-join order.
  *
  * `entriesRepo`, `objectsRepo`, and `ignorePoliciesRepo` may all share one
  * connection: `entriesRepo.iterateAllSortedByPath()` is keyset-paginated
@@ -123,7 +177,7 @@ function emptyResult(): SanityCheckResult {
  *
  * `filterGlob`, when given, scopes which tracked/untracked paths are
  * actually reported (and, for tracked paths, which ones incur the cost of
- * a rehash/HEAD check) -- the merge-join itself always walks the whole
+ * a rehash/HEAD/re-encrypt) -- the merge-join itself always walks the whole
  * tree and the whole entries table, since a partial merge-join can't tell
  * "filtered out" apart from "genuinely missing" on either side.
  */
@@ -132,12 +186,15 @@ export async function performSanityCheck(
   entriesRepo: EntriesRepository,
   objectsRepo: ObjectsRepository,
   ignorePoliciesRepo: IgnorePoliciesRepository,
-  objectExists: ObjectExistsChecker,
+  headObject: ObjectHeadChecker,
+  localChecksum: LocalChecksummer,
   logger: Logger,
   hashRunner: HashRunner,
   maxInFlightHashes: number,
   s3Pool: PQueue,
   s3QueueLimit: number,
+  streamPool: PQueue,
+  streamQueueLimit: number,
   filterGlob?: string,
   onProgress?: OnProgress,
 ): Promise<SanityCheckResult> {
@@ -146,26 +203,39 @@ export async function performSanityCheck(
   const inScope = (p: string): boolean =>
     filterGlob === undefined || matchesAnyGlob(p, [filterGlob]).matched;
   const hashJobs = new BoundedTaskTracker(maxInFlightHashes);
-  // See dispatchTracked's own doc comment (src/concurrency/pools.ts):
-  // s3Pool.onIdle() alone can't tell this function a dispatched job threw,
-  // since a rejection just discarded by `void s3Pool.add(...)` becomes an
-  // unhandled one -- this is what turns that into a real, catchable error
-  // instead. Threaded through dispatchTrackedEntryCheck into
-  // dispatchS3Check, the two nested helpers that actually dispatch to
-  // `s3Pool`. `hashJobs` needs no equivalent here -- `BoundedTaskTracker`
-  // already tracks its own dispatched failures (see its own doc comment).
-  const s3PoolErrors = createPoolErrorBox();
 
   // filesDone/filesTotal track every row the merge-join consumes (mirroring
   // this scan's pre-existing "scanned" counter); bytesDone/bytesTotal track
-  // only content actually hashed this run -- see progress-types.ts's own
-  // doc comment for the full rule. rowDiscovered() fires once per
-  // merge-join step, at the top of the loop below; rowResolved() fires
-  // immediately for every synchronous branch (untracked, ignored,
-  // out-of-scope, missing-locally, a stub's declared hash) and is deferred
-  // into dispatchTrackedEntryCheck's own hash-completion point for a real
-  // file that needed hashing.
+  // only content actually read this run -- once to hash it, and once more
+  // to re-encrypt it -- see progress-types.ts's own doc comment for the
+  // full rule. rowDiscovered() fires once per merge-join step, at the top
+  // of the loop below; rowResolved() fires immediately for every
+  // synchronous branch (untracked, ignored, out-of-scope, missing-locally,
+  // a stub's declared hash) and, for a real file, at the end of its chain,
+  // since its re-encrypt stage is byte work too.
   const progress = createProgressTracker(onProgress, ["hashing", "hashed"]);
+
+  // See dispatchTracked's own doc comment (src/concurrency/pools.ts): a
+  // pool's onIdle() alone can't tell this function a dispatched job threw,
+  // since a rejection just discarded by `void pool.add(...)` becomes an
+  // unhandled one -- these turn that into a real, catchable error instead.
+  // `hashJobs` needs no equivalent -- `BoundedTaskTracker` already tracks
+  // its own dispatched failures (see its own doc comment).
+  const ctx: CheckContext = {
+    root,
+    objectsRepo,
+    headObject,
+    localChecksum,
+    logger,
+    result,
+    progress,
+    s3Pool,
+    s3QueueLimit,
+    s3PoolErrors: createPoolErrorBox(),
+    streamPool,
+    streamQueueLimit,
+    streamPoolErrors: createPoolErrorBox(),
+  };
 
   // Started, deliberately not awaited: it merge-joins the same two
   // sequences this loop is about to, concurrently, so the denominator is
@@ -193,11 +263,10 @@ export async function performSanityCheck(
     progress.settle();
   }
 
-  // The whole body of this function, unchanged, just moved behind a name
-  // so the enumeration above can be joined and settled in a `finally`
-  // without re-indenting or splitting up the merge-join itself. Hoisted,
-  // so it's declared after the call that uses it and reads in the order it
-  // runs.
+  // The whole body of this function, moved behind a name so the
+  // enumeration above can be joined and settled in a `finally` without
+  // re-indenting or splitting up the merge-join itself. Hoisted, so it's
+  // declared after the call that uses it and reads in the order it runs.
   async function runMergeJoin(): Promise<SanityCheckResult> {
     const staleTempPaths: string[] = [];
     const fsIter = walk(root, undefined, (relativePath) => staleTempPaths.push(relativePath));
@@ -234,21 +303,7 @@ export async function performSanityCheck(
         entryNext = entryIter.next();
       } else if (fsEntry !== null && entry !== null) {
         if (inScope(entry.path)) {
-          await dispatchTrackedEntryCheck(
-            fsEntry,
-            entry,
-            root,
-            objectsRepo,
-            objectExists,
-            logger,
-            result,
-            hashRunner,
-            hashJobs,
-            s3Pool,
-            s3QueueLimit,
-            s3PoolErrors,
-            progress,
-          );
+          await dispatchTrackedEntryCheck(fsEntry, entry, ctx, hashRunner, hashJobs);
         } else {
           // Matched on both sides but out of --filter's scope -- still
           // discovered, still resolved, just never checked.
@@ -259,15 +314,20 @@ export async function performSanityCheck(
       }
     }
 
-    // Draining order matters: a hash job's own completion is what enqueues
-    // its follow-on S3 check, so every such enqueue has happened by the time
-    // hashJobs.onIdle() resolves -- only then is it safe to drain s3Pool too.
+    // Draining order matters -- see this function's doc comment: each
+    // stage's completion is what enqueues the next stage's job.
     await hashJobs.onIdle();
     await s3Pool.onIdle();
-    throwIfPoolErrored(s3PoolErrors);
+    await streamPool.onIdle();
+    throwIfPoolErrored(ctx.s3PoolErrors);
+    throwIfPoolErrored(ctx.streamPoolErrors);
 
-    result.hashMismatch.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-    result.missingInS3.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const byPath = (a: { path: string }, b: { path: string }): number =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+    result.hashMismatch.sort(byPath);
+    result.missingInS3.sort(byPath);
+    result.s3ChecksumMismatch.sort(byPath);
+    result.localChecksumMismatch.sort(byPath);
 
     // Sized only now, and only for what the walk actually found: these are
     // rare (one per interrupted write), so the stats cost nothing, and a
@@ -289,21 +349,42 @@ export async function performSanityCheck(
   }
 }
 
+/** Everything the per-entry stages share, bundled so each helper takes one argument for it. */
+interface CheckContext {
+  root: string;
+  objectsRepo: ObjectsRepository;
+  headObject: ObjectHeadChecker;
+  localChecksum: LocalChecksummer;
+  logger: Logger;
+  result: SanityCheckResult;
+  progress: ProgressTracker;
+  s3Pool: PQueue;
+  s3QueueLimit: number;
+  s3PoolErrors: PoolErrorBox;
+  streamPool: PQueue;
+  streamQueueLimit: number;
+  streamPoolErrors: PoolErrorBox;
+}
+
+/** Wraps `fn` so only its first call does anything. */
+function once(fn: () => void): () => void {
+  let called = false;
+  return () => {
+    if (called) return;
+    called = true;
+    fn();
+  };
+}
+
 async function dispatchTrackedEntryCheck(
   fsEntry: WalkEntry,
   entry: EntryRow,
-  root: string,
-  objectsRepo: ObjectsRepository,
-  objectExists: ObjectExistsChecker,
-  logger: Logger,
-  result: SanityCheckResult,
+  ctx: CheckContext,
   hashRunner: HashRunner,
   hashJobs: BoundedTaskTracker,
-  s3Pool: PQueue,
-  s3QueueLimit: number,
-  s3PoolErrors: PoolErrorBox,
-  progress: ProgressTracker,
 ): Promise<void> {
+  const { result, logger, progress } = ctx;
+
   if (entry.type === "dir") {
     // Directories carry no content -- existence is the only signal,
     // already confirmed by reaching here.
@@ -318,12 +399,17 @@ async function dispatchTrackedEntryCheck(
     return;
   }
 
-  const absolutePath = path.join(root, entry.path);
+  const absolutePath = path.join(ctx.root, entry.path);
 
   if (fsEntry.representation === "real") {
+    // Exactly-once, whichever stage turns out to be this row's last: the
+    // hash job on a mismatch, the HEAD on a missing object, otherwise the
+    // re-encrypt -- all of which may be byte work still pending.
+    const rowResolved = once(() => progress.rowResolved());
     progress.expectBytes(fsEntry.size);
     await hashJobs.dispatch(async () => {
       const fileTracker = progress.startFile(entry.path, fsEntry.size);
+      let handedOff = false;
       try {
         const actualHash = await hashRunner.run(absolutePath, (n) => fileTracker.advance(n));
         logger.debug({ pool: "hash", inFlight: hashJobs.size }, "completed");
@@ -332,29 +418,14 @@ async function dispatchTrackedEntryCheck(
           return;
         }
         if (!entry.hash) return;
-        await dispatchS3Check(
-          s3Pool,
-          s3QueueLimit,
-          s3PoolErrors,
-          entry.hash,
-          entry.path,
-          objectsRepo,
-          objectExists,
-          result,
-          logger,
-        );
+        handedOff = true;
+        await dispatchS3Check(ctx, entry.hash, entry.path, absolutePath, rowResolved);
       } finally {
         // Unconditional, per FileTracker's own contract -- see
         // update-cache.ts's dispatchHash for why this matters even on the
-        // error paths above. rowResolved() lives here too, deliberately:
-        // it means "no further BYTE work pending for this row", which is
-        // true the instant the hash settles -- not once the follow-on S3
-        // existence check (dispatchS3Check, above) actually lands. An S3
-        // HEAD isn't byte work, and resolving there instead would leave
-        // filesDone lagging behind by the whole s3Pool queue, still
-        // advancing well after hashJobs.onIdle() has already resolved.
+        // error paths above.
         fileTracker.finish();
-        progress.rowResolved();
+        if (!handedOff) rowResolved();
       }
     });
     logger.debug({ pool: "hash", inFlight: hashJobs.size }, "dispatched");
@@ -387,49 +458,116 @@ async function dispatchTrackedEntryCheck(
     progress.rowResolved();
     return;
   }
-  await dispatchS3Check(
-    s3Pool,
-    s3QueueLimit,
-    s3PoolErrors,
-    entry.hash,
-    entry.path,
-    objectsRepo,
-    objectExists,
-    result,
-    logger,
-  );
-  // A stub's declared hash is read synchronously above (never hashed), so
-  // by the time dispatchS3Check's own dispatch-not-await-completion has
-  // returned, there's no further byte work pending for this row -- same
-  // "resolved at dispatch, not completion" rule as the real-file branch's
-  // finally above.
+  // No local plaintext to re-encrypt, so the chain ends at the HEAD.
+  await dispatchS3Check(ctx, entry.hash, entry.path, null, () => {});
+  // A stub's declared hash is read synchronously above (never hashed), and
+  // a HEAD isn't byte work, so by the time the dispatch has returned
+  // there's no further byte work pending for this row -- resolved at
+  // dispatch, not completion.
   progress.rowResolved();
 }
 
+/**
+ * Stage 2: HEADs the object, comparing S3's checksum against state.db's,
+ * then hands a real file (`localPath` non-null) on to stage 3. `onSettled`
+ * fires exactly once, when this row's chain has no stage left to run.
+ */
 async function dispatchS3Check(
-  s3Pool: PQueue,
-  s3QueueLimit: number,
-  s3PoolErrors: PoolErrorBox,
+  ctx: CheckContext,
   hash: string,
   entryPath: string,
-  objectsRepo: ObjectsRepository,
-  objectExists: ObjectExistsChecker,
-  result: SanityCheckResult,
-  logger: Logger,
+  localPath: string | null,
+  onSettled: () => void,
 ): Promise<void> {
-  const objectRow = objectsRepo.get(hash);
+  const { result, logger, s3Pool } = ctx;
+  const objectRow = ctx.objectsRepo.get(hash);
   if (!objectRow) {
     result.missingInS3.push({ path: entryPath, hash });
+    onSettled();
     return;
   }
 
-  await waitForRoom(s3Pool, s3QueueLimit);
-  dispatchTracked(s3Pool, s3PoolErrors, async () => {
-    const exists = await objectExists(objectRow.s3_key);
-    logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "completed");
-    if (!exists) {
-      result.missingInS3.push({ path: entryPath, hash });
+  await waitForRoom(s3Pool, ctx.s3QueueLimit);
+  dispatchTracked(s3Pool, ctx.s3PoolErrors, async () => {
+    let handedOff = false;
+    try {
+      const head = await ctx.headObject(objectRow.s3_key);
+      logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "completed");
+      if (head === null) {
+        result.missingInS3.push({ path: entryPath, hash });
+        return;
+      }
+      const s3Checksum = head.checksumCrc64Nvme ?? null;
+      if (s3Checksum !== objectRow.ciphertext_checksum) {
+        result.s3ChecksumMismatch.push({
+          path: entryPath,
+          hash,
+          recordedChecksum: objectRow.ciphertext_checksum,
+          s3Checksum,
+        });
+      }
+      // Nothing to compare a local checksum against when S3 reports none;
+      // that absence is already reported just above.
+      if (localPath === null || s3Checksum === null) return;
+      handedOff = true;
+      await dispatchLocalChecksum(ctx, objectRow, entryPath, localPath, s3Checksum, onSettled);
+    } finally {
+      if (!handedOff) onSettled();
     }
   });
   logger.debug({ pool: "s3", inFlight: s3Pool.pending, queued: s3Pool.size }, "dispatched");
+}
+
+/**
+ * Stage 3: re-encrypts the local real file and compares its ciphertext
+ * checksum against what S3 reported. Byte work, so it's tracked on the
+ * progress bar like the hash pass was.
+ */
+async function dispatchLocalChecksum(
+  ctx: CheckContext,
+  objectRow: ObjectRow,
+  entryPath: string,
+  localPath: string,
+  s3Checksum: string,
+  onSettled: () => void,
+): Promise<void> {
+  const { result, logger, progress, streamPool } = ctx;
+  await waitForRoom(streamPool, ctx.streamQueueLimit);
+  progress.expectBytes(objectRow.size);
+  dispatchTracked(streamPool, ctx.streamPoolErrors, async () => {
+    const fileTracker = progress.startFile(entryPath, objectRow.size);
+    try {
+      const local = await ctx.localChecksum(localPath, objectRow.hash, objectRow.size, (n) =>
+        fileTracker.advance(n),
+      );
+      logger.debug(
+        { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+        "completed",
+      );
+      if ("error" in local) {
+        result.localChecksumMismatch.push({
+          path: entryPath,
+          hash: objectRow.hash,
+          s3Checksum,
+          localChecksum: null,
+          reason: local.error,
+        });
+      } else if (local.checksum !== s3Checksum) {
+        result.localChecksumMismatch.push({
+          path: entryPath,
+          hash: objectRow.hash,
+          s3Checksum,
+          localChecksum: local.checksum,
+          reason: null,
+        });
+      }
+    } finally {
+      fileTracker.finish();
+      onSettled();
+    }
+  });
+  logger.debug(
+    { pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
+    "dispatched",
+  );
 }

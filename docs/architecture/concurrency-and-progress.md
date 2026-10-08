@@ -75,9 +75,10 @@ pool.add(task)`, since the producer loop must not block on one task to dispatch 
    codebase (`materialize.ts`, `sanity-check.ts`, `converge-storage-policies.ts`, `gc.ts`,
    `thumbnail.ts`) still have this exact gap, unfixed.
 
-Where one job's completion enqueues a _second_ pool's job (`sanity_check`'s hash → S3 check,
-`materialize`'s HEAD → download), **join order matters**: the first pool must be drained before the
-second, since draining the second too early could miss a job that hadn't been enqueued yet.
+Where one job's completion enqueues a _second_ pool's job (`sanity_check`'s hash → S3 check →
+re-encrypt, `materialize`'s HEAD → download), **join order matters**: each pool must be drained before
+the next in the chain, since draining a later one too early could miss a job that hadn't been enqueued
+yet.
 
 `sync`'s two local-apply passes (deletes, then creates/modifies — see
 [conflict-resolution.md](conflict-resolution.md)) are the one case needing real bookkeeping beyond a
