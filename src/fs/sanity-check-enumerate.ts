@@ -20,7 +20,9 @@ const PUBLISH_EVERY_ROWS = 512;
  * walk and `entries` -- except that here the tracked side is state.db
  * rather than cache.db. Only a path present on *both* sides, in `--filter`
  * scope, tracked as a file, and materialized as a real file costs bytes:
- * a stub answers from its own declared hash (a cheap synchronous read), a
+ * each such file is read twice (hashed, then re-encrypted for its
+ * ciphertext checksum); a stub answers from its own declared hash (a cheap
+ * synchronous read), a
  * directory has no content, and everything else is reported without being
  * read at all.
  *
@@ -78,7 +80,11 @@ export async function enumerateSanityCheckWork(
         entryNext = entryIter.next();
       } else if (fsEntry !== null && entry !== null) {
         if (inScope(entry.path) && entry.type !== "dir" && fsEntry.representation === "real") {
-          bytes += fsEntry.size;
+          // Read twice: once to hash, once more to re-encrypt and checksum
+          // the ciphertext. An over-estimate when the hash mismatches or
+          // the object turns out missing (no second read) -- settle()
+          // replaces it with what actually happened.
+          bytes += 2 * fsEntry.size;
         }
         fsNext = await fsIter.next();
         entryNext = entryIter.next();

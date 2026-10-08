@@ -2,10 +2,14 @@
 
 A **read-only diagnostic**, purely for finding bugs. It never repairs anything — no auto-cleanup of
 dangling stubs, no re-hashing to "fix" a mismatch, no deletion of untracked files. It cross-checks
-`state.db` against both S3 (does the referenced object still actually exist) and the local filesystem
-(does the real/stub content still match what's recorded), and separately finds local files that exist on
-disk but aren't tracked and don't match any ignore policy. No password is needed — `HEAD` requests and
-rehashing local plaintext both need no decryption. See
+`state.db` against both S3 (does the referenced object still exist, and does it still carry the
+checksum it was uploaded with) and the local filesystem (does the real/stub content still match what's
+recorded, and does a real file still re-encrypt to exactly the stored object), and separately finds
+local files that exist on disk but aren't tracked and don't match any ignore policy.
+
+**Needs the vault password** (`SYNC1_PASSWORD`, or an interactive prompt) — nothing is decrypted, but
+re-encrypting a local file to checksum its ciphertext needs the master key. A wrong password fails
+before anything is checked. See
 [ignore-and-storage-policies.md](../architecture/ignore-and-storage-policies.md) for how ignore-policy
 matching fits in.
 
@@ -14,7 +18,7 @@ matching fits in.
 ## Usage
 
 ```bash
-sync1 sanity_check [--root <local-path>] [--filter <glob>] [--json] [--hash-parallelism <n>] [--s3-metadata-parallelism <n>]
+sync1 sanity_check [--root <local-path>] [--filter <glob>] [--json] [--hash-parallelism <n>] [--s3-metadata-parallelism <n>] [--file-stream-parallelism <n>]
 ```
 
 ## Options
@@ -24,11 +28,14 @@ sync1 sanity_check [--root <local-path>] [--filter <glob>] [--json] [--hash-para
 | `--root <path>`                 | no       | Local directory to check. Must already be initialized or attached. Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward. |
 | `--filter <glob>`               | no       | [Glob pattern](../README.md#glob-syntax) scoping which tracked/untracked paths are reported.                                                                                |
 | `--hash-parallelism <n>`        | no       | Max concurrent file-hashing worker threads. Default: CPU count.                                                                                                             |
-| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` existence checks. Default 8.                                                                                                                          |
+| `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` checks (existence and checksum). Default 8.                                                                                                           |
+| `--file-stream-parallelism <n>` | no       | Max concurrent local re-encryptions for the ciphertext checksum. Default 4.                                                                                                 |
 
-Rehashing and `HEAD` checks each dispatch to their own pool (see
-[concurrency-and-progress.md](../architecture/concurrency-and-progress.md)) — a file needing both runs
-its `HEAD` check only once rehashing confirms the content still matches.
+Rehashing, `HEAD` checks, and re-encryption each dispatch to their own pool (see
+[concurrency-and-progress.md](../architecture/concurrency-and-progress.md)), chained: a real file is
+`HEAD`-checked only once rehashing confirms its content still matches, and re-encrypted only once the
+`HEAD` has reported S3's checksum. A real file is therefore read twice — the progress bar's byte total
+counts both reads.
 
 ## What it checks
 
@@ -41,8 +48,16 @@ For every path that's either tracked in `state.db`, present locally, or both:
   `hash_mismatch`.
 - **Stub present** → its self-declared hash is read and validated; a malformed stub or one that disagrees
   with `state.db`'s recorded hash is `stub_mismatch`.
-- **Every tracked file**, regardless of local representation, also gets an S3 existence check (`HEAD`) on
-  the object its hash refers to — missing → `missing_in_s3`.
+- **Every tracked file**, regardless of local representation, also gets an S3 check (`HEAD`) on the
+  object its hash refers to — missing → `missing_in_s3`; present, but its CRC64NVME checksum differs
+  from the one `state.db` recorded at upload (or S3 reports none) → `s3_checksum_mismatch`.
+- **Real file present, hash matches, S3 reported a checksum** → the file is re-encrypted in memory
+  exactly as an upload would (encryption is convergent: same plaintext, same key, same bytes — see
+  [vault-and-encryption.md](../architecture/vault-and-encryption.md)) and the ciphertext's CRC64NVME
+  compared against S3's → `local_checksum_mismatch` if they differ, or if the file couldn't be
+  re-encrypted at all (it changed while being read: `local_checksum` is `null` and `reason` says why).
+  This is the only check that proves the local file would reproduce the stored object byte for byte; a
+  stub has no local plaintext, so it gets only the `HEAD` check.
 - **Tracked in state.db, but no local presence at all** (neither a stub nor a real file) →
   `missing_locally`.
 - **Present locally, not tracked** → checked against ignore policies; a match is silently excluded (just
@@ -71,6 +86,18 @@ comparison can't reliably tell "filtered out" apart from "genuinely missing" on 
   "hash_mismatch": [{ "path": "tampered.txt", "expected_hash": "...", "actual_hash": "..." }],
   "stub_mismatch": [{ "path": "img.jpg", "reason": "malformed stub content: \"...\"" }],
   "missing_in_s3": [{ "path": "vanishing.txt", "hash": "..." }],
+  "s3_checksum_mismatch": [
+    { "path": "corrupted.txt", "hash": "...", "recorded_checksum": "...", "s3_checksum": "..." }
+  ],
+  "local_checksum_mismatch": [
+    {
+      "path": "corrupted.txt",
+      "hash": "...",
+      "s3_checksum": "...",
+      "local_checksum": "...",
+      "reason": null
+    }
+  ],
   "missing_locally": ["ghost.txt"],
   "untracked": ["stray.txt"],
   "ignored_count": 1,

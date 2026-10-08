@@ -5,7 +5,7 @@ to [`thumbnail_policy`](thumbnail_policy.md) rules, so a user can browse a vault
 materializing full-size originals. See [thumbnails.md](../architecture/thumbnails.md) for the full design
 — naming convention, resolution rules, the stubbed-original limitation, and the external tools used.
 
-Local-only, same as `update_cache`/`sanity_check`: no password, no S3 client. `cache.db`/`state.db` are
+Local-only, same as `update_cache`: no password, no S3 client. `cache.db`/`state.db` are
 read (never written) and only the local filesystem is touched (a `_thumbnail/` file written or deleted).
 
 > Full sequence-diagram trace: [thumbnail.md](../sequences/thumbnail.md).

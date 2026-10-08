@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   startLocalStack,
   createTestS3Client,
@@ -12,6 +12,9 @@ import {
 import { runCli } from "./helpers/cli.js";
 import { hashBufferHex } from "../../src/crypto/hash.js";
 import { objectKey } from "../../src/vault/paths.js";
+import { openStateDb } from "../../src/db/connection.js";
+import { ObjectsRepository } from "../../src/db/repositories/objects-repository.js";
+import { localStateDbPath } from "../../src/vault/local-dir.js";
 
 const PASSWORD = "correct horse battery staple";
 
@@ -19,10 +22,10 @@ function mkTempRoot(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "sync1-e2e-sanity-"));
 }
 
-async function sanityCheck(root: string, filter?: string) {
+async function sanityCheck(root: string, filter?: string, password = PASSWORD) {
   const args = ["sanity_check", "--root", root, "--json"];
   if (filter) args.push("--filter", filter);
-  const result = await runCli(args);
+  const result = await runCli(args, { env: { SYNC1_PASSWORD: password } });
   return { ...result, parsed: JSON.parse(result.stdout) as Record<string, unknown> };
 }
 
@@ -71,6 +74,8 @@ describe("sanity_check", () => {
       hash_mismatch: [],
       stub_mismatch: [],
       missing_in_s3: [],
+      s3_checksum_mismatch: [],
+      local_checksum_mismatch: [],
       missing_locally: [],
       untracked: [],
       ignored_count: 0,
@@ -104,6 +109,8 @@ describe("sanity_check", () => {
     fs.writeFileSync(path.join(root, "vanishing.txt"), "will vanish from s3");
     fs.writeFileSync(path.join(root, "ghost.txt"), "will vanish locally");
     fs.writeFileSync(path.join(root, "dual.txt"), "has a stray stub too");
+    fs.writeFileSync(path.join(root, "corrupted.txt"), "will be overwritten in s3");
+    fs.writeFileSync(path.join(root, "rewritten.txt"), "s3 and state.db both rewritten");
     const s = await sync(root);
     expect(s.exitCode).toBe(0);
 
@@ -114,6 +121,30 @@ describe("sanity_check", () => {
     const vanishingHash = hashBufferHex(Buffer.from("will vanish from s3"));
     await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: objectKey(vanishingHash) }));
 
+    // S3 checksum mismatch (and therefore a local one too): replace the
+    // object's bytes in S3, leaving state.db's recorded checksum behind.
+    const corruptedHash = hashBufferHex(Buffer.from("will be overwritten in s3"));
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: objectKey(corruptedHash),
+        Body: Buffer.from("garbage ciphertext"),
+        ChecksumAlgorithm: "CRC64NVME",
+      }),
+    );
+
+    // Local checksum mismatch alone: replace the object in S3 *and* make
+    // state.db agree with it, so only re-encrypting the local file -- whose
+    // plaintext hash still matches -- can tell the stored object is wrong.
+    const rewrittenHash = hashBufferHex(Buffer.from("s3 and state.db both rewritten"));
+    const put = await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: objectKey(rewrittenHash),
+        Body: Buffer.from("other garbage ciphertext"),
+        ChecksumAlgorithm: "CRC64NVME",
+      }),
+    );
     // missing locally: remove all local content for a tracked path
     fs.rmSync(path.join(root, "ghost.txt"));
 
@@ -128,6 +159,18 @@ describe("sanity_check", () => {
     });
     expect(ignoreCreate.exitCode).toBe(0);
 
+    // Only now: `ignore create` above rewrites the local state.db copy from
+    // the vault, which would discard this edit.
+    const rewrittenChecksum = put.ChecksumCRC64NVME!;
+    const stateDb = openStateDb(localStateDbPath(root));
+    try {
+      const objects = new ObjectsRepository(stateDb);
+      const row = objects.get(rewrittenHash)!;
+      objects.upsert({ ...row, ciphertext_checksum: rewrittenChecksum });
+    } finally {
+      stateDb.close();
+    }
+
     const result = await sanityCheck(root);
     expect(result.exitCode).toBe(1);
     expect(result.parsed.ok).toBe(false);
@@ -140,6 +183,27 @@ describe("sanity_check", () => {
       },
     ]);
     expect(result.parsed.missing_in_s3).toEqual([{ path: "vanishing.txt", hash: vanishingHash }]);
+    expect(result.parsed.s3_checksum_mismatch).toEqual([
+      {
+        path: "corrupted.txt",
+        hash: corruptedHash,
+        recorded_checksum: expect.any(String),
+        s3_checksum: expect.any(String),
+      },
+    ]);
+    const localMismatch = result.parsed.local_checksum_mismatch as Array<{
+      path: string;
+      s3_checksum: string;
+      local_checksum: string | null;
+      reason: string | null;
+    }>;
+    expect(localMismatch.map((m) => m.path)).toEqual(["corrupted.txt", "rewritten.txt"]);
+    expect(localMismatch[1]).toMatchObject({
+      s3_checksum: rewrittenChecksum,
+      local_checksum: expect.any(String),
+      reason: null,
+    });
+    expect(localMismatch[1]!.local_checksum).not.toBe(rewrittenChecksum);
     expect(result.parsed.missing_locally).toEqual(["ghost.txt"]);
     expect(result.parsed.both_stub_and_real).toEqual(["dual.txt"]);
     expect(result.parsed.untracked).toEqual(["untracked.txt"]);
@@ -234,6 +298,35 @@ describe("sanity_check", () => {
 
     fs.rmSync(rootA, { recursive: true, force: true });
     fs.rmSync(rootB, { recursive: true, force: true });
+  });
+
+  it("fails cleanly on a wrong password, before checking anything", async () => {
+    const s3 = createTestS3Client(localstack.endpoint);
+    const bucket = await createFreshBucket(s3);
+    const root = mkTempRoot();
+
+    await runCli(
+      [
+        "init_remote",
+        "--bucket",
+        bucket,
+        "--root",
+        root,
+        "--endpoint",
+        localstack.endpoint,
+        "--json",
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
+    fs.writeFileSync(path.join(root, "a.txt"), "content");
+    await sync(root);
+
+    const result = await sanityCheck(root, undefined, "wrong password");
+    expect(result.exitCode).not.toBe(0);
+    expect(result.parsed.ok).toBe(false);
+    expect(result.parsed.error).toEqual(expect.any(String));
+
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   it("fails cleanly when the root was never initialized/attached", async () => {
