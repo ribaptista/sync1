@@ -229,8 +229,14 @@ describe("EntriesRepository (state.db)", () => {
     const db = openStateDb(":memory:");
     new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
     new VersionsRepository(db).insert("v1", "2026-01-02T00:00:00.000Z");
+    new ObjectsRepository(db).upsert({
+      hash: "h1",
+      s3_key: "objects/h1",
+      size: 10,
+      ciphertext_checksum: "crc-test",
+    });
     const repo = new EntriesRepository(db);
-    const entry = { path: "a.txt", type: "file" as const, hash: null, state_version: "v0" };
+    const entry = { path: "a.txt", type: "file" as const, hash: "h1", state_version: "v0" };
     repo.upsert(entry);
     repo.deleteWithHistory(entry, "v1");
     expect(repo.get("a.txt")).toBeUndefined();
@@ -285,8 +291,14 @@ describe("EntriesRepository (state.db)", () => {
     it("is atomic -- a failed history insert leaves the entries row untouched", () => {
       const db = openStateDb(":memory:");
       new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      new ObjectsRepository(db).upsert({
+        hash: "h1",
+        s3_key: "objects/h1",
+        size: 10,
+        ciphertext_checksum: "crc-test",
+      });
       const repo = new EntriesRepository(db);
-      const entry = { path: "a.txt", type: "file" as const, hash: null, state_version: "v0" };
+      const entry = { path: "a.txt", type: "file" as const, hash: "h1", state_version: "v0" };
       repo.upsert(entry);
 
       // "v1" was never inserted into `versions` -- entry_deletions.
@@ -299,13 +311,28 @@ describe("EntriesRepository (state.db)", () => {
     });
   });
 
+  /**
+   * Every file entry in this suite shares one dummy hash/object row --
+   * dedup already allows this in practice, and none of these tests care
+   * about hash values at all, only path ordering/matching.
+   */
+  function seedDummyObject(db: ReturnType<typeof openStateDb>): void {
+    new ObjectsRepository(db).upsert({
+      hash: "h",
+      s3_key: "objects/h",
+      size: 1,
+      ciphertext_checksum: "crc-test",
+    });
+  }
+
   it("iterateAllSortedByPath returns rows in lexicographic path order", () => {
     const db = openStateDb(":memory:");
     new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+    seedDummyObject(db);
     const repo = new EntriesRepository(db);
-    repo.upsert({ path: "z.txt", type: "file", hash: null, state_version: "v0" });
-    repo.upsert({ path: "a.txt", type: "file", hash: null, state_version: "v0" });
-    repo.upsert({ path: "m/nested.txt", type: "file", hash: null, state_version: "v0" });
+    repo.upsert({ path: "z.txt", type: "file", hash: "h", state_version: "v0" });
+    repo.upsert({ path: "a.txt", type: "file", hash: "h", state_version: "v0" });
+    repo.upsert({ path: "m/nested.txt", type: "file", hash: "h", state_version: "v0" });
 
     const paths = [...repo.iterateAllSortedByPath()].map((r) => r.path);
     expect(paths).toEqual(["a.txt", "m/nested.txt", "z.txt"]);
@@ -315,10 +342,11 @@ describe("EntriesRepository (state.db)", () => {
     it("matches a '**' pattern across nested directories", () => {
       const db = openStateDb(":memory:");
       new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      seedDummyObject(db);
       const repo = new EntriesRepository(db);
-      repo.upsert({ path: "photos/a.jpg", type: "file", hash: null, state_version: "v0" });
-      repo.upsert({ path: "photos/sub/b.jpg", type: "file", hash: null, state_version: "v0" });
-      repo.upsert({ path: "docs/c.txt", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "photos/a.jpg", type: "file", hash: "h", state_version: "v0" });
+      repo.upsert({ path: "photos/sub/b.jpg", type: "file", hash: "h", state_version: "v0" });
+      repo.upsert({ path: "docs/c.txt", type: "file", hash: "h", state_version: "v0" });
 
       const paths = [...repo.iterateByGlobSortedByPath("photos/**/*.jpg")].map((r) => r.path);
       expect(paths).toEqual(["photos/a.jpg", "photos/sub/b.jpg"]);
@@ -327,9 +355,10 @@ describe("EntriesRepository (state.db)", () => {
     it("matches dotfiles like any other name", () => {
       const db = openStateDb(":memory:");
       new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      seedDummyObject(db);
       const repo = new EntriesRepository(db);
-      repo.upsert({ path: ".env", type: "file", hash: null, state_version: "v0" });
-      repo.upsert({ path: "readme.md", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: ".env", type: "file", hash: "h", state_version: "v0" });
+      repo.upsert({ path: "readme.md", type: "file", hash: "h", state_version: "v0" });
 
       const paths = [...repo.iterateByGlobSortedByPath("*")].map((r) => r.path);
       expect(paths).toEqual([".env", "readme.md"]);
@@ -338,10 +367,11 @@ describe("EntriesRepository (state.db)", () => {
     it("still finds every match for a leading-wildcard pattern (no literal prefix to seed from)", () => {
       const db = openStateDb(":memory:");
       new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      seedDummyObject(db);
       const repo = new EntriesRepository(db);
-      repo.upsert({ path: "a.jpg", type: "file", hash: null, state_version: "v0" });
-      repo.upsert({ path: "sub/b.jpg", type: "file", hash: null, state_version: "v0" });
-      repo.upsert({ path: "z.jpg", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "a.jpg", type: "file", hash: "h", state_version: "v0" });
+      repo.upsert({ path: "sub/b.jpg", type: "file", hash: "h", state_version: "v0" });
+      repo.upsert({ path: "z.jpg", type: "file", hash: "h", state_version: "v0" });
 
       const paths = [...repo.iterateByGlobSortedByPath("*.jpg")].map((r) => r.path);
       expect(paths).toEqual(["a.jpg", "z.jpg"]); // segment-bound '*' excludes "sub/b.jpg"
@@ -350,13 +380,14 @@ describe("EntriesRepository (state.db)", () => {
     it("a literal-prefix-anchored pattern excludes a sibling sharing only a raw string prefix", () => {
       const db = openStateDb(":memory:");
       new VersionsRepository(db).insert("v0", "2026-01-01T00:00:00.000Z");
+      seedDummyObject(db);
       const repo = new EntriesRepository(db);
-      repo.upsert({ path: "Photos/2024/a.jpg", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "Photos/2024/a.jpg", type: "file", hash: "h", state_version: "v0" });
       // Shares the raw string prefix "Photos/2024" but is not actually
       // under that directory -- the seed/stop range in glob-scan.ts is
       // deliberately loose (a byte-prefix bound, not a path-segment bound),
       // so this row gets visited; matchesAnyGlob must still reject it.
-      repo.upsert({ path: "Photos/20245.txt", type: "file", hash: null, state_version: "v0" });
+      repo.upsert({ path: "Photos/20245.txt", type: "file", hash: "h", state_version: "v0" });
 
       const paths = [...repo.iterateByGlobSortedByPath("Photos/2024/*.jpg")].map((r) => r.path);
       expect(paths).toEqual(["Photos/2024/a.jpg"]);

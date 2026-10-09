@@ -304,22 +304,6 @@ describe("performSanityCheck", () => {
     expect(formatTaggedHash(hash)).toMatch(/^blake2b:/);
   });
 
-  it("falls back to a plain hash-only read, never calling readLocal, when an entry has no recorded hash", async () => {
-    touch("edge.txt", "unusual, but tolerated");
-    seedEntry("edge.txt", null);
-    const readLocal = vi.fn(defaultReadLocal);
-
-    const result = await run(defaultHeadChecker, undefined, { readLocal });
-    expect(result).toMatchObject({
-      hashMismatch: [],
-      missingInS3: [],
-      checksumMismatch: [],
-      untracked: [],
-      missingLocally: [],
-    });
-    expect(readLocal).not.toHaveBeenCalled();
-  });
-
   describe("checksum comparison (local re-encrypt / state.db / S3 HEAD)", () => {
     it("reports checksumMismatch when S3's checksum differs from state.db's recorded one", async () => {
       const hash = hashBufferHex(Buffer.from("hello"));
@@ -403,6 +387,85 @@ describe("performSanityCheck", () => {
         },
       ]);
       expect(readLocal).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("performSanityCheck: --verbose terminal events", () => {
+  /**
+   * Every path that reaches `dispatchTrackedEntryCheck`'s real/stub
+   * branches ends in exactly one of these five outcomes -- never zero
+   * (silently dropped) and never two (double-reported, e.g. both a hash
+   * mismatch and a checksum mismatch for the same file). A capturing
+   * logger is the only way to observe this end-to-end, since the result
+   * buckets alone can't show *how many* terminal events a given path
+   * produced.
+   */
+  const TERMINAL_MSGS = [
+    "ok",
+    "hash mismatch",
+    "checksum mismatch",
+    "missing in s3",
+    "stub mismatch",
+  ];
+
+  it("logs exactly one terminal event per tracked file, matching its own outcome", async () => {
+    const eventsByPath: Record<string, string[]> = {};
+    const capturingLogger = {
+      debug: (fields: Record<string, unknown>, msg: string) => {
+        if (TERMINAL_MSGS.includes(msg) && typeof fields.path === "string") {
+          (eventsByPath[fields.path] ??= []).push(msg);
+        }
+      },
+      warn: () => {},
+    } as unknown as import("../../../src/logger.js").Logger;
+
+    const okHash = hashBufferHex(Buffer.from("clean"));
+    touch("ok.txt", "clean");
+    seedObject(okHash, "objects/ok", 5);
+    seedEntry("ok.txt", okHash);
+
+    const originalHash = hashBufferHex(Buffer.from("original"));
+    touch("tampered.txt", "TAMPERED!!!");
+    seedObject(originalHash, "objects/tampered", 8);
+    seedEntry("tampered.txt", originalHash);
+
+    const driftHash = hashBufferHex(Buffer.from("hello"));
+    touch("drift.txt", "hello");
+    seedObject(driftHash, "objects/drift", 5);
+    s3Objects.set("objects/drift", "crc:drifted");
+    seedEntry("drift.txt", driftHash);
+
+    const vanishHash = hashBufferHex(Buffer.from("vanish"));
+    touch("vanish.txt", "vanish");
+    seedObject(vanishHash, "objects/vanish", 6, false);
+    seedEntry("vanish.txt", vanishHash);
+
+    const imgHash = hashBufferHex(Buffer.from("stub content"));
+    writeStubAtomic(path.join(root, "img.jpg.stub"), "c".repeat(64)); // bogus, deliberately
+    seedObject(imgHash, "objects/img", 12);
+    seedEntry("img.jpg", imgHash);
+
+    await performSanityCheck(
+      root,
+      entriesRepo,
+      objectsRepo,
+      ignorePoliciesRepo,
+      defaultHeadChecker,
+      defaultReadLocal,
+      capturingLogger,
+      new PQueue({ concurrency: 4 }),
+      8,
+      new PQueue({ concurrency: 4 }),
+      8,
+    );
+
+    expect(eventsByPath).toEqual({
+      "ok.txt": ["ok"],
+      "tampered.txt": ["hash mismatch"],
+      "drift.txt": ["checksum mismatch"],
+      "vanish.txt": ["missing in s3"],
+      "img.jpg": ["stub mismatch"],
     });
   });
 });

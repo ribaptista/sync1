@@ -111,6 +111,10 @@ comparison can't reliably tell "filtered out" apart from "genuinely missing" on 
 - `0` — every bucket above (except `ignored_count`, which is never a problem) is empty.
 - `1` — at least one problem was found, or a filesystem/S3 error.
 
+All-or-nothing: a file modified (or deleted) while the check is reading it, or any other per-file read
+error, aborts the whole run rather than reporting a partial result — there is no `--json` output and no
+exit code specific to "something changed mid-run." Re-run once the vault is quiescent.
+
 ## Example
 
 ```bash

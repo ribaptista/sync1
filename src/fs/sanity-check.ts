@@ -5,7 +5,6 @@ import type { Logger } from "../logger.js";
 import { walk, type WalkEntry } from "./walker.js";
 import { readStubHash, stubPathFor, StubFormatError } from "./stub.js";
 import { matchesAnyGlob } from "./glob-match.js";
-import { hashFile } from "./hash-file.js";
 import type { EntriesRepository, EntryRow } from "../db/repositories/entries-repository.js";
 import type { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import type { IgnorePoliciesRepository } from "../db/repositories/ignore-policies-repository.js";
@@ -268,8 +267,10 @@ export async function performSanityCheck(
           const ignoreMatch = matchesAnyGlob(fsEntry.path, ignoreGlobs);
           if (ignoreMatch.matched) {
             result.ignoredCount++;
+            logger.debug({ path: fsEntry.path }, "ignored");
           } else {
             result.untracked.push(fsEntry.path);
+            logger.debug({ path: fsEntry.path }, "untracked");
           }
         }
         // Synchronous either way -- an untracked/ignored path (or one
@@ -379,42 +380,21 @@ async function dispatchTrackedEntryCheck(
     return;
   }
 
+  // `entries.hash` is `NOT NULL` for every `type = 'file'` row (migration
+  // 0013's `CHECK ((type = 'file') = (hash IS NOT NULL))`), and `entry.type
+  // === "dir"` already returned above -- so a null here means state.db
+  // itself is corrupt, exactly the class of thing this command exists to
+  // catch, not paper over with a degraded hash-only read.
+  if (!entry.hash) {
+    throw new Error(
+      `entry "${entry.path}" has type "file" but no recorded hash -- state.db is corrupt`,
+    );
+  }
+  const hash = entry.hash;
+
   const absolutePath = path.join(root, entry.path);
 
   if (fsEntry.representation === "real") {
-    // An entry should always have a hash; without one there's nothing to
-    // derive an encryption context from, so fall back to a plain hash-only
-    // read (the pre-ciphertext-checksum behavior) rather than skipping the
-    // row outright.
-    if (!entry.hash) {
-      progress.expectBytes(fsEntry.size);
-      await waitForRoom(streamPool, streamQueueLimit);
-      dispatchTracked(streamPool, streamPoolErrors, async () => {
-        const fileTracker = progress.startFile(entry.path, fsEntry.size);
-        try {
-          await hashFile(absolutePath, (n) => fileTracker.advance(n));
-          logger.debug(
-            {
-              path: entry.path,
-              pool: "stream",
-              inFlight: streamPool.pending,
-              queued: streamPool.size,
-            },
-            "completed",
-          );
-        } finally {
-          fileTracker.finish();
-          progress.rowResolved();
-        }
-      });
-      logger.debug(
-        { path: entry.path, pool: "stream", inFlight: streamPool.pending, queued: streamPool.size },
-        "dispatched",
-      );
-      return;
-    }
-
-    const hash = entry.hash;
     progress.expectBytes(fsEntry.size);
     await waitForRoom(streamPool, streamQueueLimit);
     dispatchTracked(streamPool, streamPoolErrors, async () => {
@@ -431,6 +411,8 @@ async function dispatchTrackedEntryCheck(
             path: entry.path,
             hash,
             plaintext_hash: plaintextHash,
+            local_checksum: ciphertextChecksum,
+            bytes: fsEntry.size,
             pool: "stream",
             inFlight: streamPool.pending,
             queued: streamPool.size,
@@ -471,6 +453,7 @@ async function dispatchTrackedEntryCheck(
     return;
   }
 
+  // representation === "stub"
   let stubHash: string;
   try {
     stubHash = readStubHash(stubPathFor(absolutePath));
@@ -484,24 +467,17 @@ async function dispatchTrackedEntryCheck(
     throw err;
   }
   logger.debug({ path: entry.path, stub_hash: stubHash }, "stub");
-  if (entry.hash !== null && stubHash !== entry.hash) {
-    const reason = `stub declares hash ${stubHash}, state.db expects ${entry.hash}`;
+  if (stubHash !== hash) {
+    const reason = `stub declares hash ${stubHash}, state.db expects ${hash}`;
     result.stubMismatch.push({ path: entry.path, reason });
     logger.debug({ path: entry.path, reason }, "stub mismatch");
-    progress.rowResolved();
-    return;
-  }
-
-  if (!entry.hash) {
-    // A file entry should always have a hash; nothing further to verify if
-    // it somehow doesn't.
     progress.rowResolved();
     return;
   }
   // No local plaintext to re-encrypt, so the chain ends at the HEAD --
   // `localChecksum: null` tells dispatchS3Check there's nothing local to
   // compare.
-  await dispatchS3Check(ctx, entry.hash, entry.path, null);
+  await dispatchS3Check(ctx, hash, entry.path, null);
   // A stub's declared hash is read synchronously above (never hashed), and
   // a HEAD isn't byte work, so by the time dispatchS3Check's own
   // dispatch-not-await-completion has returned, there's no further byte
