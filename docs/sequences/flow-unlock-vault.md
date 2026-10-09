@@ -4,7 +4,7 @@
 `src/crypto/kdf.ts`
 
 **Used by:** [`sync.md`](sync.md), [`gc.md`](gc.md), [`materialize.md`](materialize.md),
-[`mirror.md`](mirror.md), [`policy_edit.md`](policy_edit.md), [`sanity_check.md`](sanity_check.md)
+[`mirror.md`](mirror.md), [`policy_edit.md`](policy_edit.md)
 
 Any command that reads or writes encrypted content needs the master key, derived from the vault
 password via Argon2id. This is the same five-step sequence everywhere it appears; only the CPU cost of
