@@ -95,6 +95,72 @@ describe("streaming codec", () => {
     expect(decrypted).toHaveLength(0);
   });
 
+  /**
+   * A zero-byte plaintext never enters the chunk loop, so nothing would
+   * otherwise ever touch `sourceStream` at all. For a real
+   * `fs.createReadStream`, its `open()` is issued asynchronously and left
+   * untouched would still be in flight when this generator returns -- if
+   * the underlying file is removed (a test's own cleanup, in practice)
+   * before that queued open() actually fires, it errors with no listener
+   * attached, an unhandled rejection unrelated to anything this generator's
+   * own caller awaited. Destroying the source explicitly, the same as the
+   * aborted-signal branch does, is what retires it deterministically
+   * instead of leaving its fate to GC and scheduling luck.
+   */
+  it("destroys an otherwise-untouched source stream for a zero-byte plaintext", async () => {
+    const masterKey = randomMasterKey();
+    const context = contentHashContext(Buffer.alloc(0));
+    const source = chunkyReadable(Buffer.alloc(0), 4);
+
+    await collect(encryptStream(source, 0, masterKey, context, { chunkSize: TEST_CHUNK_SIZE }));
+
+    expect(source.destroyed).toBe(true);
+  });
+
+  /**
+   * The actual mechanism, tested directly rather than through a real,
+   * timing-dependent `fs` race: Node's rule is that an EventEmitter with
+   * no 'error' listeners throws synchronously when 'error' is emitted on
+   * it -- for a real stream, that becomes a process-crashing unhandled
+   * 'error' event. `encryptStream` abandoning a source it never finished
+   * with (zero bytes, or a mid-read abort) has to leave a listener behind,
+   * not just call `.destroy()`, because a real `fs.createReadStream`'s
+   * `open()` is issued asynchronously and can still fail (ENOENT, if the
+   * file was removed meanwhile) well after `.destroy()` was already
+   * called -- confirmed directly against a real `fs.createReadStream`,
+   * not assumed from documentation.
+   */
+  it("leaves the abandoned zero-byte source listening for 'error', so a later one can't crash the process", async () => {
+    const masterKey = randomMasterKey();
+    const context = contentHashContext(Buffer.alloc(0));
+    const source = chunkyReadable(Buffer.alloc(0), 4);
+
+    await collect(encryptStream(source, 0, masterKey, context, { chunkSize: TEST_CHUNK_SIZE }));
+
+    expect(() => source.emit("error", new Error("ENOENT (simulated)"))).not.toThrow();
+  });
+
+  it("destroys the source, with an 'error' listener attached, when the signal aborts mid-read", async () => {
+    const masterKey = randomMasterKey();
+    const plaintext = Buffer.from("content long enough to span a couple of chunks here");
+    const context = contentHashContext(plaintext);
+    const source = chunkyReadable(plaintext, 5);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      collect(
+        encryptStream(source, plaintext.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          signal: controller.signal,
+        }),
+      ),
+    ).rejects.toThrow();
+
+    expect(source.destroyed).toBe(true);
+    expect(() => source.emit("error", new Error("ENOENT (simulated)"))).not.toThrow();
+  });
+
   it("fails authentication when a ciphertext byte is tampered with", async () => {
     const masterKey = randomMasterKey();
     const plaintext = Buffer.from("A".repeat(16) + "B".repeat(16));

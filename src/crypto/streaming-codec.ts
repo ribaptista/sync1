@@ -153,6 +153,12 @@ export function encryptStream(
       finishHash(hasher, expectedHash, onPlaintextHash);
     }
 
+    if (totalChunks === 0) {
+      // Nothing below will ever touch `sourceStream` -- `StreamByteReader`
+      // is never asked to read a single byte from it.
+      abandon(sourceStream);
+    }
+
     yield header;
     const reader = new StreamByteReader(sourceStream);
     for (let i = 0; i < totalChunks; i++) {
@@ -162,7 +168,7 @@ export function encryptStream(
       // open file handle; throwing alone would leave it open until GC,
       // same as the hang this whole mechanism exists to prevent.
       if (signal?.aborted) {
-        sourceStream.destroy();
+        abandon(sourceStream);
         signal.throwIfAborted();
       }
       const len = i === totalChunks - 1 ? totalPlaintextSize - chunkSize * i : chunkSize;
@@ -191,6 +197,32 @@ export function encryptStream(
   }
 
   return Readable.from(generate());
+}
+
+/**
+ * Releases a source stream this generator is giving up on early -- never
+ * read at all (a zero-byte plaintext) or abandoned mid-read (`signal`
+ * aborted) -- without letting it crash the process later.
+ *
+ * `.destroy()` alone isn't enough for a real `fs.createReadStream`: its
+ * `open()` is issued asynchronously and may still be in flight (Node
+ * queues it, lazily, rather than opening synchronously at construction).
+ * Destroying the stream doesn't cancel that queued syscall, and if the
+ * file is removed before it resolves -- a test's own cleanup, a
+ * concurrent delete -- it still completes, with ENOENT, and still emits
+ * 'error' on the now-destroyed stream regardless. Confirmed directly
+ * (destroy() alone measurably still crashes under this exact race), not
+ * assumed from documentation. With nothing here ever having awaited that
+ * eventual error, it would otherwise be a genuine unhandled 'error' event
+ * -- Node's default for that is to crash the process outright. Attaching
+ * a listener first, even a no-op one, is what an EventEmitter needs to
+ * consider 'error' handled; this one is deliberately silent, since by the
+ * time this runs the caller has already decided the stream's fate and has
+ * nothing further to learn from an error it causes on the way out.
+ */
+function abandon(sourceStream: Readable): void {
+  sourceStream.on("error", () => {});
+  sourceStream.destroy();
 }
 
 /**
