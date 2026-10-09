@@ -12,17 +12,18 @@ import type { EnumerationControl } from "./update-cache-enumerate.js";
 const PUBLISH_EVERY_ROWS = 512;
 
 /**
- * Counts what `performSanityCheck` is about to hash, so the bar has a real
- * denominator early instead of one that climbs until the run ends.
+ * Counts what `performSanityCheck` is about to read (and, in the same
+ * pass, re-encrypt), so the bar has a real denominator early instead of
+ * one that climbs until the run ends.
  *
  * Same shape and rationale as `enumerateUpdateCacheWork`, over the same
  * two sorted sequences sanity_check itself merge-joins -- the filesystem
  * walk and `entries` -- except that here the tracked side is state.db
  * rather than cache.db. Only a path present on *both* sides, in `--filter`
- * scope, tracked as a file, and materialized as a real file costs bytes:
- * a stub answers from its own declared hash (a cheap synchronous read), a
- * directory has no content, and everything else is reported without being
- * read at all.
+ * scope, tracked as a file, and materialized as a real file costs bytes --
+ * read exactly once (see src/fs/encrypt-file.ts): a stub answers from its
+ * own declared hash (a cheap synchronous read), a directory has no
+ * content, and everything else is reported without being read at all.
  *
  * Deliberately not checked here: `representation === "both"` (a stray stub
  * alongside the real file), which the real pass reports without hashing.

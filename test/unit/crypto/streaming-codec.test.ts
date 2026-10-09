@@ -214,4 +214,99 @@ describe("streaming codec", () => {
       await expect(collect(stream)).rejects.toThrow(/source file changed size during read/);
     });
   });
+
+  describe("encryptStream: onPlaintextHash", () => {
+    const masterKey = randomMasterKey();
+
+    it("reports the actual plaintext hash without throwing, when given alone", async () => {
+      const plaintext = Buffer.from("some content, reported but never asserted against");
+      const context = contentHashContext(plaintext);
+      let reported: string | undefined;
+
+      const encoded = await collect(
+        encryptStream(chunkyReadable(plaintext, 5), plaintext.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          onPlaintextHash: (hex) => (reported = hex),
+        }),
+      );
+
+      expect(reported).toBe(contentHashContext(plaintext).toString("hex"));
+      // Not an assertion seam: the full ciphertext is still emitted even
+      // though nothing here claimed to expect that particular hash.
+      const whole = encryptBuffer(plaintext, masterKey, context, TEST_CHUNK_SIZE);
+      expect(encoded.equals(whole)).toBe(true);
+    });
+
+    it("reports the true hash of mismatched content, rather than throwing", async () => {
+      const scanned = Buffer.from("the content that was hashed at scan time..");
+      const actual = Buffer.from("the content that is on disk at upload time");
+      const context = contentHashContext(scanned);
+      let reported: string | undefined;
+
+      const encoded = await collect(
+        encryptStream(chunkyReadable(actual, 5), actual.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          onPlaintextHash: (hex) => (reported = hex),
+        }),
+      );
+
+      // The reported hash is the content actually read, not `context`.
+      expect(reported).toBe(contentHashContext(actual).toString("hex"));
+      expect(reported).not.toBe(context.toString("hex"));
+      // The stream still completes -- the caller asked to be told, not guarded.
+      const whole = encryptBuffer(actual, masterKey, context, TEST_CHUNK_SIZE);
+      expect(encoded.equals(whole)).toBe(true);
+    });
+
+    it("fires for a zero-byte plaintext too, immediately", async () => {
+      const context = contentHashContext(Buffer.from("irrelevant"));
+      let reported: string | undefined;
+
+      await collect(
+        encryptStream(chunkyReadable(Buffer.alloc(0), 4), 0, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          onPlaintextHash: (hex) => (reported = hex),
+        }),
+      );
+
+      expect(reported).toBe(contentHashContext(Buffer.alloc(0)).toString("hex"));
+    });
+
+    it("never fires when expectedHash rejects the content first", async () => {
+      const scanned = Buffer.from("the content that was hashed at scan time..");
+      const actual = Buffer.from("the content that is on disk at upload time");
+      const context = contentHashContext(scanned);
+      let reported: string | undefined;
+
+      const stream = encryptStream(chunkyReadable(actual, 5), actual.length, masterKey, context, {
+        chunkSize: TEST_CHUNK_SIZE,
+        expectedHash: context.toString("hex"),
+        onPlaintextHash: (hex) => (reported = hex),
+      });
+
+      await expect(collect(stream)).rejects.toThrow(/does not match the expected/);
+      expect(reported).toBeUndefined();
+    });
+
+    it("fires exactly once, after expectedHash's own assertion passes", async () => {
+      const plaintext = Buffer.from("content that is exactly what it claims to be");
+      const context = contentHashContext(plaintext);
+      let calls = 0;
+      let reported: string | undefined;
+
+      await collect(
+        encryptStream(chunkyReadable(plaintext, 5), plaintext.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          expectedHash: context.toString("hex"),
+          onPlaintextHash: (hex) => {
+            calls++;
+            reported = hex;
+          },
+        }),
+      );
+
+      expect(calls).toBe(1);
+      expect(reported).toBe(context.toString("hex"));
+    });
+  });
 });

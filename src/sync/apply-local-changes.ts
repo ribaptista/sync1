@@ -10,7 +10,8 @@ import { ObjectsRepository } from "../db/repositories/objects-repository.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
 import { VersionsRepository } from "../db/repositories/versions-repository.js";
 import { StoragePoliciesRepository } from "../db/repositories/storage-policies-repository.js";
-import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
+import { encryptedSize } from "../crypto/streaming-codec.js";
+import { encryptFileForObject } from "../fs/encrypt-file.js";
 import { HASH_BYTES } from "../crypto/hash.js";
 import { headObject } from "../s3/client.js";
 import { uploadObjectStream, S3UploadFatalError } from "../s3/upload-object.js";
@@ -18,7 +19,6 @@ import { resolveHashTargetClass } from "../s3/policy-evaluation.js";
 import { remoteKey, objectKey, type RemoteLocation } from "../vault/paths.js";
 import { decideLocalChange } from "./conflict-rules.js";
 import { toCollisionKey } from "../fs/case-collision.js";
-import { countingReadable } from "../fs/counting-stream.js";
 import {
   mirrorObjectExists,
   writeMirrorStream,
@@ -610,19 +610,26 @@ export async function applyLocalChangesToCandidate(
               controller.abort(error);
             };
 
-            const sourceStream = countingReadable(fs.createReadStream(absolutePath), (n) =>
-              fileTracker.advance(n),
+            // `hashMismatch: "abort"` is what asks the codec to prove the
+            // bytes it is encrypting are the ones `hash` was taken from --
+            // for a content object the context *is* the content hash. See
+            // EncryptFileOptions for why the two can disagree, and why a
+            // mismatch has to abort the stream rather than be reported
+            // afterwards. `checksum: false`: the upload's own verified
+            // CRC64NVME comes back from `uploadObjectStream` below instead,
+            // so a second pass over the same bytes here would be wasted.
+            const { ciphertext: encryptedStream } = encryptFileForObject(
+              absolutePath,
+              size,
+              masterKey,
+              hash,
+              {
+                onBytes: (n) => fileTracker.advance(n),
+                signal,
+                hashMismatch: "abort",
+                checksum: false,
+              },
             );
-            // `expectedHash` is `hash` itself: for a content object the
-            // context *is* the content hash, so this asks the codec to
-            // prove the bytes it is encrypting are the ones that hash
-            // was taken from. See EncryptStreamOptions for why the two
-            // can disagree, and why a mismatch has to abort the stream
-            // rather than be reported afterwards.
-            const encryptedStream = encryptStream(sourceStream, size, masterKey, context, {
-              expectedHash: hash,
-              signal,
-            });
             // Observed, never consumed: `uploadObjectStream` has no way to
             // tell "my own S3 call failed" from "the body stream I was
             // handed failed" -- a read error (a permission change, a
