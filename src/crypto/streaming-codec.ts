@@ -91,6 +91,24 @@ export interface EncryptStreamOptions {
    */
   expectedHash?: string;
   /**
+   * Called once, with the BLAKE2b hex digest of the plaintext actually
+   * read, at the same point `expectedHash`'s assertion would fire -- the
+   * instant the last plaintext chunk has been consumed (or immediately,
+   * for a zero-byte plaintext). Lets a caller that wants the *actual*
+   * hash of whatever content was just encrypted (sanity_check, comparing
+   * it against a recorded value itself rather than asking this module to
+   * assert it) get it without the stream throwing on a mismatch.
+   *
+   * Compatible with `expectedHash` on the same call: if both are given and
+   * the content doesn't match, `expectedHash`'s assertion still throws
+   * (aborting the stream, withholding the final ciphertext chunk) before
+   * this ever fires -- the two are never both satisfied for a mismatched
+   * file. Harmless together because the hasher is finalized exactly once
+   * either way; this just forwards that one digest to whichever of the two
+   * callers asked for it.
+   */
+  onPlaintextHash?: (digestHex: string) => void;
+  /**
    * Job-level coordination from the caller: when the sink(s) this stream
    * feeds have given up for good (the mirror failed, S3 gave up), the read
    * has to stop too, rather than going on reading and encrypting bytes
@@ -119,19 +137,26 @@ export function encryptStream(
   context: Buffer,
   options: EncryptStreamOptions = {},
 ): Readable {
-  const { chunkSize = DEFAULT_CHUNK_SIZE, expectedHash, signal } = options;
+  const { chunkSize = DEFAULT_CHUNK_SIZE, expectedHash, onPlaintextHash, signal } = options;
   const objectKey = deriveObjectKey(masterKey, context);
   const header = encodeHeader(context, chunkSize, totalPlaintextSize);
   const totalChunks = Math.ceil(totalPlaintextSize / chunkSize);
 
   async function* generate(): AsyncGenerator<Buffer> {
-    const hasher = expectedHash === undefined ? undefined : new StreamingHasher();
+    const needsHash = expectedHash !== undefined || onPlaintextHash !== undefined;
+    const hasher = needsHash ? new StreamingHasher() : undefined;
 
     // A zero-byte plaintext never enters the loop below, so the header *is*
     // the whole body and there would be nothing left to withhold once it
     // has been yielded. Its hash is knowable immediately, so check first.
-    if (hasher && expectedHash !== undefined && totalChunks === 0) {
-      assertPlaintextHash(hasher, expectedHash);
+    if (hasher && totalChunks === 0) {
+      finishHash(hasher, expectedHash, onPlaintextHash);
+    }
+
+    if (totalChunks === 0) {
+      // Nothing below will ever touch `sourceStream` -- `StreamByteReader`
+      // is never asked to read a single byte from it.
+      abandon(sourceStream);
     }
 
     yield header;
@@ -143,7 +168,7 @@ export function encryptStream(
       // open file handle; throwing alone would leave it open until GC,
       // same as the hang this whole mechanism exists to prevent.
       if (signal?.aborted) {
-        sourceStream.destroy();
+        abandon(sourceStream);
         signal.throwIfAborted();
       }
       const len = i === totalChunks - 1 ? totalPlaintextSize - chunkSize * i : chunkSize;
@@ -164,8 +189,8 @@ export function encryptStream(
       // cleaned up -- no window in which another machine's verifyRemote
       // HEAD could adopt it, and no poisoned content key if the cleanup
       // itself failed.
-      if (hasher && expectedHash !== undefined && i === totalChunks - 1) {
-        assertPlaintextHash(hasher, expectedHash);
+      if (hasher && i === totalChunks - 1) {
+        finishHash(hasher, expectedHash, onPlaintextHash);
       }
       yield encryptChunk(chunk, objectKey, i);
     }
@@ -174,12 +199,52 @@ export function encryptStream(
   return Readable.from(generate());
 }
 
-function assertPlaintextHash(hasher: StreamingHasher, expectedHash: string): void {
+/**
+ * Releases a source stream this generator is giving up on early -- never
+ * read at all (a zero-byte plaintext) or abandoned mid-read (`signal`
+ * aborted) -- without letting it crash the process later.
+ *
+ * `.destroy()` alone isn't enough for a real `fs.createReadStream`: its
+ * `open()` is issued asynchronously and may still be in flight (Node
+ * queues it, lazily, rather than opening synchronously at construction).
+ * Destroying the stream doesn't cancel that queued syscall, and if the
+ * file is removed before it resolves -- a test's own cleanup, a
+ * concurrent delete -- it still completes, with ENOENT, and still emits
+ * 'error' on the now-destroyed stream regardless. Confirmed directly
+ * (destroy() alone measurably still crashes under this exact race), not
+ * assumed from documentation. With nothing here ever having awaited that
+ * eventual error, it would otherwise be a genuine unhandled 'error' event
+ * -- Node's default for that is to crash the process outright. Attaching
+ * a listener first, even a no-op one, is what an EventEmitter needs to
+ * consider 'error' handled; this one is deliberately silent, since by the
+ * time this runs the caller has already decided the stream's fate and has
+ * nothing further to learn from an error it causes on the way out.
+ */
+function abandon(sourceStream: Readable): void {
+  sourceStream.on("error", () => {});
+  sourceStream.destroy();
+}
+
+/**
+ * Finalizes `hasher` exactly once (libsodium's `generichash_final` can't be
+ * called twice on the same state) and routes the one resulting digest to
+ * whichever of `expectedHash`/`onPlaintextHash` the caller asked for --
+ * `expectedHash`'s assertion runs first, so a mismatch throws (and
+ * `onPlaintextHash` never fires) before the final ciphertext chunk is ever
+ * emitted.
+ */
+function finishHash(
+  hasher: StreamingHasher,
+  expectedHash: string | undefined,
+  onPlaintextHash: ((digestHex: string) => void) | undefined,
+): void {
   const actual = hasher.digestHex();
-  if (actual === expectedHash) return;
-  throw new Error(
-    `plaintext hash ${actual} does not match the expected ${expectedHash} -- the file changed after it was hashed, so encrypting it under that hash's context would store the wrong content at a content-addressed key`,
-  );
+  if (expectedHash !== undefined && actual !== expectedHash) {
+    throw new Error(
+      `plaintext hash ${actual} does not match the expected ${expectedHash} -- the file changed after it was hashed, so encrypting it under that hash's context would store the wrong content at a content-addressed key`,
+    );
+  }
+  onPlaintextHash?.(actual);
 }
 
 /** Decrypts an encoded object stream chunk-by-chunk, verifying each chunk's AEAD tag as it goes. */

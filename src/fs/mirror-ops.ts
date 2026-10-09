@@ -6,7 +6,8 @@ import { HASH_BYTES, isValidHashHex } from "../crypto/hash.js";
 import { UploadChecksumTap } from "../s3/checksum.js";
 import { isInTreeTempName, inTreeTempPath } from "./temp-path.js";
 import { renameWithRetry } from "./safe-fs.js";
-import { encryptStream, encryptedSize } from "../crypto/streaming-codec.js";
+import { encryptedSize } from "../crypto/streaming-codec.js";
+import { encryptFileForObject } from "./encrypt-file.js";
 import { pipeline } from "node:stream/promises";
 import {
   mirrorObjectPath,
@@ -262,12 +263,13 @@ export function* findExtraMirrorObjects(
  * only if it proves to be the content the object claims.
  *
  * **Two ends checked in a single pass, with the rename as the gate.** The
- * one read feeds `encryptStream`'s own `expectedHash` over the plaintext
- * and a `UploadChecksumTap` over the ciphertext. BLAKE2b must equal the
- * object's hash -- proving the right content was encrypted -- *and* the
- * CRC64NVME must equal what S3 corroborated at upload time, proving the
- * bytes this produced are the bytes the bucket holds. Either fails and the
- * temp is discarded without ever being renamed.
+ * one read, via `encryptFileForObject` (`hashMismatch: "abort"`,
+ * `checksum: true`), feeds `encryptStream`'s own `expectedHash` over the
+ * plaintext and a `UploadChecksumTap` over the ciphertext. BLAKE2b must
+ * equal the object's hash -- proving the right content was encrypted --
+ * *and* the CRC64NVME must equal what S3 corroborated at upload time,
+ * proving the bytes this produced are the bytes the bucket holds. Either
+ * fails and the temp is discarded without ever being renamed.
  *
  * Without this, catchup would be a silent-corruption engine. `objects` has
  * no path column, so a source is found through `entries.hash`
@@ -289,25 +291,27 @@ export async function writeVerifiedMirrorObject(
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const tempPath = inTreeTempPath(target);
 
-  const tap = new UploadChecksumTap();
+  const { ciphertext, result } = encryptFileForObject(
+    sourceAbsolutePath,
+    row.size,
+    masterKey,
+    row.hash,
+    {
+      hashMismatch: "abort",
+      checksum: true,
+    },
+  );
   try {
-    const encrypted = encryptStream(
-      fs.createReadStream(sourceAbsolutePath),
-      row.size,
-      masterKey,
-      Buffer.from(row.hash, "hex"),
-      { expectedHash: row.hash },
-    );
-    await pipeline(tap.tap(encrypted), fs.createWriteStream(tempPath));
+    await pipeline(ciphertext, fs.createWriteStream(tempPath));
+    const { ciphertextChecksum } = await result;
+    if (ciphertextChecksum !== row.ciphertext_checksum) {
+      removeQuietly(tempPath);
+      return false;
+    }
   } catch {
     // A plaintext mismatch or a size change aborts the stream, which is
     // the intended outcome, not an error to propagate: this source simply
     // is not the content, and the caller has others to try.
-    removeQuietly(tempPath);
-    return false;
-  }
-
-  if ((await tap.checksum()) !== row.ciphertext_checksum) {
     removeQuietly(tempPath);
     return false;
   }

@@ -95,6 +95,72 @@ describe("streaming codec", () => {
     expect(decrypted).toHaveLength(0);
   });
 
+  /**
+   * A zero-byte plaintext never enters the chunk loop, so nothing would
+   * otherwise ever touch `sourceStream` at all. For a real
+   * `fs.createReadStream`, its `open()` is issued asynchronously and left
+   * untouched would still be in flight when this generator returns -- if
+   * the underlying file is removed (a test's own cleanup, in practice)
+   * before that queued open() actually fires, it errors with no listener
+   * attached, an unhandled rejection unrelated to anything this generator's
+   * own caller awaited. Destroying the source explicitly, the same as the
+   * aborted-signal branch does, is what retires it deterministically
+   * instead of leaving its fate to GC and scheduling luck.
+   */
+  it("destroys an otherwise-untouched source stream for a zero-byte plaintext", async () => {
+    const masterKey = randomMasterKey();
+    const context = contentHashContext(Buffer.alloc(0));
+    const source = chunkyReadable(Buffer.alloc(0), 4);
+
+    await collect(encryptStream(source, 0, masterKey, context, { chunkSize: TEST_CHUNK_SIZE }));
+
+    expect(source.destroyed).toBe(true);
+  });
+
+  /**
+   * The actual mechanism, tested directly rather than through a real,
+   * timing-dependent `fs` race: Node's rule is that an EventEmitter with
+   * no 'error' listeners throws synchronously when 'error' is emitted on
+   * it -- for a real stream, that becomes a process-crashing unhandled
+   * 'error' event. `encryptStream` abandoning a source it never finished
+   * with (zero bytes, or a mid-read abort) has to leave a listener behind,
+   * not just call `.destroy()`, because a real `fs.createReadStream`'s
+   * `open()` is issued asynchronously and can still fail (ENOENT, if the
+   * file was removed meanwhile) well after `.destroy()` was already
+   * called -- confirmed directly against a real `fs.createReadStream`,
+   * not assumed from documentation.
+   */
+  it("leaves the abandoned zero-byte source listening for 'error', so a later one can't crash the process", async () => {
+    const masterKey = randomMasterKey();
+    const context = contentHashContext(Buffer.alloc(0));
+    const source = chunkyReadable(Buffer.alloc(0), 4);
+
+    await collect(encryptStream(source, 0, masterKey, context, { chunkSize: TEST_CHUNK_SIZE }));
+
+    expect(() => source.emit("error", new Error("ENOENT (simulated)"))).not.toThrow();
+  });
+
+  it("destroys the source, with an 'error' listener attached, when the signal aborts mid-read", async () => {
+    const masterKey = randomMasterKey();
+    const plaintext = Buffer.from("content long enough to span a couple of chunks here");
+    const context = contentHashContext(plaintext);
+    const source = chunkyReadable(plaintext, 5);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      collect(
+        encryptStream(source, plaintext.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          signal: controller.signal,
+        }),
+      ),
+    ).rejects.toThrow();
+
+    expect(source.destroyed).toBe(true);
+    expect(() => source.emit("error", new Error("ENOENT (simulated)"))).not.toThrow();
+  });
+
   it("fails authentication when a ciphertext byte is tampered with", async () => {
     const masterKey = randomMasterKey();
     const plaintext = Buffer.from("A".repeat(16) + "B".repeat(16));
@@ -212,6 +278,101 @@ describe("streaming codec", () => {
         },
       );
       await expect(collect(stream)).rejects.toThrow(/source file changed size during read/);
+    });
+  });
+
+  describe("encryptStream: onPlaintextHash", () => {
+    const masterKey = randomMasterKey();
+
+    it("reports the actual plaintext hash without throwing, when given alone", async () => {
+      const plaintext = Buffer.from("some content, reported but never asserted against");
+      const context = contentHashContext(plaintext);
+      let reported: string | undefined;
+
+      const encoded = await collect(
+        encryptStream(chunkyReadable(plaintext, 5), plaintext.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          onPlaintextHash: (hex) => (reported = hex),
+        }),
+      );
+
+      expect(reported).toBe(contentHashContext(plaintext).toString("hex"));
+      // Not an assertion seam: the full ciphertext is still emitted even
+      // though nothing here claimed to expect that particular hash.
+      const whole = encryptBuffer(plaintext, masterKey, context, TEST_CHUNK_SIZE);
+      expect(encoded.equals(whole)).toBe(true);
+    });
+
+    it("reports the true hash of mismatched content, rather than throwing", async () => {
+      const scanned = Buffer.from("the content that was hashed at scan time..");
+      const actual = Buffer.from("the content that is on disk at upload time");
+      const context = contentHashContext(scanned);
+      let reported: string | undefined;
+
+      const encoded = await collect(
+        encryptStream(chunkyReadable(actual, 5), actual.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          onPlaintextHash: (hex) => (reported = hex),
+        }),
+      );
+
+      // The reported hash is the content actually read, not `context`.
+      expect(reported).toBe(contentHashContext(actual).toString("hex"));
+      expect(reported).not.toBe(context.toString("hex"));
+      // The stream still completes -- the caller asked to be told, not guarded.
+      const whole = encryptBuffer(actual, masterKey, context, TEST_CHUNK_SIZE);
+      expect(encoded.equals(whole)).toBe(true);
+    });
+
+    it("fires for a zero-byte plaintext too, immediately", async () => {
+      const context = contentHashContext(Buffer.from("irrelevant"));
+      let reported: string | undefined;
+
+      await collect(
+        encryptStream(chunkyReadable(Buffer.alloc(0), 4), 0, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          onPlaintextHash: (hex) => (reported = hex),
+        }),
+      );
+
+      expect(reported).toBe(contentHashContext(Buffer.alloc(0)).toString("hex"));
+    });
+
+    it("never fires when expectedHash rejects the content first", async () => {
+      const scanned = Buffer.from("the content that was hashed at scan time..");
+      const actual = Buffer.from("the content that is on disk at upload time");
+      const context = contentHashContext(scanned);
+      let reported: string | undefined;
+
+      const stream = encryptStream(chunkyReadable(actual, 5), actual.length, masterKey, context, {
+        chunkSize: TEST_CHUNK_SIZE,
+        expectedHash: context.toString("hex"),
+        onPlaintextHash: (hex) => (reported = hex),
+      });
+
+      await expect(collect(stream)).rejects.toThrow(/does not match the expected/);
+      expect(reported).toBeUndefined();
+    });
+
+    it("fires exactly once, after expectedHash's own assertion passes", async () => {
+      const plaintext = Buffer.from("content that is exactly what it claims to be");
+      const context = contentHashContext(plaintext);
+      let calls = 0;
+      let reported: string | undefined;
+
+      await collect(
+        encryptStream(chunkyReadable(plaintext, 5), plaintext.length, masterKey, context, {
+          chunkSize: TEST_CHUNK_SIZE,
+          expectedHash: context.toString("hex"),
+          onPlaintextHash: (hex) => {
+            calls++;
+            reported = hex;
+          },
+        }),
+      );
+
+      expect(calls).toBe(1);
+      expect(reported).toBe(context.toString("hex"));
     });
   });
 });

@@ -51,7 +51,7 @@ describe("sanity_check: concurrency", () => {
     await localstack.stop();
   });
 
-  it("hashes and HEADs multiple tracked files concurrently, each bounded by its own --*-parallelism flag", async () => {
+  it("reads+encrypts and HEADs multiple tracked files concurrently, each bounded by its own --*-parallelism flag", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
     const bucket = await createFreshBucket(s3);
     const root = mkTempRoot();
@@ -79,30 +79,35 @@ describe("sanity_check: concurrency", () => {
     });
     expect(syncResult.exitCode).toBe(0);
 
-    const hashParallelism = 3;
+    const streamParallelism = 3;
     const s3Parallelism = 2;
-    const result = await runCli([
-      "sanity_check",
-      "--root",
-      root,
-      "--json",
-      "--verbose",
-      "--hash-parallelism",
-      String(hashParallelism),
-      "--s3-metadata-parallelism",
-      String(s3Parallelism),
-    ]);
+    const result = await runCli(
+      [
+        "sanity_check",
+        "--root",
+        root,
+        "--json",
+        "--verbose",
+        "--file-stream-parallelism",
+        String(streamParallelism),
+        "--s3-metadata-parallelism",
+        String(s3Parallelism),
+      ],
+      { env: { SYNC1_PASSWORD: PASSWORD } },
+    );
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout) as { ok: boolean };
     expect(parsed.ok).toBe(true);
 
     const dispatchLogs = parseDispatchLogs(result.stderr);
 
-    const hashDispatches = dispatchLogs.filter((l) => l.pool === "hash" && l.msg === "dispatched");
-    expect(hashDispatches.length).toBe(fileCount);
-    const maxHashInFlight = Math.max(...hashDispatches.map((l) => l.inFlight));
-    expect(maxHashInFlight).toBeLessThanOrEqual(hashParallelism);
-    expect(maxHashInFlight).toBe(hashParallelism);
+    const streamDispatches = dispatchLogs.filter(
+      (l) => l.pool === "stream" && l.msg === "dispatched",
+    );
+    expect(streamDispatches.length).toBe(fileCount);
+    const maxStreamInFlight = Math.max(...streamDispatches.map((l) => l.inFlight));
+    expect(maxStreamInFlight).toBeLessThanOrEqual(streamParallelism);
+    expect(maxStreamInFlight).toBe(streamParallelism);
 
     const s3Dispatches = dispatchLogs.filter((l) => l.pool === "s3" && l.msg === "dispatched");
     expect(s3Dispatches.length).toBe(fileCount);

@@ -127,25 +127,23 @@ two states; only an object with no usable source anywhere does.
 ```mermaid
 sequenceDiagram
     participant Job as writeVerifiedMirrorObject
-    participant FS
-    participant Codec as encryptStream
+    participant Enc as encryptFileForObject
     participant Mirror as mirror filesystem
 
-    Job->>FS: createReadStream(local plaintext path)
-    Job->>Codec: encryptStream(source, size, masterKey, context=hash, {expectedHash: hash})<br/>-- see flow-encrypt-stream.md
-    Job->>Job: tap the CIPHERTEXT with UploadChecksumTap while piping to a temp sibling
-    alt plaintext mismatch (expectedHash) or a mid-stream size change
-        Job->>FS: discard the temp, unrenamed -- return false, caller tries the next referencing path
-    else stream completed, but tapped CRC64NVME != row.ciphertext_checksum
-        Job->>FS: discard the temp -- return false
+    Job->>Enc: encryptFileForObject(path, size, masterKey, hash, {hashMismatch: "abort", checksum: true})<br/>-- see flow-encrypt-file.md
+    Job->>Mirror: pipeline(ciphertext, createWriteStream(temp))
+    alt plaintext mismatch or a mid-stream size change (ciphertext/result rejects)
+        Job->>Mirror: discard the temp, unrenamed -- return false, caller tries the next referencing path
+    else piped successfully, but result's ciphertextChecksum != row.ciphertext_checksum
+        Job->>Mirror: discard the temp -- return false
     else both checks pass
         Job->>Mirror: renameWithRetry(temp, target) -- see flow-atomic-publish.md (the renameWithRetry variant)
         Job-->>Job: return true
     end
 ```
 
-**Two independent proofs, not one.** BLAKE2b (via `expectedHash`) proves the right plaintext was
-encrypted; CRC64NVME (via the tap) proves the resulting bytes match what S3 itself corroborated at
+**Two independent proofs, not one.** BLAKE2b (`hashMismatch: "abort"`) proves the right plaintext was
+encrypted; CRC64NVME (`checksum: true`) proves the resulting bytes match what S3 itself corroborated at
 upload time. Either failing discards the temp unrenamed — without this, a since-edited local path could
 silently write wrong-content ciphertext under the right object's hash.
 
@@ -193,7 +191,7 @@ Always `ok: true` — pruning (or counting what pruning would remove) has no fai
   failures the plan calls "most likely to go unnoticed and the one that invalidates every later result,"
   so they're checked first and reported distinctly rather than manifesting as thousands of misleading
   per-object rows.
-- **Sub-flows:** [`flow-encrypt-stream.md`](flow-encrypt-stream.md) (the re-encryption in
+- **Sub-flows:** [`flow-encrypt-file.md`](flow-encrypt-file.md) (the re-encryption in
   `writeVerifiedMirrorObject`), [`flow-atomic-publish.md`](flow-atomic-publish.md) (every mirror write —
   the `renameWithRetry` variant), [`flow-archive-status.md`](flow-archive-status.md) (`catchup`'s
   fallback-to-S3 restore ladder).

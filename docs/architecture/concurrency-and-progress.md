@@ -75,9 +75,9 @@ pool.add(task)`, since the producer loop must not block on one task to dispatch 
    codebase (`materialize.ts`, `sanity-check.ts`, `converge-storage-policies.ts`, `gc.ts`,
    `thumbnail.ts`) still have this exact gap, unfixed.
 
-Where one job's completion enqueues a _second_ pool's job (`sanity_check`'s hash → S3 check,
-`materialize`'s HEAD → download), **join order matters**: the first pool must be drained before the
-second, since draining the second too early could miss a job that hadn't been enqueued yet.
+Where one job's completion enqueues a _second_ pool's job (`sanity_check`'s read/re-encrypt → S3
+check, `materialize`'s HEAD → download), **join order matters**: the first pool must be drained before
+the second, since draining the second too early could miss a job that hadn't been enqueued yet.
 
 `sync`'s two local-apply passes (deletes, then creates/modifies — see
 [conflict-resolution.md](conflict-resolution.md)) are the one case needing real bookkeeping beyond a
@@ -99,9 +99,13 @@ collision detection of its own.
   overlapping different items' waits. `PQueue` already has `.onIdle()`/`.pending`/`.size`, so no extra
   bookkeeping is needed beyond the shared backpressure helper (below).
 - **`piscina`** (real OS worker threads) — used only for `--hash-parallelism` (file hashing in
-  `update_cache`/`sanity_check`/`stubify`). Hashing many _different_ files is the one place in this
-  plan that's genuinely CPU-bound and embarrassingly parallel across files, so it's the one place
-  worth spending real threads rather than main-thread async concurrency. `Piscina` must be imported as
+  `update_cache`/`stubify`). Hashing many _different_ files is the one place in this plan that's
+  genuinely CPU-bound and embarrassingly parallel across files, so it's the one place worth spending
+  real threads rather than main-thread async concurrency. `sanity_check` does **not** use this pool —
+  it reads and re-encrypts each real file on its own file-stream-pipeline pool instead (see
+  `src/fs/encrypt-file.ts`), the same kind sync's upload uses, since the single read there is
+  dominated by disk I/O (and a synchronous encryption/CRC pass) rather than being the kind of
+  embarrassingly-parallel pure hashing this pool exists for. `Piscina` must be imported as
   the **named** export (`import { Piscina } from "piscina"`) — the default-export form compiles and
   runs fine under `tsx`/`vitest`, but fails a real `tsc` build with `TS2351: This expression is not
 constructable`.

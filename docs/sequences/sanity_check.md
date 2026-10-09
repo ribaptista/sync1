@@ -1,15 +1,16 @@
 # `sync1 sanity_check`
 
-**Derived from:** `src/commands/sanity_check.ts`, `src/fs/sanity-check.ts`
+**Derived from:** `src/commands/sanity_check.ts`, `src/fs/sanity-check.ts`, `src/fs/encrypt-file.ts`
 
 Read-only diagnostic: cross-checks `state.db` against S3 and the local filesystem for bugs, **never
 repairs anything**. Structurally the same streaming merge-join as `update_cache`, but where that command
 silently repairs what it finds, this one only reports — surfacing exactly the class of problem
 `update_cache`/`materialize` would otherwise fix without a trace, or never notice at all (a corrupt
-stub, a tampered file, an entry whose object vanished from S3, an untracked file). Needs no password —
-HEAD doesn't decrypt anything, and `state.db` is opened read-only. Runs after the ordinary
-lock/root-resolution preamble (see [`flow-preamble.md`](flow-preamble.md)), omitted below since it never
-varies.
+stub, a tampered file, an entry whose object vanished from S3 or whose checksum drifted, an untracked
+file). Unlocks the vault first ([`flow-unlock-vault.md`](flow-unlock-vault.md)) — nothing is ever
+decrypted, but re-encrypting a local file for its ciphertext checksum needs the master key; `state.db` is
+opened read-only. Runs after the ordinary lock/root-resolution preamble (see
+[`flow-preamble.md`](flow-preamble.md)), omitted below since it never varies.
 
 ## Sequence — the merge-join
 
@@ -18,7 +19,7 @@ sequenceDiagram
     participant Loop as merge-join loop
     participant FS
     participant State as state.db (read-only)
-    participant Hash as hash pool
+    participant Stream as stream pool
     participant S3Pool as s3 pool
     participant S3
 
@@ -42,9 +43,9 @@ sequenceDiagram
         end
     end
 
-    Loop->>Hash: await hashJobs.onIdle() -- MUST come first: a hash job's own completion<br/>is what enqueues its follow-on S3 check
-    Loop->>S3Pool: await s3Pool.onIdle(); throwIfPoolErrored()
-    Loop->>Loop: sort hashMismatch and missingInS3 by path (dispatch order isn't path order)
+    Loop->>Stream: await streamPool.onIdle() -- MUST come first: a read job's own completion<br/>is what enqueues its follow-on HEAD check
+    Loop->>S3Pool: await s3Pool.onIdle(); throwIfPoolErrored() (both pools)
+    Loop->>Loop: sort hashMismatch, missingInS3, checksumMismatch by path (dispatch order isn't path order)
     Loop->>FS: stat every stale in-tree temp file the walk collected -- report size, never remove
 ```
 
@@ -54,7 +55,7 @@ sequenceDiagram
 sequenceDiagram
     participant Job as dispatchTrackedEntryCheck
     participant FS
-    participant Hash as hash pool
+    participant Stream as stream pool
     participant S3Pool as s3 pool
     participant S3
 
@@ -63,11 +64,15 @@ sequenceDiagram
     else both a stub AND the real file present
         Job->>Job: bothStubAndReal.push(path) -- a bad state, never auto-cleaned here
     else representation = "real"
-        Job->>Hash: hashJobs.dispatch(rehash)
-        alt actualHash != entry.hash
-            Hash-->>Job: hashMismatch.push({path, expectedHash, actualHash})
-        else entry.hash is set
-            Hash-->>Job: dispatchS3Check(entry.hash) -- see below
+        alt entry.hash is null (should never happen; tolerated anyway)
+            Job->>Stream: streamPool.dispatch(hashFile) -- plain hash, no encryption possible without a hash
+        else
+            Job->>Stream: streamPool.dispatch(readLocal) -- one read: BLAKE2b + re-encrypt + CRC64NVME
+            alt plaintextHash != entry.hash
+                Stream-->>Job: hashMismatch.push({path, expectedHash, actualHash}) -- stops here, no HEAD
+            else
+                Stream-->>Job: dispatchS3Check(entry.hash, localChecksum) -- see below
+            end
         end
     else representation = "stub"
         Job->>FS: readStubHash(stubPath) -- cheap, synchronous, no pool
@@ -76,14 +81,26 @@ sequenceDiagram
         else stubHash != entry.hash
             Job->>Job: stubMismatch.push({path, reason: "stub declares X, state.db expects Y"})
         else entry.hash is set
-            Job->>S3Pool: dispatchS3Check(entry.hash) -- see below
+            Job->>S3Pool: dispatchS3Check(entry.hash, null) -- no local plaintext to compare
         end
     end
 ```
 
-`dispatchS3Check(hash)`: `objectsRepo.get(hash)` missing → `missingInS3.push({path, hash})` immediately;
-otherwise dispatched to `s3Pool` → `objectExists(s3_key)` (a HEAD) → not found →
-`missingInS3.push({path, hash})`.
+`dispatchS3Check(hash, localChecksum)`: `objectsRepo.get(hash)` missing → `missingInS3.push({path,
+hash})` immediately; otherwise dispatched to `s3Pool` → `headObject(s3_key)` (`ChecksumMode: "ENABLED"`)
+→ not found → `missingInS3.push`; found → compare `objectRow.ciphertext_checksum` (recorded),
+`head.checksumCrc64Nvme ?? null` (S3's), and `localChecksum` (null for a stub) — any disagreement, or a
+null S3 checksum, → `checksumMismatch.push({path, hash, localChecksum, recordedChecksum, s3Checksum})`.
+
+### `readLocal` (production: `encryptFileForObject`, bound to the master key)
+
+The one place a real file is actually read: `fs.createReadStream` → `encryptStream(..., { hashMismatch:
+"report" })`, which hashes the plaintext (BLAKE2b) as it re-encrypts it the same pass → a
+`UploadChecksumTap` over the ciphertext (CRC64NVME) → drained to nothing. `"report"` never aborts the
+stream on a hash disagreement the way sync's own upload does (see
+[`flow-encrypt-stream.md`](flow-encrypt-stream.md)) — the point here is to learn the _actual_ hash of
+whatever is on disk and let the caller (this module) decide, not to guard a write. This is the single
+pass that makes `hash_mismatch` and `checksum_mismatch` both derive from one read instead of two.
 
 ## Output
 
@@ -94,6 +111,7 @@ otherwise dispatched to `s3Pool` → `objectExists(s3_key)` (a HEAD) → not fou
   "hash_mismatch": [],
   "stub_mismatch": [],
   "missing_in_s3": [],
+  "checksum_mismatch": [],
   "missing_locally": [],
   "untracked": ["scratch.txt"],
   "ignored_count": 2,
@@ -105,27 +123,28 @@ otherwise dispatched to `s3Pool` → `objectExists(s3_key)` (a HEAD) → not fou
 
 ## Notes
 
-- **Concurrency, and a load-bearing drain order.** The hash pool and the s3 pool are two independently
+- **Concurrency, and a load-bearing drain order.** The stream pool and the s3 pool are two independently
   bounded pools (see [`flow-pool-dispatch.md`](flow-pool-dispatch.md)), but they are not drained
-  independently: `hashJobs.onIdle()` **must** be awaited before `s3Pool.onIdle()`, because a hash job's
-  own completion is what enqueues its follow-on S3 check — draining `s3Pool` first could miss S3 checks
-  a still-running hash job hadn't enqueued yet.
-- **A stub's declared hash never touches the hash pool at all** — `readStubHash` is a cheap synchronous
-  read, unlike hashing a real file's actual bytes, so that branch dispatches straight to `dispatchS3Check`
-  with no hash job in between.
-- **`hashMismatch` and `missingInS3` are explicitly re-sorted by path before returning** — dispatch order
-  is not completion order once work is spread across two pools, so the merge-join's own path ordering
-  would otherwise be lost by the time results are collected.
+  independently: `streamPool.onIdle()` **must** be awaited before `s3Pool.onIdle()`, because a read job's
+  own completion is what enqueues its follow-on HEAD check — draining `s3Pool` first could miss checks a
+  still-running read job hadn't enqueued yet.
+- **A stub's declared hash never touches the stream pool at all** — `readStubHash` is a cheap synchronous
+  read, unlike re-encrypting a real file's actual bytes, so that branch dispatches straight to
+  `dispatchS3Check` with no stream job in between, and its row always has `localChecksum: null`.
+- **Every pool-reported bucket is explicitly re-sorted by path before returning** — dispatch order is not
+  completion order once work is spread across two pools, so the merge-join's own path ordering would
+  otherwise be lost by the time results are collected.
 - **`--filter` scopes reporting and cost, never the walk itself.** The merge-join always walks the whole
   tree and the whole `entries` table regardless of `--filter` — a partial merge-join couldn't tell
   "filtered out" apart from "genuinely missing" on either side. Only whether an in-both-sides path
-  actually gets rehashed/HEAD-checked (and whether an fs-only/entry-only path gets reported at all) is
+  actually gets read/HEAD-checked (and whether an fs-only/entry-only path gets reported at all) is
   gated by `--filter`.
 - **Stale in-tree temp files are reported, never removed** — this command is read-only by design, and
   nothing else will ever clean these up either: the startup lock-hook sweep only reads `.sync1/`, and
   every ordinary walk excludes temp names by construction, so they are otherwise invisible dead space
   (a partially-decrypted `materialize` temp can be many GB).
-- **On failure:** a pool error from either pool (a real hash-runner crash, a genuine S3 error rather
-  than "object not found") is captured via `dispatchTracked`/`throwIfPoolErrored` and fails the whole
-  command; anything actually _found wrong_ is reported in the result, not thrown.
-- **Sub-flows:** [`flow-pool-dispatch.md`](flow-pool-dispatch.md), [`flow-enumeration-pass.md`](flow-enumeration-pass.md).
+- **On failure:** a pool error from either pool (a real read/encryption failure, a genuine S3 error
+  rather than "object not found") is captured via `dispatchTracked`/`throwIfPoolErrored` and fails the
+  whole command; anything actually _found wrong_ is reported in the result, not thrown.
+- **Sub-flows:** [`flow-unlock-vault.md`](flow-unlock-vault.md), [`flow-pool-dispatch.md`](flow-pool-dispatch.md),
+  [`flow-enumeration-pass.md`](flow-enumeration-pass.md), [`flow-encrypt-stream.md`](flow-encrypt-stream.md).

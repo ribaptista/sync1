@@ -136,7 +136,7 @@ sequenceDiagram
 ## Sequence — the dispatched job: coordinated abort, three failure sources, checksum accounting
 
 One job per distinct content hash; every same-batch dedup row rides on it via `job.sourceRows`.
-Delegates the actual streaming to [`flow-encrypt-stream.md`](flow-encrypt-stream.md) and
+Delegates the actual streaming to [`flow-encrypt-file.md`](flow-encrypt-file.md) and
 [`flow-put-object-stream.md`](flow-put-object-stream.md). `withS3Retry` no longer wraps this whole unit
 — every S3 request's own transient-failure retry now happens _inside_ `uploadObjectStream`, per
 request/part, so only `withMirrorRetry` retries the whole read-encrypt-write here (a `Readable` that
@@ -146,7 +146,7 @@ already errored can't be replayed, so recovering from a mirror failure means sta
 sequenceDiagram
     participant Job as dispatched job
     participant FS
-    participant Codec as encryptStream
+    participant Enc as encryptFileForObject
     participant Tee as teeStream
     participant S3 as uploadObjectStream
     participant Mirror as writeMirrorStream
@@ -160,9 +160,8 @@ sequenceDiagram
             Job--xJob: throw -- row stays dirty, not stored under a stale hash
         end
         Job->>Job: controller = new AbortController(); signal = controller.signal<br/>firstFailure = undefined; upstreamError = undefined
-        Job->>FS: createReadStream (counted via countingReadable)
-        Job->>Codec: encryptStream(source, size, masterKey, context, {expectedHash: hash, signal})
-        Job->>Codec: encryptedStream.once("error", err => upstreamError ??= err)<br/>-- observed, never consumed: distinguishes "the body I was handed<br/>failed" from either sink's own call failing, which look identical to them
+        Job->>Enc: encryptFileForObject(path, size, masterKey, hash, {onBytes, signal,<br/>hashMismatch: "abort", checksum: false}) -- see flow-encrypt-file.md
+        Job->>Enc: encryptedStream.once("error", err => upstreamError ??= err)<br/>-- observed, never consumed: distinguishes "the body I was handed<br/>failed" from either sink's own call failing, which look identical to them
         alt needsS3 AND mirrorTarget defined
             Job->>Tee: teeStream(encryptedStream, onMaxRetries="ignore" ? "detach-secondary" : "abort-both")
             par uploadTo(primary)
@@ -261,7 +260,7 @@ sequenceDiagram
   `abort-both` for both — a bug a past change fixed, since it meant `detach-secondary` was reachable in
   the type system but never actually selected.
 - **A shared `AbortController`, not the tee's own stream-level reaction, is now the primary
-  coordination.** One signal per attempt is threaded through `encryptStream`, `uploadObjectStream` and
+  coordination.** One signal per attempt is threaded through `encryptFileForObject`, `uploadObjectStream` and
   `writeMirrorStream`; whichever of the two sinks fails first calls `recordFailure`, which logs
   unconditionally but only records the cause and calls `controller.abort()` if the signal isn't already
   aborted — so the _first_ failure decides the outcome, and the echo it causes in the sibling is logged,
@@ -298,6 +297,7 @@ sequenceDiagram
   except the two branches with no async gap between deciding and writing (non-file rows, and a clean
   dedup hit), which record it immediately since nothing can fail in between.
 - **Sub-flows:** [`flow-pool-dispatch.md`](flow-pool-dispatch.md) (the stream pool dispatch itself),
-  [`flow-encrypt-stream.md`](flow-encrypt-stream.md) (the chunked AEAD and its `expectedHash` abort
-  seam), [`flow-put-object-stream.md`](flow-put-object-stream.md) (the S3 PUT/multipart branch and
+  [`flow-encrypt-file.md`](flow-encrypt-file.md) (the shared read-encrypt pipeline, with its own
+  [`flow-encrypt-stream.md`](flow-encrypt-stream.md) sub-flow for the chunked AEAD and its
+  `expectedHash` abort seam), [`flow-put-object-stream.md`](flow-put-object-stream.md) (the S3 PUT/multipart branch and
   checksum verification), [`flow-s3-retry.md`](flow-s3-retry.md) (the unbounded outer retry).

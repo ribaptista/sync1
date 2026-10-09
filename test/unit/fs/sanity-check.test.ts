@@ -9,14 +9,13 @@ import { ObjectsRepository } from "../../../src/db/repositories/objects-reposito
 import { IgnorePoliciesRepository } from "../../../src/db/repositories/ignore-policies-repository.js";
 import { VersionsRepository } from "../../../src/db/repositories/versions-repository.js";
 import { hashBufferHex, formatTaggedHash } from "../../../src/crypto/hash.js";
-import { hashFile } from "../../../src/fs/hash-file.js";
 import { writeStubAtomic } from "../../../src/fs/stub.js";
 import {
   performSanityCheck,
-  type ObjectExistsChecker,
+  type ObjectHeadChecker,
+  type LocalReader,
   type SanityCheckResult,
 } from "../../../src/fs/sanity-check.js";
-import type { HashRunner } from "../../../src/concurrency/hash-runner.js";
 import type { OnProgress } from "../../../src/progress-types.js";
 
 const silentLogger = {
@@ -24,13 +23,10 @@ const silentLogger = {
   warn: () => {},
 } as unknown as import("../../../src/logger.js").Logger;
 
-// Most tests below only care about *whether/what* gets reported, not the
-// concurrency mechanics -- this default HashRunner just delegates to the
-// real (small, fast) hashFile, and a generous pool limit means nothing in
-// these tests ever hits backpressure. Dedicated concurrency tests inject
-// their own controllable fake instead, per the same pattern used in
-// update-cache.test.ts.
-const defaultHashRunner: HashRunner = { run: (absolutePath) => hashFile(absolutePath) };
+/** A fake ciphertext checksum, deterministic in the content hash -- stands in for the real (convergent) one. */
+function crcFor(hash: string): string {
+  return `crc:${hash}`;
+}
 
 let root: string;
 let dbDir: string;
@@ -38,17 +34,31 @@ let dbPath: string;
 let entriesRepo: EntriesRepository;
 let objectsRepo: ObjectsRepository;
 let ignorePoliciesRepo: IgnorePoliciesRepository;
-let existingS3Keys: Set<string>;
+/** S3 key -> its checksum, or undefined for "object exists but S3 reports no checksum". Absent key = missing. */
+let s3Objects: Map<string, string | undefined>;
 
-const alwaysExists: ObjectExistsChecker = (s3Key) => Promise.resolve(existingS3Keys.has(s3Key));
+const defaultHeadChecker: ObjectHeadChecker = (s3Key) => {
+  if (!s3Objects.has(s3Key)) return Promise.resolve(null);
+  const checksum = s3Objects.get(s3Key);
+  return Promise.resolve(checksum === undefined ? {} : { checksumCrc64Nvme: checksum });
+};
+
+/** Reads the file for real (so a genuine I/O error surfaces like the real one would), checksums its content hash. */
+const defaultReadLocal: LocalReader = (absolutePath, _size, _hash, onBytes) => {
+  const content = fs.readFileSync(absolutePath);
+  onBytes(content.length);
+  const plaintextHash = hashBufferHex(content);
+  return Promise.resolve({ plaintextHash, ciphertextChecksum: crcFor(plaintextHash) });
+};
 
 function run(
-  objectExists: ObjectExistsChecker,
+  headChecker: ObjectHeadChecker,
   filterGlob?: string,
   options: {
-    hashRunner?: HashRunner;
+    readLocal?: LocalReader;
     onProgress?: OnProgress;
-    maxInFlightHashes?: number;
+    streamPool?: PQueue;
+    streamQueueLimit?: number;
   } = {},
 ): Promise<SanityCheckResult> {
   return performSanityCheck(
@@ -56,10 +66,11 @@ function run(
     entriesRepo,
     objectsRepo,
     ignorePoliciesRepo,
-    objectExists,
+    headChecker,
+    options.readLocal ?? defaultReadLocal,
     silentLogger,
-    options.hashRunner ?? defaultHashRunner,
-    options.maxInFlightHashes ?? 4,
+    options.streamPool ?? new PQueue({ concurrency: 4 }),
+    options.streamQueueLimit ?? 8,
     new PQueue({ concurrency: 4 }),
     8,
     filterGlob,
@@ -71,7 +82,7 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-sanity-check-test-"));
   dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-sanity-check-db-"));
   dbPath = path.join(dbDir, "state.db");
-  existingS3Keys = new Set();
+  s3Objects = new Map();
 
   // One connection, exactly like the CLI command does -- entriesRepo's
   // iterateAllSortedByPath() is keyset-paginated, not a live `.iterate()`
@@ -94,9 +105,16 @@ function touch(relPath: string, content: string): void {
   fs.writeFileSync(abs, content);
 }
 
-function seedObject(hash: string, s3Key: string, size: number, present = true): void {
-  objectsRepo.upsert({ hash, s3_key: s3Key, size, ciphertext_checksum: "crc-test" });
-  if (present) existingS3Keys.add(s3Key);
+/** `present=true` also records a checksum matching the hash's own default, so a clean file never mismatches. */
+function seedObject(
+  hash: string,
+  s3Key: string,
+  size: number,
+  present = true,
+  checksum: string = crcFor(hash),
+): void {
+  objectsRepo.upsert({ hash, s3_key: s3Key, size, ciphertext_checksum: checksum });
+  if (present) s3Objects.set(s3Key, checksum);
 }
 
 function seedEntry(filePath: string, hash: string | null, type: "file" | "dir" = "file"): void {
@@ -110,12 +128,13 @@ describe("performSanityCheck", () => {
     seedObject(hash, "objects/a", 5);
     seedEntry("a.txt", hash);
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result).toEqual({
       bothStubAndReal: [],
       hashMismatch: [],
       stubMismatch: [],
       missingInS3: [],
+      checksumMismatch: [],
       missingLocally: [],
       untracked: [],
       ignoredCount: 0,
@@ -137,7 +156,7 @@ describe("performSanityCheck", () => {
     seedEntry("a.txt", hash);
     touch(`.sync1-tmp-${"f0e1d2c3".repeat(4)}`, "half-downloaded, never renamed");
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.untracked).toEqual([]); // never a tracked-content candidate
     expect(result.staleTempFiles).toEqual([
       { path: `.sync1-tmp-${"f0e1d2c3".repeat(4)}`, size: 30 },
@@ -148,7 +167,7 @@ describe("performSanityCheck", () => {
     fs.mkdirSync(path.join(root, "photos"));
     seedEntry("photos", null, "dir");
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.missingLocally).toEqual([]);
     expect(result.untracked).toEqual([]);
   });
@@ -162,19 +181,20 @@ describe("performSanityCheck", () => {
     // "both" short-circuits before the S3 check.
     seedEntry("img.jpg", hash);
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.bothStubAndReal).toEqual(["img.jpg"]);
     expect(result.missingInS3).toEqual([]);
     expect(result.hashMismatch).toEqual([]);
   });
 
-  it("reports hashMismatch when a real file's content no longer matches state.db", async () => {
+  it("reports hashMismatch when a real file's content no longer matches state.db, and never HEADs it", async () => {
     const originalHash = hashBufferHex(Buffer.from("original"));
     touch("a.txt", "tampered");
     seedObject(originalHash, "objects/a", 8);
     seedEntry("a.txt", originalHash);
+    const headChecker = vi.fn(defaultHeadChecker);
 
-    const result = await run(alwaysExists);
+    const result = await run(headChecker);
     expect(result.hashMismatch).toEqual([
       {
         path: "a.txt",
@@ -182,6 +202,9 @@ describe("performSanityCheck", () => {
         actualHash: hashBufferHex(Buffer.from("tampered")),
       },
     ]);
+    expect(result.checksumMismatch).toEqual([]);
+    expect(result.missingInS3).toEqual([]);
+    expect(headChecker).not.toHaveBeenCalled();
   });
 
   it("reports stubMismatch for a malformed stub", async () => {
@@ -190,7 +213,7 @@ describe("performSanityCheck", () => {
     seedObject(hash, "objects/bad", 1);
     seedEntry("bad.jpg", hash);
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.stubMismatch).toHaveLength(1);
     expect(result.stubMismatch[0]!.path).toBe("bad.jpg");
     expect(result.stubMismatch[0]!.reason).toMatch(/malformed stub content/);
@@ -203,7 +226,7 @@ describe("performSanityCheck", () => {
     seedObject(expectedHash, "objects/img", 1);
     seedEntry("img.jpg", expectedHash);
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.stubMismatch).toEqual([
       {
         path: "img.jpg",
@@ -218,8 +241,9 @@ describe("performSanityCheck", () => {
     seedObject(hash, "objects/a", 5, false); // present=false: row exists, S3 object doesn't
     seedEntry("a.txt", hash);
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.missingInS3).toEqual([{ path: "a.txt", hash }]);
+    expect(result.checksumMismatch).toEqual([]);
   });
 
   it("reports missingLocally for a tracked entry with no local presence at all", async () => {
@@ -227,14 +251,14 @@ describe("performSanityCheck", () => {
     seedObject(hash, "objects/gone", 4);
     seedEntry("gone.txt", hash);
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.missingLocally).toEqual(["gone.txt"]);
   });
 
   it("reports untracked for a local file with no state.db entry and no ignore match", async () => {
     touch("stray.txt", "surprise");
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.untracked).toEqual(["stray.txt"]);
     expect(result.ignoredCount).toBe(0);
   });
@@ -244,7 +268,7 @@ describe("performSanityCheck", () => {
     touch("scratch.tmp", "throwaway");
     touch("stray.txt", "surprise");
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.untracked).toEqual(["stray.txt"]);
     expect(result.ignoredCount).toBe(1);
   });
@@ -259,7 +283,7 @@ describe("performSanityCheck", () => {
     seedEntry("elsewhere/gone.txt", goneHash); // out of scope
     touch("elsewhere/stray.txt", "surprise"); // out of scope
 
-    const result = await run(alwaysExists, "keep/*");
+    const result = await run(defaultHeadChecker, "keep/*");
     expect(result.missingLocally).toEqual([]);
     expect(result.untracked).toEqual([]);
     expect(result.hashMismatch).toEqual([]);
@@ -272,103 +296,157 @@ describe("performSanityCheck", () => {
     seedObject(hash, "objects/img", 14);
     seedEntry("img.jpg", hash);
 
-    const result = await run(alwaysExists);
+    const result = await run(defaultHeadChecker);
     expect(result.stubMismatch).toEqual([]);
     expect(result.missingInS3).toEqual([]);
+    expect(result.checksumMismatch).toEqual([]);
     // sanity: formatTaggedHash round-trips through writeStubAtomic/readStubHash
     expect(formatTaggedHash(hash)).toMatch(/^blake2b:/);
   });
+
+  it("falls back to a plain hash-only read, never calling readLocal, when an entry has no recorded hash", async () => {
+    touch("edge.txt", "unusual, but tolerated");
+    seedEntry("edge.txt", null);
+    const readLocal = vi.fn(defaultReadLocal);
+
+    const result = await run(defaultHeadChecker, undefined, { readLocal });
+    expect(result).toMatchObject({
+      hashMismatch: [],
+      missingInS3: [],
+      checksumMismatch: [],
+      untracked: [],
+      missingLocally: [],
+    });
+    expect(readLocal).not.toHaveBeenCalled();
+  });
+
+  describe("checksum comparison (local re-encrypt / state.db / S3 HEAD)", () => {
+    it("reports checksumMismatch when S3's checksum differs from state.db's recorded one", async () => {
+      const hash = hashBufferHex(Buffer.from("hello"));
+      touch("a.txt", "hello");
+      seedObject(hash, "objects/a", 5); // s3Objects now has crcFor(hash)
+      s3Objects.set("objects/a", "crc:drifted"); // ...until S3 drifts from it
+      seedEntry("a.txt", hash);
+
+      const result = await run(defaultHeadChecker);
+      expect(result.checksumMismatch).toEqual([
+        {
+          path: "a.txt",
+          hash,
+          localChecksum: crcFor(hash), // the local file still re-encrypts to its own content
+          recordedChecksum: crcFor(hash),
+          s3Checksum: "crc:drifted",
+        },
+      ]);
+    });
+
+    it("reports a null s3Checksum when S3 has none recorded for the object", async () => {
+      const hash = hashBufferHex(Buffer.from("hello"));
+      touch("a.txt", "hello");
+      seedObject(hash, "objects/a", 5);
+      s3Objects.set("objects/a", undefined); // object exists, but with no checksum
+      seedEntry("a.txt", hash);
+
+      const result = await run(defaultHeadChecker);
+      expect(result.checksumMismatch).toEqual([
+        {
+          path: "a.txt",
+          hash,
+          localChecksum: crcFor(hash),
+          recordedChecksum: crcFor(hash),
+          s3Checksum: null,
+        },
+      ]);
+    });
+
+    it("reports checksumMismatch when the local re-encrypt disagrees with both state.db and S3", async () => {
+      const content = Buffer.from("hello");
+      const hash = hashBufferHex(content);
+      touch("a.txt", content.toString());
+      seedObject(hash, "objects/a", 5); // state.db and S3 agree with each other
+      seedEntry("a.txt", hash);
+      // The local file's plaintext still hashes correctly (so it clears the
+      // hash_mismatch gate), but its ciphertext checksum disagrees --
+      // exercised directly, since reproducing it with real encryption would
+      // need a tampered *ciphertext*, which never happens through this path.
+      const readLocal: LocalReader = () =>
+        Promise.resolve({ plaintextHash: hash, ciphertextChecksum: "crc:locally-different" });
+
+      const result = await run(defaultHeadChecker, undefined, { readLocal });
+      expect(result.checksumMismatch).toEqual([
+        {
+          path: "a.txt",
+          hash,
+          localChecksum: "crc:locally-different",
+          recordedChecksum: crcFor(hash),
+          s3Checksum: crcFor(hash),
+        },
+      ]);
+    });
+
+    it("checks a stub's checksum against S3, but never calls readLocal (there's no local plaintext)", async () => {
+      const hash = hashBufferHex(Buffer.from("steady content"));
+      writeStubAtomic(path.join(root, "img.jpg.stub"), hash);
+      seedObject(hash, "objects/img", 14);
+      s3Objects.set("objects/img", "crc:drifted");
+      seedEntry("img.jpg", hash);
+      const readLocal = vi.fn(defaultReadLocal);
+
+      const result = await run(defaultHeadChecker, undefined, { readLocal });
+      expect(result.checksumMismatch).toEqual([
+        {
+          path: "img.jpg",
+          hash,
+          localChecksum: null,
+          recordedChecksum: crcFor(hash),
+          s3Checksum: "crc:drifted",
+        },
+      ]);
+      expect(readLocal).not.toHaveBeenCalled();
+    });
+  });
 });
 
-describe("performSanityCheck: concurrency", () => {
-  function makeControllableHashRunner() {
-    let inFlight = 0;
-    let maxObservedInFlight = 0;
-    const pending: { absolutePath: string; resolve: (hash: string) => void }[] = [];
+describe("performSanityCheck: concurrency and error propagation", () => {
+  function makeControllableReadLocal() {
+    const pending: {
+      path: string;
+      hash: string;
+      resolve: (r: { plaintextHash: string; ciphertextChecksum: string }) => void;
+      reject: (err: unknown) => void;
+    }[] = [];
 
-    const hashRunner: HashRunner = {
-      run(absolutePath: string) {
-        inFlight++;
-        maxObservedInFlight = Math.max(maxObservedInFlight, inFlight);
-        return new Promise<string>((resolve) => {
-          pending.push({
-            absolutePath,
-            resolve: (hash) => {
-              inFlight--;
-              resolve(hash);
-            },
-          });
-        });
-      },
-    };
+    const readLocal: LocalReader = (absolutePath, _size, hash) =>
+      new Promise((resolve, reject) => {
+        pending.push({ path: absolutePath, hash, resolve, reject });
+      });
 
     return {
-      hashRunner,
-      get maxObservedInFlight() {
-        return maxObservedInFlight;
-      },
+      readLocal,
       get pendingCount() {
         return pending.length;
       },
-      resolveOldestFirst(hashFor: (absolutePath: string) => string) {
+      resolveOldestFirst(
+        result: (hash: string) => { plaintextHash: string; ciphertextChecksum: string },
+      ) {
         const job = pending.shift();
-        if (!job) throw new Error("no pending hash job to resolve");
-        job.resolve(hashFor(job.absolutePath));
+        if (!job) throw new Error("no pending job to resolve");
+        job.resolve(result(job.hash));
       },
-      resolveNewestFirst(hashFor: (absolutePath: string) => string) {
+      resolveNewestFirst(
+        result: (hash: string) => { plaintextHash: string; ciphertextChecksum: string },
+      ) {
         const job = pending.pop();
-        if (!job) throw new Error("no pending hash job to resolve");
-        job.resolve(hashFor(job.absolutePath));
+        if (!job) throw new Error("no pending job to resolve");
+        job.resolve(result(job.hash));
       },
     };
   }
 
-  it("never dispatches more than maxInFlightHashes hash jobs at once", async () => {
-    for (let i = 0; i < 6; i++) {
-      const hash = hashBufferHex(Buffer.from(`content ${i}`));
-      touch(`f${i}.txt`, `content ${i}`);
-      seedObject(hash, `objects/f${i}`, 20);
-      seedEntry(`f${i}.txt`, hash);
-    }
-    const controllable = makeControllableHashRunner();
-
-    const resultPromise = performSanityCheck(
-      root,
-      entriesRepo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      alwaysExists,
-      silentLogger,
-      controllable.hashRunner,
-      2,
-      new PQueue({ concurrency: 4 }),
-      8,
-    );
-    let settled = false;
-    void resultPromise.finally(() => {
-      settled = true;
-    });
-
-    await vi.waitFor(() => expect(controllable.pendingCount).toBe(2));
-    expect(controllable.maxObservedInFlight).toBe(2);
-
-    while (!settled) {
-      if (controllable.pendingCount > 0) {
-        controllable.resolveOldestFirst((absolutePath) =>
-          hashBufferHex(Buffer.from(`content ${path.basename(absolutePath).replace(/\D/g, "")}`)),
-        );
-      }
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-
-    await resultPromise;
-    expect(controllable.maxObservedInFlight).toBeLessThanOrEqual(2);
-  });
-
-  it("still reports an S3 check dispatched by a late-completing hash job (join-order correctness)", async () => {
-    // Every hash job resolves out of merge-join order (reversed), and every
-    // one of them is missing in S3 -- proving hashJobs.onIdle() draining
-    // *before* s3Pool.onIdle() actually catches every hash-triggered S3
+  it("still reports a checksum check dispatched by a late-completing read job (join-order correctness)", async () => {
+    // Every read job resolves out of merge-join order (reversed), and every
+    // one of them is missing in S3 -- proving streamPool.onIdle() draining
+    // *before* s3Pool.onIdle() actually catches every read-triggered HEAD
     // dispatch, not just the ones that happened to enqueue early.
     const paths = ["a.txt", "b.txt", "c.txt"];
     for (const p of paths) {
@@ -378,47 +456,60 @@ describe("performSanityCheck: concurrency", () => {
       seedEntry(p, hash);
     }
 
-    const controllable = makeControllableHashRunner();
-    const resultPromise = performSanityCheck(
-      root,
-      entriesRepo,
-      objectsRepo,
-      ignorePoliciesRepo,
-      alwaysExists,
-      silentLogger,
-      controllable.hashRunner,
-      3,
-      new PQueue({ concurrency: 4 }),
-      8,
-    );
+    const controllable = makeControllableReadLocal();
+    const resultPromise = run(defaultHeadChecker, undefined, { readLocal: controllable.readLocal });
 
     await vi.waitFor(() => expect(controllable.pendingCount).toBe(3));
     // Resolve newest-first (the reverse of dispatch order), each with its
-    // own file's content hash so entry.hash matches and every one reaches
-    // the S3 check -- proving out-of-order hash completion doesn't lose any
-    // of the S3 dispatches it triggers.
+    // own file's correct hash so entry.hash matches and every one reaches
+    // the HEAD check -- proving out-of-order read completion doesn't lose
+    // any of the HEAD dispatches it triggers.
     while (controllable.pendingCount > 0) {
-      controllable.resolveNewestFirst((absolutePath) =>
-        hashBufferHex(Buffer.from(path.basename(absolutePath))),
-      );
+      controllable.resolveNewestFirst((hash) => ({
+        plaintextHash: hash,
+        ciphertextChecksum: crcFor(hash),
+      }));
     }
 
     const result = await resultPromise;
     expect(result.missingInS3.map((m) => m.path).sort()).toEqual(paths);
   });
+
+  it("propagates a rejection from the stream pool, failing the whole check", async () => {
+    const hash = hashBufferHex(Buffer.from("hello"));
+    touch("a.txt", "hello");
+    seedObject(hash, "objects/a", 5);
+    seedEntry("a.txt", hash);
+    const readLocal: LocalReader = () => Promise.reject(new Error("disk read failed: EIO"));
+
+    await expect(run(defaultHeadChecker, undefined, { readLocal })).rejects.toThrow(
+      "disk read failed: EIO",
+    );
+  });
+
+  it("propagates a rejection from the s3 pool, failing the whole check", async () => {
+    const hash = hashBufferHex(Buffer.from("hello"));
+    touch("a.txt", "hello");
+    seedObject(hash, "objects/a", 5);
+    seedEntry("a.txt", hash);
+    const headChecker: ObjectHeadChecker = () => Promise.reject(new Error("HEAD failed: 500"));
+
+    await expect(run(headChecker)).rejects.toThrow("HEAD failed: 500");
+  });
 });
 
 describe("performSanityCheck: byte progress", () => {
-  it("grows bytesTotal on dispatch, and only advances bytesDone once the hash resolves", async () => {
+  it("grows bytesTotal on dispatch, and only advances bytesDone once the read resolves", async () => {
     const hash = hashBufferHex(Buffer.from("hello")); // 5 bytes
     touch("a.txt", "hello");
     seedObject(hash, "objects/a", 5);
     seedEntry("a.txt", hash);
 
-    let resolveHash!: (hash: string) => void;
-    const hashRunner: HashRunner = {
-      run: () => new Promise<string>((resolve) => (resolveHash = resolve)),
-    };
+    let resolveRead!: (r: { plaintextHash: string; ciphertextChecksum: string }) => void;
+    const readLocal: LocalReader = () =>
+      new Promise((resolve) => {
+        resolveRead = resolve;
+      });
 
     const updates: {
       filesDone: number;
@@ -426,16 +517,16 @@ describe("performSanityCheck: byte progress", () => {
       bytesDone: number;
       bytesTotal: number;
     }[] = [];
-    const resultPromise = run(alwaysExists, undefined, {
-      hashRunner,
+    const resultPromise = run(defaultHeadChecker, undefined, {
+      readLocal,
       onProgress: (u) => updates.push({ ...u }),
     });
 
-    await vi.waitFor(() => expect(resolveHash).toBeDefined());
+    await vi.waitFor(() => expect(resolveRead).toBeDefined());
     expect(updates.some((u) => u.bytesTotal === 5 && u.bytesDone === 0)).toBe(true);
     expect(updates.every((u) => u.bytesDone === 0)).toBe(true);
 
-    resolveHash(hash);
+    resolveRead({ plaintextHash: hash, ciphertextChecksum: crcFor(hash) });
     await resultPromise;
 
     expect(updates.at(-1)).toMatchObject({ bytesDone: 5, bytesTotal: 5 });
@@ -446,26 +537,26 @@ describe("performSanityCheck: byte progress", () => {
     seedEntry("photos", null, "dir");
 
     const updates: { bytesDone: number; bytesTotal: number }[] = [];
-    await run(alwaysExists, undefined, { onProgress: (u) => updates.push({ ...u }) });
+    await run(defaultHeadChecker, undefined, { onProgress: (u) => updates.push({ ...u }) });
 
     expect(updates.every((u) => u.bytesDone === 0 && u.bytesTotal === 0)).toBe(true);
   });
 
-  it("a stub contributes 0 bytes (its declared hash is read synchronously, never hashed)", async () => {
+  it("a stub contributes 0 bytes (its declared hash is read synchronously, never re-encrypted)", async () => {
     const hash = hashBufferHex(Buffer.from("steady content"));
     writeStubAtomic(path.join(root, "img.jpg.stub"), hash);
     seedObject(hash, "objects/img", 14);
     seedEntry("img.jpg", hash);
 
     const updates: { bytesDone: number; bytesTotal: number }[] = [];
-    await run(alwaysExists, undefined, { onProgress: (u) => updates.push({ ...u }) });
+    await run(defaultHeadChecker, undefined, { onProgress: (u) => updates.push({ ...u }) });
 
     expect(updates.every((u) => u.bytesDone === 0 && u.bytesTotal === 0)).toBe(true);
   });
 
-  it("knows the whole byte total while the hash pool is still blocking the merge-join", async () => {
+  it("knows the whole byte total while the stream pool is still blocking the merge-join", async () => {
     // The regression the enumeration pass exists to prevent. Three tracked
-    // files, a hash pool of one, and a runner that never resolves until
+    // files, a stream pool of one, and a reader that never resolves until
     // the gate opens: the merge-join dispatches the first file and then
     // blocks on the pool. Discovery-driven totals could only ever have
     // seen ONE file's bytes by now.
@@ -482,24 +573,25 @@ describe("performSanityCheck: byte progress", () => {
 
     let openGate!: () => void;
     const gate = new Promise<void>((resolve) => (openGate = resolve));
-    const hashRunner: HashRunner = {
-      run: async (absolutePath) => {
-        await gate;
-        return hashFile(absolutePath);
-      },
+    const readLocal: LocalReader = async (absolutePath, _size, hash, onBytes) => {
+      await gate;
+      const content = fs.readFileSync(absolutePath);
+      onBytes(content.length);
+      return { plaintextHash: hash, ciphertextChecksum: crcFor(hash) };
     };
 
     const updates: { bytesDone: number; bytesTotal: number; filesTotal: number }[] = [];
-    const resultPromise = run(alwaysExists, undefined, {
-      hashRunner,
-      maxInFlightHashes: 1,
+    const resultPromise = run(defaultHeadChecker, undefined, {
+      readLocal,
+      streamPool: new PQueue({ concurrency: 1 }),
+      streamQueueLimit: 1,
       onProgress: (u) => updates.push({ ...u }),
     });
 
     await vi.waitFor(() => {
       expect(updates.some((u) => u.bytesTotal === 700)).toBe(true);
     });
-    // Nothing has finished hashing: the total came from the enumeration
+    // Nothing has finished reading: the total came from the enumeration
     // pass running ahead of the blocked merge-join, not from dispatch,
     // which by now has only ever seen a.txt's 100 bytes.
     expect(updates.every((u) => u.bytesDone === 0)).toBe(true);
@@ -508,6 +600,7 @@ describe("performSanityCheck: byte progress", () => {
     const result = await resultPromise;
     expect(result.hashMismatch).toEqual([]);
     expect(result.missingInS3).toEqual([]);
+    expect(result.checksumMismatch).toEqual([]);
 
     const last = updates.at(-1)!;
     expect(last.bytesDone).toBe(700);
@@ -517,7 +610,7 @@ describe("performSanityCheck: byte progress", () => {
   it("counts only the --filter's scope, not the whole tree it still has to walk", async () => {
     // The merge-join always walks everything (it can't tell "filtered out"
     // from "genuinely missing" otherwise), but only in-scope paths are
-    // ever hashed -- so only those may show up in the byte total.
+    // ever read -- so only those may show up in the byte total.
     for (const [name, content] of [
       ["keep/a.txt", "a".repeat(100)],
       ["other/b.txt", "b".repeat(200)],
@@ -529,7 +622,7 @@ describe("performSanityCheck: byte progress", () => {
     }
 
     const updates: { bytesDone: number; bytesTotal: number }[] = [];
-    await run(alwaysExists, "keep/**", { onProgress: (u) => updates.push({ ...u }) });
+    await run(defaultHeadChecker, "keep/**", { onProgress: (u) => updates.push({ ...u }) });
 
     expect(updates.every((u) => u.bytesTotal <= 100)).toBe(true);
     expect(updates.at(-1)).toMatchObject({ bytesDone: 100, bytesTotal: 100 });
