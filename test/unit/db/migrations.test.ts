@@ -66,6 +66,7 @@ describe("migration runner", () => {
       { filename: "0010_add_entry_deletions.sql" },
       { filename: "0011_object_ciphertext_checksum_not_null.sql" },
       { filename: "0012_thumbnail_skip_glob_only.sql" },
+      { filename: "0013_entries_file_hash_check.sql" },
     ]);
 
     // Running again must not error (e.g. re-executing CREATE TABLE) and must
@@ -409,6 +410,122 @@ describe("migration runner", () => {
       expect(() =>
         insertRawPolicy(db, "ok_generate", "generate", ["image/jpeg"], VALID_GENERATE_COLUMNS),
       ).not.toThrow();
+    });
+  });
+
+  /**
+   * Like 0011, this rebuilds a table something references (`entries.hash`
+   * -> `objects.hash`), so it exercises the same foreign-keys-off-plus-
+   * `foreign_key_check` path, not just the `entries_new` CHECK itself.
+   */
+  describe("0013: entries file/dir hash CHECK", () => {
+    function dirWithout0013(): string {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-mig-"));
+      const allSqlFiles = fs.readdirSync(STATE_MIGRATIONS_DIR).filter((f) => f.endsWith(".sql"));
+      const files = allSqlFiles.filter((f) => f < "0013");
+      expect(files.length).toBeLessThan(allSqlFiles.length);
+      for (const f of files) {
+        fs.copyFileSync(path.join(STATE_MIGRATIONS_DIR, f), path.join(tmp, f));
+      }
+      return tmp;
+    }
+
+    /** Seeds one valid file row and one valid dir row before 0013 runs. */
+    function seededPre0013(): Database.Database {
+      const db = new Database(":memory:");
+      db.pragma("foreign_keys = ON");
+      runMigrations(db, dirWithout0013());
+      db.prepare("INSERT INTO versions (version_stamp, created_at) VALUES ('v1', 'now')").run();
+      db.prepare("INSERT INTO objects VALUES (?, ?, ?, ?)").run("aa", "objects/aa", 7, "crc1");
+      db.prepare("INSERT INTO entries (path, type, hash, state_version) VALUES (?, ?, ?, ?)").run(
+        "a.txt",
+        "file",
+        "aa",
+        "v1",
+      );
+      db.prepare("INSERT INTO entries (path, type, hash, state_version) VALUES (?, ?, ?, ?)").run(
+        "photos",
+        "dir",
+        null,
+        "v1",
+      );
+      return db;
+    }
+
+    it("carries existing valid rows across unchanged", () => {
+      const db = seededPre0013();
+      runMigrations(db, STATE_MIGRATIONS_DIR);
+
+      expect(db.prepare("SELECT path, type, hash FROM entries ORDER BY path").all()).toEqual([
+        { path: "a.txt", type: "file", hash: "aa" },
+        { path: "photos", type: "dir", hash: null },
+      ]);
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+      expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+    });
+
+    it("recreates all three indexes", () => {
+      const db = seededPre0013();
+      runMigrations(db, STATE_MIGRATIONS_DIR);
+
+      const indexes = db
+        .prepare<[], { name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'entries' AND name NOT LIKE 'sqlite_%'",
+        )
+        .all()
+        .map((r) => r.name)
+        .sort();
+      expect(indexes).toEqual([
+        "idx_entries_hash",
+        "idx_entries_normalized_path",
+        "idx_entries_state_version",
+      ]);
+    });
+
+    /**
+     * A file row with no hash is exactly the dead state sanity_check used
+     * to defend against by reading the file and throwing the hash away --
+     * the CHECK now makes it impossible to have reached state.db at all.
+     */
+    it("fails loudly and changes nothing when an existing row is a file with no hash", () => {
+      const db = seededPre0013();
+      db.prepare("INSERT INTO entries (path, type, hash, state_version) VALUES (?, ?, ?, ?)").run(
+        "orphan.txt",
+        "file",
+        null,
+        "v1",
+      );
+
+      expect(() => runMigrations(db, STATE_MIGRATIONS_DIR)).toThrow(/CHECK constraint failed/);
+
+      // Rolled back whole: the row (and the unapplied migration record)
+      // are still exactly as they were pre-migration.
+      expect(db.prepare("SELECT path FROM entries WHERE path = 'orphan.txt'").get()).toEqual({
+        path: "orphan.txt",
+      });
+      const applied = db
+        .prepare<[], { filename: string }>("SELECT filename FROM _migrations")
+        .all()
+        .map((r) => r.filename);
+      expect(applied).not.toContain("0013_entries_file_hash_check.sql");
+      expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+    });
+
+    it("fails loudly and changes nothing when an existing row is a dir with a hash", () => {
+      const db = seededPre0013();
+      db.prepare("INSERT INTO entries (path, type, hash, state_version) VALUES (?, ?, ?, ?)").run(
+        "weird_dir",
+        "dir",
+        "aa",
+        "v1",
+      );
+
+      expect(() => runMigrations(db, STATE_MIGRATIONS_DIR)).toThrow(/CHECK constraint failed/);
+      const applied = db
+        .prepare<[], { filename: string }>("SELECT filename FROM _migrations")
+        .all()
+        .map((r) => r.filename);
+      expect(applied).not.toContain("0013_entries_file_hash_check.sql");
     });
   });
 });
