@@ -51,7 +51,7 @@ describe("sanity_check: concurrency", () => {
     await localstack.stop();
   });
 
-  it("hashes, HEADs, and re-encrypts multiple tracked files concurrently, each bounded by its own --*-parallelism flag", async () => {
+  it("hashes and HEADs multiple tracked files concurrently, each bounded by its own --*-parallelism flag", async () => {
     const s3 = createTestS3Client(localstack.endpoint);
     const bucket = await createFreshBucket(s3);
     const root = mkTempRoot();
@@ -81,23 +81,17 @@ describe("sanity_check: concurrency", () => {
 
     const hashParallelism = 3;
     const s3Parallelism = 2;
-    const streamParallelism = 2;
-    const result = await runCli(
-      [
-        "sanity_check",
-        "--root",
-        root,
-        "--json",
-        "--verbose",
-        "--hash-parallelism",
-        String(hashParallelism),
-        "--s3-metadata-parallelism",
-        String(s3Parallelism),
-        "--file-stream-parallelism",
-        String(streamParallelism),
-      ],
-      { env: { SYNC1_PASSWORD: PASSWORD } },
-    );
+    const result = await runCli([
+      "sanity_check",
+      "--root",
+      root,
+      "--json",
+      "--verbose",
+      "--hash-parallelism",
+      String(hashParallelism),
+      "--s3-metadata-parallelism",
+      String(s3Parallelism),
+    ]);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout) as { ok: boolean };
     expect(parsed.ok).toBe(true);
@@ -118,16 +112,6 @@ describe("sanity_check: concurrency", () => {
     const maxS3InFlight = Math.max(...s3Dispatches.map((l) => l.inFlight));
     expect(maxS3InFlight).toBeLessThanOrEqual(s3Parallelism);
     expect(maxS3InFlight).toBe(s3Parallelism);
-
-    // Every file is re-encrypted for its ciphertext checksum on the stream
-    // pool, never more at once than --file-stream-parallelism allows.
-    const streamDispatches = dispatchLogs.filter(
-      (l) => l.pool === "stream" && l.msg === "dispatched",
-    );
-    expect(streamDispatches.length).toBe(fileCount);
-    expect(Math.max(...streamDispatches.map((l) => l.inFlight))).toBeLessThanOrEqual(
-      streamParallelism,
-    );
 
     fs.rmSync(root, { recursive: true, force: true });
   });

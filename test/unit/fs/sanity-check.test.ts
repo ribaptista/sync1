@@ -13,8 +13,7 @@ import { hashFile } from "../../../src/fs/hash-file.js";
 import { writeStubAtomic } from "../../../src/fs/stub.js";
 import {
   performSanityCheck,
-  type ObjectHeadChecker,
-  type LocalChecksummer,
+  type ObjectExistsChecker,
   type SanityCheckResult,
 } from "../../../src/fs/sanity-check.js";
 import type { HashRunner } from "../../../src/concurrency/hash-runner.js";
@@ -39,39 +38,14 @@ let dbPath: string;
 let entriesRepo: EntriesRepository;
 let objectsRepo: ObjectsRepository;
 let ignorePoliciesRepo: IgnorePoliciesRepository;
-/** S3 key -> the checksum its HEAD reports (undefined: none reported). */
-let s3Objects: Map<string, string | undefined>;
+let existingS3Keys: Set<string>;
 
-/**
- * Stands in for a real ciphertext checksum: deterministic in the content
- * hash, exactly like the real (convergent) one, without needing a key.
- */
-function crcFor(hash: string): string {
-  return `crc:${hash}`;
-}
-
-const alwaysExists: ObjectHeadChecker = (s3Key) =>
-  Promise.resolve(
-    s3Objects.has(s3Key)
-      ? (() => {
-          const checksum = s3Objects.get(s3Key);
-          return checksum === undefined ? {} : { checksumCrc64Nvme: checksum };
-        })()
-      : null,
-  );
-
-/** Reads the file for real (so it fails like the real one would), checksums its content hash. */
-const defaultLocalChecksum: LocalChecksummer = (absolutePath, _hash, _size, onBytes) => {
-  const content = fs.readFileSync(absolutePath);
-  onBytes(content.length);
-  return Promise.resolve({ checksum: crcFor(hashBufferHex(content)) });
-};
+const alwaysExists: ObjectExistsChecker = (s3Key) => Promise.resolve(existingS3Keys.has(s3Key));
 
 function run(
-  objectExists: ObjectHeadChecker,
+  objectExists: ObjectExistsChecker,
   filterGlob?: string,
   options: {
-    localChecksum?: LocalChecksummer;
     hashRunner?: HashRunner;
     onProgress?: OnProgress;
     maxInFlightHashes?: number;
@@ -83,14 +57,11 @@ function run(
     objectsRepo,
     ignorePoliciesRepo,
     objectExists,
-    options.localChecksum ?? defaultLocalChecksum,
     silentLogger,
     options.hashRunner ?? defaultHashRunner,
     options.maxInFlightHashes ?? 4,
     new PQueue({ concurrency: 4 }),
     8,
-    new PQueue({ concurrency: 2 }),
-    4,
     filterGlob,
     options.onProgress,
   );
@@ -100,7 +71,7 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-sanity-check-test-"));
   dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "sync1-sanity-check-db-"));
   dbPath = path.join(dbDir, "state.db");
-  s3Objects = new Map();
+  existingS3Keys = new Set();
 
   // One connection, exactly like the CLI command does -- entriesRepo's
   // iterateAllSortedByPath() is keyset-paginated, not a live `.iterate()`
@@ -124,8 +95,8 @@ function touch(relPath: string, content: string): void {
 }
 
 function seedObject(hash: string, s3Key: string, size: number, present = true): void {
-  objectsRepo.upsert({ hash, s3_key: s3Key, size, ciphertext_checksum: crcFor(hash) });
-  if (present) s3Objects.set(s3Key, crcFor(hash));
+  objectsRepo.upsert({ hash, s3_key: s3Key, size, ciphertext_checksum: "crc-test" });
+  if (present) existingS3Keys.add(s3Key);
 }
 
 function seedEntry(filePath: string, hash: string | null, type: "file" | "dir" = "file"): void {
@@ -145,120 +116,11 @@ describe("performSanityCheck", () => {
       hashMismatch: [],
       stubMismatch: [],
       missingInS3: [],
-      s3ChecksumMismatch: [],
-      localChecksumMismatch: [],
       missingLocally: [],
       untracked: [],
       ignoredCount: 0,
       staleTempFiles: [],
     });
-  });
-
-  it("reports s3ChecksumMismatch when S3's checksum differs from state.db's recorded one", async () => {
-    const hash = hashBufferHex(Buffer.from("hello"));
-    touch("a.txt", "hello");
-    seedObject(hash, "objects/a", 5);
-    s3Objects.set("objects/a", "crc:something-else");
-    seedEntry("a.txt", hash);
-
-    const result = await run(alwaysExists);
-    expect(result.s3ChecksumMismatch).toEqual([
-      { path: "a.txt", hash, recordedChecksum: crcFor(hash), s3Checksum: "crc:something-else" },
-    ]);
-    // The local file still re-encrypts to its own content, not to S3's
-    // wrong value -- so it is reported against S3 too.
-    expect(result.localChecksumMismatch).toEqual([
-      {
-        path: "a.txt",
-        hash,
-        s3Checksum: "crc:something-else",
-        localChecksum: crcFor(hash),
-        reason: null,
-      },
-    ]);
-  });
-
-  it("reports a null s3Checksum, and skips the local comparison, when S3 reports no checksum", async () => {
-    const hash = hashBufferHex(Buffer.from("hello"));
-    touch("a.txt", "hello");
-    seedObject(hash, "objects/a", 5);
-    s3Objects.set("objects/a", undefined);
-    seedEntry("a.txt", hash);
-    const localChecksum = vi.fn(defaultLocalChecksum);
-
-    const result = await run(alwaysExists, undefined, { localChecksum });
-    expect(result.s3ChecksumMismatch).toEqual([
-      { path: "a.txt", hash, recordedChecksum: crcFor(hash), s3Checksum: null },
-    ]);
-    expect(result.localChecksumMismatch).toEqual([]);
-    expect(localChecksum).not.toHaveBeenCalled();
-  });
-
-  it("reports localChecksumMismatch when the local file re-encrypts to a different ciphertext", async () => {
-    const hash = hashBufferHex(Buffer.from("hello"));
-    touch("a.txt", "hello");
-    seedObject(hash, "objects/a", 5);
-    seedEntry("a.txt", hash);
-
-    const result = await run(alwaysExists, undefined, {
-      localChecksum: () => Promise.resolve({ checksum: "crc:wrong" }),
-    });
-    expect(result.s3ChecksumMismatch).toEqual([]);
-    expect(result.localChecksumMismatch).toEqual([
-      { path: "a.txt", hash, s3Checksum: crcFor(hash), localChecksum: "crc:wrong", reason: null },
-    ]);
-  });
-
-  it("reports localChecksumMismatch with a reason when the local checksum can't be computed", async () => {
-    const hash = hashBufferHex(Buffer.from("hello"));
-    touch("a.txt", "hello");
-    seedObject(hash, "objects/a", 5);
-    seedEntry("a.txt", hash);
-
-    const result = await run(alwaysExists, undefined, {
-      localChecksum: () => Promise.resolve({ error: "the file changed after it was hashed" }),
-    });
-    expect(result.localChecksumMismatch).toEqual([
-      {
-        path: "a.txt",
-        hash,
-        s3Checksum: crcFor(hash),
-        localChecksum: null,
-        reason: "the file changed after it was hashed",
-      },
-    ]);
-  });
-
-  it("checks a stub's S3 checksum but never re-encrypts it (there's no local plaintext)", async () => {
-    const hash = hashBufferHex(Buffer.from("steady content"));
-    writeStubAtomic(path.join(root, "img.jpg.stub"), hash);
-    seedObject(hash, "objects/img", 14);
-    s3Objects.set("objects/img", "crc:drifted");
-    seedEntry("img.jpg", hash);
-    const localChecksum = vi.fn(defaultLocalChecksum);
-
-    const result = await run(alwaysExists, undefined, { localChecksum });
-    expect(result.s3ChecksumMismatch).toEqual([
-      { path: "img.jpg", hash, recordedChecksum: crcFor(hash), s3Checksum: "crc:drifted" },
-    ]);
-    expect(localChecksum).not.toHaveBeenCalled();
-  });
-
-  it("never re-encrypts a file whose hash already mismatched, or whose object is missing", async () => {
-    const original = hashBufferHex(Buffer.from("original"));
-    touch("tampered.txt", "tampered");
-    seedObject(original, "objects/t", 8);
-    seedEntry("tampered.txt", original);
-    const goneHash = hashBufferHex(Buffer.from("vanishing"));
-    touch("vanishing.txt", "vanishing");
-    seedObject(goneHash, "objects/v", 9, false);
-    seedEntry("vanishing.txt", goneHash);
-    const localChecksum = vi.fn(defaultLocalChecksum);
-
-    const result = await run(alwaysExists, undefined, { localChecksum });
-    expect(result.hashMismatch.map((m) => m.path)).toEqual(["tampered.txt"]);
-    expect(result.missingInS3.map((m) => m.path)).toEqual(["vanishing.txt"]);
-    expect(localChecksum).not.toHaveBeenCalled();
   });
 
   /**
@@ -476,14 +338,11 @@ describe("performSanityCheck: concurrency", () => {
       objectsRepo,
       ignorePoliciesRepo,
       alwaysExists,
-      defaultLocalChecksum,
       silentLogger,
       controllable.hashRunner,
       2,
       new PQueue({ concurrency: 4 }),
       8,
-      new PQueue({ concurrency: 2 }),
-      4,
     );
     let settled = false;
     void resultPromise.finally(() => {
@@ -526,14 +385,11 @@ describe("performSanityCheck: concurrency", () => {
       objectsRepo,
       ignorePoliciesRepo,
       alwaysExists,
-      defaultLocalChecksum,
       silentLogger,
       controllable.hashRunner,
       3,
       new PQueue({ concurrency: 4 }),
       8,
-      new PQueue({ concurrency: 2 }),
-      4,
     );
 
     await vi.waitFor(() => expect(controllable.pendingCount).toBe(3));
@@ -554,7 +410,6 @@ describe("performSanityCheck: concurrency", () => {
 
 describe("performSanityCheck: byte progress", () => {
   it("grows bytesTotal on dispatch, and only advances bytesDone once the hash resolves", async () => {
-    // 5 bytes, read twice: once hashed, once re-encrypted for its checksum.
     const hash = hashBufferHex(Buffer.from("hello")); // 5 bytes
     touch("a.txt", "hello");
     seedObject(hash, "objects/a", 5);
@@ -577,13 +432,13 @@ describe("performSanityCheck: byte progress", () => {
     });
 
     await vi.waitFor(() => expect(resolveHash).toBeDefined());
-    expect(updates.some((u) => u.bytesTotal >= 5 && u.bytesDone === 0)).toBe(true);
+    expect(updates.some((u) => u.bytesTotal === 5 && u.bytesDone === 0)).toBe(true);
     expect(updates.every((u) => u.bytesDone === 0)).toBe(true);
 
     resolveHash(hash);
     await resultPromise;
 
-    expect(updates.at(-1)).toMatchObject({ bytesDone: 10, bytesTotal: 10 });
+    expect(updates.at(-1)).toMatchObject({ bytesDone: 5, bytesTotal: 5 });
   });
 
   it("a directory contributes 0 bytes", async () => {
@@ -642,8 +497,7 @@ describe("performSanityCheck: byte progress", () => {
     });
 
     await vi.waitFor(() => {
-      // 700 bytes, each read twice (hash, then re-encrypt).
-      expect(updates.some((u) => u.bytesTotal === 1400)).toBe(true);
+      expect(updates.some((u) => u.bytesTotal === 700)).toBe(true);
     });
     // Nothing has finished hashing: the total came from the enumeration
     // pass running ahead of the blocked merge-join, not from dispatch,
@@ -656,8 +510,8 @@ describe("performSanityCheck: byte progress", () => {
     expect(result.missingInS3).toEqual([]);
 
     const last = updates.at(-1)!;
-    expect(last.bytesDone).toBe(1400);
-    expect(last.bytesTotal).toBe(1400);
+    expect(last.bytesDone).toBe(700);
+    expect(last.bytesTotal).toBe(700);
   });
 
   it("counts only the --filter's scope, not the whole tree it still has to walk", async () => {
@@ -677,7 +531,7 @@ describe("performSanityCheck: byte progress", () => {
     const updates: { bytesDone: number; bytesTotal: number }[] = [];
     await run(alwaysExists, "keep/**", { onProgress: (u) => updates.push({ ...u }) });
 
-    expect(updates.every((u) => u.bytesTotal <= 200)).toBe(true);
-    expect(updates.at(-1)).toMatchObject({ bytesDone: 200, bytesTotal: 200 });
+    expect(updates.every((u) => u.bytesTotal <= 100)).toBe(true);
+    expect(updates.at(-1)).toMatchObject({ bytesDone: 100, bytesTotal: 100 });
   });
 });

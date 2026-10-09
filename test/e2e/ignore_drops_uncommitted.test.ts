@@ -90,9 +90,7 @@ describe("update_cache/sync drop an uncommitted row a since-added ignore policy 
     // cache.db, not merely omitted from the summary -- and correctly
     // counted as ignored (untracked, matching a policy), not flagged as a
     // problem.
-    const sanity = await runCli(["sanity_check", "--root", root, "--json"], {
-      env: { SYNC1_PASSWORD: PASSWORD },
-    });
+    const sanity = await runCli(["sanity_check", "--root", root, "--json"]);
     expect(sanity.exitCode).toBe(0);
     const sanityParsed = JSON.parse(sanity.stdout) as {
       ok: boolean;
