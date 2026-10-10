@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import PQueue from "p-queue";
 import type { Command, OptionValues } from "commander";
 import { openStateDbReadOnly } from "../db/connection.js";
 import { emitJson, emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "../cli/output.js";
@@ -7,7 +8,7 @@ import { parseRemoteConfig } from "../vault/remote-config.js";
 import { localStateDbPath, localRemoteConfigPath, localVaultJsonPath } from "../vault/local-dir.js";
 import { parseManifest, unlockVault } from "../vault/manifest.js";
 import { getPassword } from "../cli/password.js";
-import { encryptFileForObject } from "../fs/encrypt-file.js";
+import { createChecksumRunner } from "../concurrency/hash-runner.js";
 import { resolveRoot } from "../cli/resolve-root.js";
 import { remoteKey, normalizePrefix, type RemoteLocation } from "../vault/paths.js";
 import { EntriesRepository } from "../db/repositories/entries-repository.js";
@@ -212,20 +213,19 @@ async function runSanityCheck(
 
     // Bound to the vault's master key -- the single read that produces
     // both the file's actual BLAKE2b hash and (since encryption is
-    // convergent) the CRC64NVME it would upload as. See src/fs/
-    // encrypt-file.ts and docs/architecture/vault-and-encryption.md.
-    const readLocal: LocalReader = async (absolutePath, size, hash, onBytes) => {
-      const { ciphertext, result } = encryptFileForObject(absolutePath, size, masterKey, hash, {
-        onBytes,
-        hashMismatch: "report",
-        checksum: true,
-      });
-      // Drained to nothing -- this call only wants the two checksums
-      // `result` resolves with, never the ciphertext bytes themselves.
-      ciphertext.resume();
-      const { plaintextHash, ciphertextChecksum } = await result;
-      return { plaintextHash, ciphertextChecksum: ciphertextChecksum! };
-    };
+    // convergent) the CRC64NVME it would upload as. Dispatched to the hash
+    // pool's worker threads: a genuine multi-core win, since the CRC64NVME
+    // pass in particular is pure-JS and CPU-bound. See src/fs/
+    // encrypt-file.ts, src/concurrency/hash-worker.ts (`checksumFileTask`),
+    // and docs/architecture/vault-and-encryption.md.
+    const readLocal: LocalReader = createChecksumRunner(pools.hash, masterKey);
+
+    // Sized to the worker pool itself (`--hash-parallelism`, not
+    // `--file-stream-parallelism`): this queue's only job is to keep the
+    // merge-join from dispatching more reads than the pool can actually
+    // run concurrently, same backpressure role `pools.stream` plays for
+    // sync's upload pipeline.
+    const readQueue = new PQueue({ concurrency: pools.hash.maxThreads });
 
     return await performSanityCheck(
       root,
@@ -235,8 +235,8 @@ async function runSanityCheck(
       objectHead,
       readLocal,
       logger,
-      pools.stream,
-      pools.stream.concurrency * 2,
+      readQueue,
+      readQueue.concurrency * 2,
       pools.s3,
       pools.s3.concurrency * 2,
       opts.filter,

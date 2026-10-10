@@ -98,14 +98,16 @@ collision detection of its own.
   `identify`/`ffmpeg` subprocess), not CPU work on the main thread itself — concurrency helps by
   overlapping different items' waits. `PQueue` already has `.onIdle()`/`.pending`/`.size`, so no extra
   bookkeeping is needed beyond the shared backpressure helper (below).
-- **`piscina`** (real OS worker threads) — used only for `--hash-parallelism` (file hashing in
-  `update_cache`/`stubify`). Hashing many _different_ files is the one place in this plan that's
-  genuinely CPU-bound and embarrassingly parallel across files, so it's the one place worth spending
-  real threads rather than main-thread async concurrency. `sanity_check` does **not** use this pool —
-  it reads and re-encrypts each real file on its own file-stream-pipeline pool instead (see
-  `src/fs/encrypt-file.ts`), the same kind sync's upload uses, since the single read there is
-  dominated by disk I/O (and a synchronous encryption/CRC pass) rather than being the kind of
-  embarrassingly-parallel pure hashing this pool exists for. `Piscina` must be imported as
+- **`piscina`** (real OS worker threads) — used for `--hash-parallelism`: plain file hashing in
+  `update_cache`/`stubify` (`hashFileTask`, the worker file's default export), and `sanity_check`'s single
+  read/re-encrypt/checksum pass (`checksumFileTask`, a _named_ export of that same worker file, dispatched
+  via `pool.run(task, { name: "checksumFileTask" })`). Both are genuinely CPU-bound and embarrassingly
+  parallel across different files — for `sanity_check` specifically, because the CRC64NVME pass in
+  `encryptFileForObject` (`src/fs/encrypt-file.ts`) is pure-JS and dominates the per-file CPU time
+  (confirmed: ~240 MiB/s on one core, versus ~1100+ MiB/s either side of it for BLAKE2b/XChaCha20) — so
+  it's worth spending real threads rather than main-thread async concurrency, the same reasoning file
+  hashing already uses. `--file-stream-parallelism` has no effect on `sanity_check`; there's no separate
+  I/O-bound streaming pass there the way there is in `sync`/`materialize`. `Piscina` must be imported as
   the **named** export (`import { Piscina } from "piscina"`) — the default-export form compiles and
   runs fine under `tsx`/`vitest`, but fails a real `tsc` build with `TS2351: This expression is not
 constructable`.

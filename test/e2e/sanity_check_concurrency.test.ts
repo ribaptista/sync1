@@ -79,7 +79,7 @@ describe("sanity_check: concurrency", () => {
     });
     expect(syncResult.exitCode).toBe(0);
 
-    const streamParallelism = 3;
+    const hashParallelism = 3;
     const s3Parallelism = 2;
     const result = await runCli(
       [
@@ -88,8 +88,8 @@ describe("sanity_check: concurrency", () => {
         root,
         "--json",
         "--verbose",
-        "--file-stream-parallelism",
-        String(streamParallelism),
+        "--hash-parallelism",
+        String(hashParallelism),
         "--s3-metadata-parallelism",
         String(s3Parallelism),
       ],
@@ -101,13 +101,19 @@ describe("sanity_check: concurrency", () => {
 
     const dispatchLogs = parseDispatchLogs(result.stderr);
 
+    // Still logged under "stream" -- sanity-check.ts's own merge-join logic
+    // is unchanged; only the production LocalReader it's handed now runs
+    // the read on a real worker thread (src/concurrency/hash-worker.ts's
+    // checksumFileTask) instead of the main thread, and the queue bounding
+    // it is sized to --hash-parallelism (the worker pool) rather than
+    // --file-stream-parallelism.
     const streamDispatches = dispatchLogs.filter(
       (l) => l.pool === "stream" && l.msg === "dispatched",
     );
     expect(streamDispatches.length).toBe(fileCount);
     const maxStreamInFlight = Math.max(...streamDispatches.map((l) => l.inFlight));
-    expect(maxStreamInFlight).toBeLessThanOrEqual(streamParallelism);
-    expect(maxStreamInFlight).toBe(streamParallelism);
+    expect(maxStreamInFlight).toBeLessThanOrEqual(hashParallelism);
+    expect(maxStreamInFlight).toBe(hashParallelism);
 
     const s3Dispatches = dispatchLogs.filter((l) => l.pool === "s3" && l.msg === "dispatched");
     expect(s3Dispatches.length).toBe(fileCount);
