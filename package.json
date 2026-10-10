@@ -1,6 +1,6 @@
 {
   "name": "sync1",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "E2E-encrypted, deduplicated, incremental backup CLI",
   "type": "module",
   "private": true,
