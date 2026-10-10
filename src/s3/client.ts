@@ -35,12 +35,99 @@ export interface S3ClientOptions {
 }
 
 /**
+ * How deep `primitivesOnly` recurses before giving up on a value -- not a
+ * limit this SDK's own records are expected to reach (they're a handful of
+ * levels at most), just a cheap backstop against a cyclic object looping
+ * forever.
+ */
+const PRIMITIVES_ONLY_MAX_DEPTH = 6;
+
+/**
+ * Strips a value down to what's safe to write into a structured log line:
+ * strings, numbers, booleans, `null`, and plain objects/arrays built only
+ * from those (recursively). Everything else -- a `Buffer`, a stream, any
+ * other class instance, a function -- is dropped rather than serialized.
+ *
+ * Exists because `@smithy`'s own request/response logging middleware
+ * (`loggerMiddleware.js`) calls `logger.info({ clientName, commandName,
+ * input, output, metadata })` with the *whole* input/output objects, and
+ * nothing in the SDK trims them for us: its own sensitive-data filter
+ * (`schemaLogFilter`) only ever redacts fields the service's schema marks
+ * `sensitive`, and S3's `Body` isn't one of those -- it's a `StreamingBlob`
+ * with trait `{ streaming: 1 }`, which passes straight through. Since this
+ * project's uploads hand the SDK a `Buffer` holding the whole object (or
+ * whole part) being uploaded, `input.Body` there is the actual ciphertext --
+ * writing it to a log line verbatim would mean every synced byte lands in
+ * `--log`'s file a second time, as a giant JSON array of numbers.
+ *
+ * Deliberately the simplest rule that avoids that: no special-casing by
+ * type or size (a `Buffer`, a `Readable`, and a custom class instance are
+ * all just "not a primitive" and vanish the same way), at the cost of one
+ * known gap -- a large plain array of primitives (`CompleteMultipartUpload`'s
+ * `Parts` list, up to 10,000 small `{ETag, PartNumber}` entries) is kept in
+ * full, since it's already made only of the values this function keeps.
+ * That's one long `--verbose` line for a large multipart upload, not a
+ * leak of file content.
+ */
+function primitivesOnly(value: unknown, depth = 0): unknown {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  // `undefined` specifically, not just "anything not caught above": an SDK
+  // record routinely has `undefined`-valued fields (an absent `output` on
+  // some responses, a metadata field with no value this time), and
+  // `Object.getPrototypeOf(undefined)` throws -- confirmed directly, a real
+  // sync run crashed on exactly this ("Cannot convert undefined or null to
+  // object") the first time this function met one. Dropped, same as any
+  // other non-primitive -- there is nothing to keep.
+  if (value === undefined) return undefined;
+  if (value instanceof Error) {
+    return { name: value.name, message: value.message };
+  }
+  if (depth >= PRIMITIVES_ONLY_MAX_DEPTH) return undefined;
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => primitivesOnly(item, depth + 1))
+      .filter((item) => item !== undefined);
+  }
+  // A plain object literal only -- a Buffer, a Readable, a Date, or any
+  // other class instance has a different prototype and is dropped instead,
+  // the same as a function or a symbol would be.
+  const proto: unknown = Object.getPrototypeOf(value);
+  if (proto === Object.prototype || proto === null) {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const sanitizedItem = primitivesOnly(item, depth + 1);
+      if (sanitizedItem !== undefined) sanitized[key] = sanitizedItem;
+    }
+    return sanitized;
+  }
+  return undefined;
+}
+
+/**
  * Adapts this project's structured pino logger (`debug(context, msg)`) to
  * the shape `@smithy/types` expects (`debug(...content: unknown[])`,
- * matching `console`'s own variadic signature). The SDK always calls with
- * a message, sometimes followed by extra values -- folded into one
- * structured `args` field rather than interpolated into the message
- * string, per this repo's own logging convention (see AGENTS.md).
+ * matching `console`'s own variadic signature).
+ *
+ * The SDK calls this two different ways. Its own retry/streaming
+ * diagnostics (`src/s3/retry.ts`'s doc comment) pass a plain message string,
+ * sometimes followed by extra values -- folded into one structured `args`
+ * field rather than interpolated into the message string, per this repo's
+ * own logging convention (see AGENTS.md). Its request/response logging
+ * middleware instead calls `logger.info({ clientName, commandName, input,
+ * output, metadata })` (or `{ ..., error }` on failure) with **no message at
+ * all**, just that one record -- `String(record)` on that produces exactly
+ * `"[object Object]"`, discarding everything useful. That record is run
+ * through `primitivesOnly` and logged as its own `sdk` field instead, with a
+ * short, fixed message (`"s3 <commandName>"`, or `"... failed"` once the
+ * record carries an `error`) so every such line is still searchable by
+ * command.
  */
 function smithyLoggerAdapter(logger: Logger): SmithyLogger {
   const forward =
@@ -48,7 +135,17 @@ function smithyLoggerAdapter(logger: Logger): SmithyLogger {
     (...content: unknown[]): void => {
       const [message, ...rest] = content;
       const context: Record<string, unknown> = { source: "aws-sdk" };
-      if (rest.length > 0) context.args = rest;
+      if (rest.length > 0) context.args = primitivesOnly(rest);
+
+      if (message !== null && typeof message === "object") {
+        const record = message as Record<string, unknown>;
+        const commandName = typeof record.commandName === "string" ? record.commandName : "command";
+        const failed = "error" in record;
+        context.sdk = primitivesOnly(record);
+        logger[level](context, `s3 ${commandName}${failed ? " failed" : ""}`);
+        return;
+      }
+
       logger[level](context, typeof message === "string" ? message : String(message));
     };
   return {

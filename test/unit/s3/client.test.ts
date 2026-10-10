@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { Readable } from "node:stream";
 
 const { multipartPartSize, MULTIPART_THRESHOLD_BYTES, headObject, createS3Client } =
   await import("../../../src/s3/client.js");
@@ -53,6 +54,127 @@ describe("createS3Client: routing the SDK's own diagnostics", () => {
     (client.config.logger as any).debug("retrying", extra);
 
     expect(calls).toEqual([[{ source: "aws-sdk", args: [extra] }, "retrying"]]);
+  });
+
+  /**
+   * `@smithy`'s own request/response logging middleware
+   * (`loggerMiddleware.js`) calls `logger.info({ clientName, commandName,
+   * input, output, metadata })` directly -- no message string, just that one
+   * record -- which is exactly what used to turn into the unreadable
+   * `"msg":"[object Object]"` a real sync run produced: `String(record)`
+   * discards everything in it. `input.Body` there is the actual ciphertext
+   * being uploaded (this project passes it as a whole-object/whole-part
+   * `Buffer`), so it must never reach the log verbatim either.
+   */
+  describe("the SDK's own request/response logging middleware (an object, not a message string)", () => {
+    function installFakeLogger(): {
+      calls: Array<[Record<string, unknown>, string]>;
+      invoke: (record: unknown) => void;
+    } {
+      const calls: Array<[Record<string, unknown>, string]> = [];
+      const logger = {
+        trace: vi.fn(),
+        debug: vi.fn(),
+        info: (context: Record<string, unknown>, message: string) => calls.push([context, message]),
+        warn: vi.fn(),
+        error: vi.fn(),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any;
+      const client = createS3Client({ region: "us-east-1", endpoint: undefined, logger });
+      return {
+        calls,
+        // `client.config.logger` is `smithyLoggerAdapter(logger)`, the thing
+        // actually under test here -- invoking the fake `logger` directly
+        // would skip it entirely, same reasoning as the two tests above.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        invoke: (record: unknown) => (client.config.logger as any).info(record),
+      };
+    }
+
+    it("drops a Buffer Body, keeping the rest of the record and a readable message", () => {
+      const { calls, invoke } = installFakeLogger();
+      invoke({
+        clientName: "S3Client",
+        commandName: "PutObjectCommand",
+        input: { Bucket: "my-bucket", Key: "objects/aa", Body: Buffer.alloc(1024 * 1024, 1) },
+        output: {},
+        metadata: { httpStatusCode: 200, requestId: "req-1" },
+      });
+
+      expect(calls).toHaveLength(1);
+      const [context, message] = calls[0]!;
+      expect(message).toBe("s3 PutObjectCommand");
+      expect(context.source).toBe("aws-sdk");
+      expect(context.sdk).toEqual({
+        clientName: "S3Client",
+        commandName: "PutObjectCommand",
+        input: { Bucket: "my-bucket", Key: "objects/aa" },
+        output: {},
+        metadata: { httpStatusCode: 200, requestId: "req-1" },
+      });
+      expect(JSON.stringify(context)).not.toContain("[object Object]");
+    });
+
+    it("drops a stream Body the same way", () => {
+      const { calls, invoke } = installFakeLogger();
+      invoke({
+        commandName: "UploadPartCommand",
+        input: { Bucket: "my-bucket", Key: "objects/aa", PartNumber: 3, Body: Readable.from([]) },
+        metadata: { httpStatusCode: 200 },
+      });
+
+      const sdk = calls[0]![0].sdk as { input: Record<string, unknown> };
+      expect(sdk.input).toEqual({ Bucket: "my-bucket", Key: "objects/aa", PartNumber: 3 });
+    });
+
+    it("reports a failed command with the error's name and message, and a '... failed' message", () => {
+      const { calls, invoke } = installFakeLogger();
+      invoke({
+        commandName: "PutObjectCommand",
+        input: { Bucket: "my-bucket", Key: "objects/aa" },
+        error: Object.assign(new Error("Access Denied"), { name: "AccessDenied" }),
+      });
+
+      const [context, message] = calls[0]!;
+      expect(message).toBe("s3 PutObjectCommand failed");
+      expect((context.sdk as { error: unknown }).error).toEqual({
+        name: "AccessDenied",
+        message: "Access Denied",
+      });
+    });
+
+    it("falls back to a generic command name, and never throws, for an unrecognized or cyclic record", () => {
+      const { calls, invoke } = installFakeLogger();
+      const cyclic: Record<string, unknown> = { input: { Bucket: "my-bucket" } };
+      cyclic.self = cyclic;
+
+      expect(() => invoke(cyclic)).not.toThrow();
+      expect(calls[0]![1]).toBe("s3 command");
+    });
+
+    /**
+     * A real sync run crashed on exactly this: an SDK record with an
+     * `undefined`-valued field (an absent `output` on some responses is one
+     * routine source) reaches `Object.getPrototypeOf(value)`, which throws
+     * "Cannot convert undefined or null to object" for `undefined`
+     * specifically -- `null` alone isn't enough to catch it.
+     */
+    it("drops an undefined field instead of throwing", () => {
+      const { calls, invoke } = installFakeLogger();
+
+      expect(() =>
+        invoke({
+          commandName: "PutObjectCommand",
+          input: { Bucket: "my-bucket", Key: "objects/aa" },
+          output: undefined,
+          metadata: { httpStatusCode: 200, cfId: undefined },
+        }),
+      ).not.toThrow();
+
+      const sdk = calls[0]![0].sdk as Record<string, unknown>;
+      expect("output" in sdk).toBe(false);
+      expect(sdk.metadata).toEqual({ httpStatusCode: 200 });
+    });
   });
 });
 
