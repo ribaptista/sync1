@@ -1,6 +1,7 @@
 # `sync1 sanity_check`
 
-**Derived from:** `src/commands/sanity_check.ts`, `src/fs/sanity-check.ts`, `src/fs/encrypt-file.ts`
+**Derived from:** `src/commands/sanity_check.ts`, `src/fs/sanity-check.ts`, `src/fs/encrypt-file.ts`,
+`src/concurrency/hash-worker.ts`, `src/concurrency/hash-runner.ts`
 
 Read-only diagnostic: cross-checks `state.db` against S3 and the local filesystem for bugs, **never
 repairs anything**. Structurally the same streaming merge-join as `update_cache`, but where that command
@@ -63,24 +64,22 @@ sequenceDiagram
         Job->>Job: nothing further -- existence alone was already confirmed
     else both a stub AND the real file present
         Job->>Job: bothStubAndReal.push(path) -- a bad state, never auto-cleaned here
+    else entry.hash is null
+        Job--xJob: throw -- state.db is corrupt (migration 0013's CHECK makes<br/>this unreachable for a real entries row; a defensive invariant, not a live path)
     else representation = "real"
-        alt entry.hash is null (should never happen; tolerated anyway)
-            Job->>Stream: streamPool.dispatch(hashFile) -- plain hash, no encryption possible without a hash
+        Job->>Stream: streamPool.dispatch(readLocal) -- one read: BLAKE2b + re-encrypt + CRC64NVME
+        alt plaintextHash != entry.hash
+            Stream-->>Job: hashMismatch.push({path, expectedHash, actualHash}) -- stops here, no HEAD
         else
-            Job->>Stream: streamPool.dispatch(readLocal) -- one read: BLAKE2b + re-encrypt + CRC64NVME
-            alt plaintextHash != entry.hash
-                Stream-->>Job: hashMismatch.push({path, expectedHash, actualHash}) -- stops here, no HEAD
-            else
-                Stream-->>Job: dispatchS3Check(entry.hash, localChecksum) -- see below
-            end
+            Stream-->>Job: dispatchS3Check(entry.hash, localChecksum) -- see below
         end
     else representation = "stub"
         Job->>FS: readStubHash(stubPath) -- cheap, synchronous, no pool
         alt corrupt stub (StubFormatError)
-            Job->>Job: stubMismatch.push({path, reason})
+            Job->>Job: stubMismatch.push({path, reason}) -- stops here, no HEAD
         else stubHash != entry.hash
-            Job->>Job: stubMismatch.push({path, reason: "stub declares X, state.db expects Y"})
-        else entry.hash is set
+            Job->>Job: stubMismatch.push({path, reason: "stub declares X, state.db expects Y"}) -- stops here, no HEAD
+        else
             Job->>S3Pool: dispatchS3Check(entry.hash, null) -- no local plaintext to compare
         end
     end
@@ -92,15 +91,29 @@ hash})` immediately; otherwise dispatched to `s3Pool` → `headObject(s3_key)` (
 `head.checksumCrc64Nvme ?? null` (S3's), and `localChecksum` (null for a stub) — any disagreement, or a
 null S3 checksum, → `checksumMismatch.push({path, hash, localChecksum, recordedChecksum, s3Checksum})`.
 
-### `readLocal` (production: `encryptFileForObject`, bound to the master key)
+### `readLocal` (production: `createChecksumRunner`, dispatched to a hash-pool worker thread)
 
-The one place a real file is actually read: `fs.createReadStream` → `encryptStream(..., { hashMismatch:
-"report" })`, which hashes the plaintext (BLAKE2b) as it re-encrypts it the same pass → a
-`UploadChecksumTap` over the ciphertext (CRC64NVME) → drained to nothing. `"report"` never aborts the
-stream on a hash disagreement the way sync's own upload does (see
-[`flow-encrypt-stream.md`](flow-encrypt-stream.md)) — the point here is to learn the _actual_ hash of
-whatever is on disk and let the caller (this module) decide, not to guard a write. This is the single
-pass that makes `hash_mismatch` and `checksum_mismatch` both derive from one read instead of two.
+The one place a real file is actually read, and the only step `sanity_check` spends real CPU on: inside
+the worker thread, `fs.createReadStream` → `encryptStream(..., { hashMismatch: "report" })`, which hashes
+the plaintext (BLAKE2b) as it re-encrypts it the same pass → a `UploadChecksumTap` over the ciphertext
+(CRC64NVME) → drained to nothing. `"report"` never aborts the stream on a hash disagreement the way
+sync's own upload does (see [`flow-encrypt-stream.md`](flow-encrypt-stream.md)) — the point here is to
+learn the _actual_ hash of whatever is on disk and let the caller (this module) decide, not to guard a
+write. This is the single pass that makes `hash_mismatch` and `checksum_mismatch` both derive from one
+read instead of two.
+
+**Why a worker thread.** Measured on one core: BLAKE2b ~1090 MiB/s, XChaCha20 ~1170 MiB/s, but the pure-JS
+CRC64NVME is only ~240 MiB/s and dominates the pass's CPU time (confirmed directly, not assumed). Each
+file's read is independent, so `src/commands/sanity_check.ts` binds `readLocal` to
+`createChecksumRunner(pools.hash, masterKey)` (`src/concurrency/hash-runner.ts`) rather than running it on
+the main thread — the exact same multi-core reasoning `update_cache`'s own file hashing already uses (see
+`src/concurrency/hash-worker.ts`'s own top-of-file comment). The worker side is `checksumFileTask`
+(`hash-worker.ts`), dispatched by _name_ (`pool.run(task, { name: "checksumFileTask" })`) since the same
+worker file's **default** export, `hashFileTask`, is what `update_cache`/`stubify` still use for a plain
+hash with no encryption. `--hash-parallelism` (not `--file-stream-parallelism`) is therefore what bounds
+`streamPool` here, sized in the command to `pools.hash.maxThreads` — the log label stays `"stream"` purely
+because `src/fs/sanity-check.ts` itself is unchanged; it has no idea what kind of pool its `readLocal`
+argument happens to be backed by.
 
 ## Output
 

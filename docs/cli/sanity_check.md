@@ -20,7 +20,7 @@ anything is checked.
 ## Usage
 
 ```bash
-sync1 sanity_check [--root <local-path>] [--filter <glob>] [--json] [--file-stream-parallelism <n>] [--s3-metadata-parallelism <n>]
+sync1 sanity_check [--root <local-path>] [--filter <glob>] [--json] [--hash-parallelism <n>] [--s3-metadata-parallelism <n>]
 ```
 
 ## Options
@@ -29,19 +29,21 @@ sync1 sanity_check [--root <local-path>] [--filter <glob>] [--json] [--file-stre
 | ------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--root <path>`                 | no       | Local directory to check. Must already be initialized or attached. Defaults to the nearest ancestor directory with a `.sync1/`, searched from the current directory upward. |
 | `--filter <glob>`               | no       | [Glob pattern](../README.md#glob-syntax) scoping which tracked/untracked paths are reported.                                                                                |
-| `--file-stream-parallelism <n>` | no       | Max concurrent read-and-re-encrypt jobs for real files. Default 4.                                                                                                          |
+| `--hash-parallelism <n>`        | no       | Max concurrent read-and-re-encrypt jobs for real files, run on real worker threads. Default: CPU count.                                                                     |
 | `--s3-metadata-parallelism <n>` | no       | Max concurrent `HEAD` checks (existence and checksum). Default 8.                                                                                                           |
 
 A real file is read exactly once: the same pass that computes its BLAKE2b content hash also encrypts it
 (convergent encryption, so this reproduces the exact bytes an upload would have produced) and checksums
-the result, on `--file-stream-parallelism`'s pool. `HEAD` checks run on their own, separately-bounded pool
-(see [concurrency-and-progress.md](../architecture/concurrency-and-progress.md)) — a file only gets one
-once its hash is confirmed to still match.
+the result, dispatched to `--hash-parallelism`'s worker-thread pool — the CRC64NVME step in particular is
+pure-JS and CPU-bound, so spreading different files' reads across real cores is a genuine speed-up, not
+just overlapped I/O. `HEAD` checks run on their own, separately-bounded pool (see
+[concurrency-and-progress.md](../architecture/concurrency-and-progress.md)) — a file only gets one once
+its hash is confirmed to still match.
 
-`--hash-parallelism` is still a global flag, but `sanity_check` never uses it: hashing isn't a separate
-pass here. Use `--file-stream-parallelism 1` on a spinning disk, where reading several files at once
-costs more in seeking than it gains in overlap; `--file-stream-parallelism`'s default (4) favors an SSD or
-a NAS, where several reads really do run concurrently.
+`--file-stream-parallelism` is still a global flag, but `sanity_check` never uses it: there's no separate
+I/O-bound streaming pass here, unlike `sync`/`materialize`. Use `--hash-parallelism 1` on a spinning disk,
+where reading several files at once costs more in seeking than it gains from extra cores;
+`--hash-parallelism`'s default (CPU count) favors an SSD or NVMe, where it scales close to linearly.
 
 ## What it checks
 

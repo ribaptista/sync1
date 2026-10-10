@@ -77,6 +77,14 @@ sequenceDiagram
   caller's own consumer of `ciphertext` already sees the identical failure through its own `'error'`
   listener (or the pool wrapping it, for `sanity_check` — see [`sanity_check.md`](sanity_check.md)).
 - **No internal concurrency** -- one source stream, one encryption pass, at most one checksum tap, fully
-  sequential. Whatever pool bounds how many files are read at once (sync's/mirror's stream pool,
-  `sanity_check`'s own) is the caller's responsibility, same as it always was before this was shared.
+  sequential. Whatever pool bounds how many files are read at once (sync's/mirror's stream pool) is the
+  caller's responsibility, same as it always was before this was shared.
+- **`sanity_check` runs this inside a worker thread, not on the main thread.** `checksumFileTask`
+  (`src/concurrency/hash-worker.ts`) calls `encryptFileForObject` exactly as shown above, from inside a
+  Piscina worker -- genuine multi-core parallelism across different files, since the CRC64NVME pass here
+  is pure-JS and CPU-bound (confirmed: ~240 MiB/s on one core, well below the ~1100+ MiB/s either side of
+  it). `src/commands/sanity_check.ts` binds its `readLocal` to `createChecksumRunner(pools.hash,
+masterKey)` (`src/concurrency/hash-runner.ts`), which dispatches to `checksumFileTask` by name
+  (`pool.run(task, { name: "checksumFileTask" })`) rather than running this function in-process; see
+  [`sanity_check.md`](sanity_check.md).
 - **Sub-flows:** [`flow-encrypt-stream.md`](flow-encrypt-stream.md).
