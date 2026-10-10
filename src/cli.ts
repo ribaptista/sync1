@@ -24,6 +24,7 @@ import { emitError, exitCodeForError, EXIT_GENERIC_ERROR } from "./cli/output.js
 import { resolveRoot } from "./cli/resolve-root.js";
 import { sync1Dir } from "./vault/local-dir.js";
 import { sweepStaleTempFiles } from "./fs/temp-path.js";
+import { shouldShowProgress, openRunLogIfShowingProgress } from "./cli/progress.js";
 
 const program = new Command();
 
@@ -55,6 +56,21 @@ program.hook("preAction", (_thisCommand, actionCommand) => {
   // command-specific code -- which might create its own fresh temp files
   // under the same naming scheme -- ever does.
   sweepStaleTempFiles(sync1Dir(root));
+
+  // `--log` only ever matters once progress bars are actually going to own
+  // stderr -- see openRunLogIfShowingProgress's own doc comment. A bad path
+  // fails the whole run immediately via the top-level `.catch()` below, the
+  // same way a `VaultLockedError` from acquireLock above already does --
+  // never partway through, after bars are already on screen.
+  const globalOpts = actionCommand.optsWithGlobals() as {
+    json?: boolean;
+    progress?: boolean;
+    log?: string;
+  };
+  openRunLogIfShowingProgress(
+    globalOpts.log,
+    shouldShowProgress({ json: globalOpts.json ?? false, progress: globalOpts.progress ?? true }),
+  );
 });
 
 program.hook("postAction", (_thisCommand, actionCommand) => {
@@ -138,7 +154,11 @@ program
     "--thumbnail-parallelism <n>",
     "max concurrent thumbnail/mosaic generation jobs -- default 4",
   )
-  .option("--no-progress", "disable progress bars even on a real terminal");
+  .option("--no-progress", "disable progress bars even on a real terminal")
+  .option(
+    "--log <path>",
+    "append logs to this file while progress bars are showing (otherwise logs go to stderr, --log is ignored, and the file is never created)",
+  );
 
 registerInitRemoteCommand(program);
 registerAttachRemoteCommand(program);

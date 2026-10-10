@@ -157,15 +157,30 @@ can't distinguish a correctly-bounded pool from an accidentally-sequential or ac
 one: such a test asserts both that the configured limit was **never exceeded** and that it was
 **actually reached** at some point.
 
-## Progress bars and `--verbose`, sharing a terminal
+## Progress bars and logging, sharing a terminal
 
 `src/cli/progress.ts` decides whether to show bars at all (`shouldShowProgress`: never for `--json` or
 `--no-progress`, otherwise only when stderr is a real TTY) and, when it does, owns stderr exclusively —
 a rendering progress bar and interleaved log lines would corrupt each other. So while bars are active,
-`--verbose` output is diverted to file descriptor 3 instead (`createLoggerForRun`), which is only ever
-open if the _caller_ redirected it there (`sync1 sync --verbose --root ~/x 3>/tmp/sync1.log`) — the
-tool never opens a file itself. If fd 3 isn't open, verbose output is silently discarded (after a
-one-time notice explaining why) rather than corrupting the bars or crashing.
+logging (`--verbose` or not — even a bare `warn` would corrupt the bars just as badly) is diverted to
+the file `--log <path>` names instead (`createLoggerForRun`), opened once by `src/cli.ts`'s `preAction`
+hook before any command-specific work starts — a bad path fails the whole run immediately, the same
+way a `VaultLockedError` from the lock already does, never partway through with bars already on screen.
+Without `--log`, logging is silently discarded (after a one-time notice explaining why, under
+`--verbose`) rather than corrupting the bars.
+
+**This used to divert to file descriptor 3** instead, open only if the caller redirected it there
+(`3>/tmp/sync1.log`) — replaced because that detection was fundamentally unreliable, not merely
+inconvenient for callers (Docker's exec-form `ENTRYPOINT` has no shell to redirect fd 3 with at all).
+Node/libuv takes fd 3 for its own internal epoll/io_uring handle at process startup, so a bare
+`fstatSync(3)` succeeded even with _no_ redirect whatsoever — confirmed directly
+(`/proc/self/fd/3 -> anon_inode:[eventpoll]` on a freshly-started process) — pointing the logger at
+libuv's own fd instead. The first warning-level write then hung the entire process: pino writes through
+sonic-boom, whose retry path for that failure spins synchronously (`Atomics.wait`) on the main thread,
+stopping the event loop outright — no timers, no child-process exit events, not even `SIGINT`/`SIGTERM`
+handlers, which are ordinary JS callbacks that never got to run. `--log` sidesteps the whole class of
+bug: there is no ambient fd to collide with, since the file this opens is one `preAction` itself created
+for exactly this purpose, and only when a command will actually show bars at all.
 
 `src/cli/progress.ts` exposes **two** session types, chosen per command by what that command actually
 measures:
@@ -352,7 +367,7 @@ that waits out the outage — but it shifts weight onto three things:
 - **Visibility is the only signal.** An indefinite retry loop looks identical at minute one and
   minute sixty, so the progress label carries both the attempt count and the elapsed time —
   `retrying in 30s (attempt 47, failing for 21m)` — and every retry logs the underlying error to
-  fd 3, clear of the bars.
+  the `--log` file, clear of the bars.
 
 What is _not_ retried matters as much: anything outside the transient classification throws on its
 first occurrence, including `CasConflictError` (a real answer about the vault's state, not a transport

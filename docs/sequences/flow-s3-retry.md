@@ -88,5 +88,6 @@ sequenceDiagram
     building anyway.
 - **Visibility:** because a retry loop looks identical at minute one and at minute sixty, `onRetry`
   always carries both the attempt count and elapsed time, and every caller logs it — the diagram in
-  [`sync.md`](sync.md) shows exactly where those log lines land relative to the progress bar (fd 3).
+  [`sync.md`](sync.md) shows exactly where those log lines land relative to the progress bar (the
+  `--log` file).
 - **Sub-flows:** none.

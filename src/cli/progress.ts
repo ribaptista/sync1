@@ -639,36 +639,90 @@ export function reporterFor(session: BytesProgressTarget): OnProgress {
   };
 }
 
-let notifiedFd3Missing = false;
+let runLogFd: number | undefined;
+let notifiedLogMissing = false;
 
-function fd3IsOpen(): boolean {
-  try {
-    fs.fstatSync(3);
-    return true;
-  } catch {
-    return false;
-  }
+/**
+ * Called once, by `src/cli.ts`'s `preAction` hook, after it has opened
+ * `--log`'s file (only when `--log` was given *and* this run will actually
+ * show progress bars -- see that hook's own comment for why it's
+ * conditional). `createLoggerForRun` below reads this module-level value
+ * rather than taking the fd as one of its own parameters, since it's
+ * called from every command's own action handler, long after `preAction`
+ * has already run and far from anywhere that still has the fd in scope.
+ */
+export function setRunLogFd(fd: number): void {
+  runLogFd = fd;
 }
 
 /**
- * While progress bars are rendering, they own stderr exclusively -- verbose
- * logging (if requested) is diverted to file descriptor 3 instead, which is
- * only ever open if the *caller* redirected it there (e.g. `3>/tmp/x.log`).
- * This function never opens a file itself. If fd 3 isn't open, verbose
- * output is silently discarded (after a one-time notice) rather than
- * corrupting the bars.
+ * Opens `--log`'s file and hands its fd to `setRunLogFd`, but only when
+ * `showProgress` is true -- `--log` only ever matters once progress bars
+ * are actually going to own stderr (see `createLoggerForRun`'s own doc
+ * comment for why), so when they won't show at all this is a deliberate
+ * no-op: `logPath` is never opened, and no file is ever created, matching
+ * `createLoggerForRun`'s own `!showProgress` branch (always stderr, `--log`
+ * or not).
+ *
+ * Called once, by `src/cli.ts`'s `preAction` hook, before any
+ * command-specific work starts -- a bad path (an unwritable directory, a
+ * permission error) throws here, failing the whole run immediately rather
+ * than partway through, after bars are already on screen. Pulled out as its
+ * own function (rather than inlined in that hook) specifically so it can be
+ * unit-tested without a real terminal: `preAction` only ever observes a
+ * real TTY's `showProgress`, but this function's own behavior is a pure
+ * function of the two arguments, independent of how `showProgress` was
+ * actually decided.
+ */
+export function openRunLogIfShowingProgress(
+  logPath: string | undefined,
+  showProgress: boolean,
+): void {
+  if (!logPath || !showProgress) return;
+  let fd: number;
+  try {
+    fd = fs.openSync(logPath, "a");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`cannot open --log file "${logPath}": ${message}`);
+  }
+  setRunLogFd(fd);
+}
+
+/**
+ * While progress bars are rendering, they own stderr exclusively -- logging
+ * (verbose or not) is diverted to the file `--log` named instead, opened by
+ * `src/cli.ts`'s `preAction` hook via `setRunLogFd` above. This function
+ * never opens a file itself -- only `preAction` does, once, before any
+ * command-specific work starts, so a bad `--log` path fails the whole run
+ * immediately rather than partway through.
+ *
+ * `--log` was *not* given (or this run won't show bars at all, which
+ * `preAction` already knows and so never opens anything): logging is
+ * silently discarded instead of corrupting the bars, after a one-time
+ * notice pointing at `--log`.
+ *
+ * Previously this diverted to file descriptor 3, open only if the *caller*
+ * redirected it there (`3>/tmp/x.log`) -- replaced because that detection
+ * was unreliable: Node/libuv takes fd 3 for its own internal epoll/io_uring
+ * handle at startup, so `fstatSync(3)` succeeded even with no redirect at
+ * all, pointing the logger at libuv's own fd -- and the first warning-level
+ * write then hung the entire process (sonic-boom's retry path spins
+ * synchronously on the main thread). `--log` sidesteps the whole class of
+ * bug: there's no ambient fd to collide with, since the file this opens is
+ * one `preAction` itself created for exactly this purpose.
  */
 export function createLoggerForRun(opts: { verbose: boolean; showProgress: boolean }): Logger {
   if (!opts.showProgress) {
     return createLogger(opts.verbose);
   }
-  if (fd3IsOpen()) {
-    return createLogger(opts.verbose, pino.destination({ fd: 3, sync: false }));
+  if (runLogFd !== undefined) {
+    return createLogger(opts.verbose, pino.destination({ fd: runLogFd, sync: false }));
   }
-  if (opts.verbose && !notifiedFd3Missing) {
-    notifiedFd3Missing = true;
+  if (opts.verbose && !notifiedLogMissing) {
+    notifiedLogMissing = true;
     process.stderr.write(
-      "note: --verbose output is being discarded while progress bars are active -- redirect fd 3 (e.g. `3>/tmp/sync1.log`) to capture it\n",
+      "note: log output is being discarded while progress bars are active -- pass --log <file> to keep it\n",
     );
   }
   const discard: pino.DestinationStream = { write: () => true };

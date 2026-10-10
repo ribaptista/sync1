@@ -157,6 +157,21 @@ ts`](../src/cli/password.ts)).
 The image's `ENTRYPOINT` is the CLI itself, so any subcommand works the same way — e.g. `... sync1
 thumbnail ensure --root /data` — and running the image with no arguments at all prints `--help`.
 
+With `-it` (a real TTY), progress bars take over stderr and logging is silently discarded unless you
+also pass `--log <path>` — an ordinary CLI flag (not a shell redirection), so it needs no entrypoint
+workaround and works exactly like every other argument above:
+
+```bash
+docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
+  -v /path/to/your/vault:/data \
+  -e SYNC1_PASSWORD \
+  sync1 sync --root /data --verbose --log /data/.sync1/sync1.log
+```
+
+Without `-it` (a cron job, most orchestrators), stderr isn't a TTY, so there are no bars to begin with
+and logging already goes straight to stderr — plain `docker logs <container>` — with no `--log` needed.
+
 The `Dockerfile` pins its base image by content digest and both media tools by exact Debian package
 version (verified against the same `>= 7`/`>= 4.4` floors this doc documents above); see the comments at
 the top of the file for exactly how those versions were chosen and how to update them later, including

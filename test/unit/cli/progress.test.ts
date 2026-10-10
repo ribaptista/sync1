@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import prettyBytes from "pretty-bytes";
 import { MultiBar } from "cli-progress";
 
@@ -132,25 +134,33 @@ describe("createLoggerForRun", () => {
     expect(createLoggerMock).toHaveBeenCalledWith(true);
   });
 
-  it("diverts to fd 3 when progress bars are shown and fd 3 is open", () => {
-    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number) => {
-      if (fd === 3) return {} as fs.Stats;
-      throw Object.assign(new Error("EBADF"), { code: "EBADF" });
-    }) as typeof fs.fstatSync);
+  // Each test here imports its own fresh module instance (vi.resetModules()
+  // + a dynamic re-import) rather than sharing the file-top static import --
+  // `runLogFd`/`notifiedLogMissing` are module-level singletons set by
+  // `setRunLogFd` and never unset, so a test that left either mutated would
+  // otherwise leak into whichever test ran next.
 
-    createLoggerForRun({ verbose: true, showProgress: true });
+  it("diverts to the --log file once setRunLogFd has been called with its fd", async () => {
+    vi.resetModules();
+    const fresh = await import("../../../src/cli/progress.js");
+    const tmpPath = path.join(os.tmpdir(), `sync1-progress-test-${process.pid}-${Date.now()}.log`);
+    const fd = fs.openSync(tmpPath, "a");
+    try {
+      fresh.setRunLogFd(fd);
+      fresh.createLoggerForRun({ verbose: true, showProgress: true });
 
-    expect(createLoggerMock).toHaveBeenCalledTimes(1);
-    const [verbose, destination] = createLoggerMock.mock.calls[0]!;
-    expect(verbose).toBe(true);
-    expect(destination).toBeDefined();
+      expect(createLoggerMock).toHaveBeenCalledTimes(1);
+      const [verbose, destination] = createLoggerMock.mock.calls[0]!;
+      expect(verbose).toBe(true);
+      expect(destination).toBeDefined();
+    } finally {
+      fs.closeSync(fd);
+      fs.rmSync(tmpPath, { force: true });
+    }
   });
 
-  it("discards logging when progress bars are shown but fd 3 isn't open, printing a notice once", async () => {
+  it("discards logging when progress bars are shown but --log wasn't given, printing a notice once", async () => {
     vi.resetModules();
-    vi.spyOn(fs, "fstatSync").mockImplementation(() => {
-      throw Object.assign(new Error("EBADF"), { code: "EBADF" });
-    });
     const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
     const fresh = await import("../../../src/cli/progress.js");
@@ -161,8 +171,96 @@ describe("createLoggerForRun", () => {
       false,
       expect.objectContaining({ write: expect.any(Function) }),
     );
-    const notices = writeSpy.mock.calls.filter(([chunk]) => String(chunk).includes("discarded"));
+    const notices = writeSpy.mock.calls.filter(([chunk]) => String(chunk).includes("--log"));
     expect(notices).toHaveLength(1);
+  });
+
+  it("ignores a --log fd and logs to stderr when progress bars aren't shown", async () => {
+    vi.resetModules();
+    const fresh = await import("../../../src/cli/progress.js");
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `sync1-progress-test-noprog-${process.pid}-${Date.now()}.log`,
+    );
+    const fd = fs.openSync(tmpPath, "a");
+    try {
+      fresh.setRunLogFd(fd);
+      fresh.createLoggerForRun({ verbose: true, showProgress: false });
+
+      expect(createLoggerMock).toHaveBeenCalledWith(true);
+    } finally {
+      fs.closeSync(fd);
+      fs.rmSync(tmpPath, { force: true });
+    }
+  });
+});
+
+describe("openRunLogIfShowingProgress", () => {
+  // Each test imports its own fresh module instance, same reasoning as
+  // createLoggerForRun's tests above: `runLogFd` is a module-level
+  // singleton this function writes to on success.
+
+  it("is a no-op, never opening anything, when --log wasn't given", async () => {
+    vi.resetModules();
+    const fresh = await import("../../../src/cli/progress.js");
+    const openSpy = vi.spyOn(fs, "openSync");
+
+    expect(() => fresh.openRunLogIfShowingProgress(undefined, true)).not.toThrow();
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op, never opening anything, when progress bars won't show", async () => {
+    vi.resetModules();
+    const fresh = await import("../../../src/cli/progress.js");
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `sync1-progress-test-noop-${process.pid}-${Date.now()}.log`,
+    );
+
+    expect(() => fresh.openRunLogIfShowingProgress(tmpPath, false)).not.toThrow();
+    expect(fs.existsSync(tmpPath)).toBe(false);
+  });
+
+  it("opens the file and hands its fd to createLoggerForRun, when --log is given and bars will show", async () => {
+    vi.resetModules();
+    const fresh = await import("../../../src/cli/progress.js");
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `sync1-progress-test-open-${process.pid}-${Date.now()}.log`,
+    );
+    try {
+      fresh.openRunLogIfShowingProgress(tmpPath, true);
+      expect(fs.existsSync(tmpPath)).toBe(true);
+
+      fresh.createLoggerForRun({ verbose: true, showProgress: true });
+      const [, destination] = createLoggerMock.mock.calls.at(-1)!;
+      expect(destination).toBeDefined();
+    } finally {
+      fs.rmSync(tmpPath, { force: true });
+    }
+  });
+
+  it("throws (never calling setRunLogFd) when the path can't be opened, bars showing", async () => {
+    vi.resetModules();
+    const fresh = await import("../../../src/cli/progress.js");
+    const badPath = path.join(
+      os.tmpdir(),
+      `sync1-progress-test-missing-dir-${process.pid}-${Date.now()}`,
+      "x.log",
+    );
+
+    expect(() => fresh.openRunLogIfShowingProgress(badPath, true)).toThrow(
+      /cannot open --log file/,
+    );
+
+    // Confirms the failure really left runLogFd unset, not merely that the
+    // call above threw -- createLoggerForRun must still discard.
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    fresh.createLoggerForRun({ verbose: true, showProgress: true });
+    expect(createLoggerMock).toHaveBeenCalledWith(
+      false,
+      expect.objectContaining({ write: expect.any(Function) }),
+    );
   });
 });
 

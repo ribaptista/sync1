@@ -97,9 +97,9 @@ USER sync1
 
 # tini as PID 1: forwards SIGINT/SIGTERM to node correctly and reaps the `identify`/`convert`/
 # `ffmpeg`/`ffprobe` child processes thumbnail generation spawns (see src/media/thumbnail-
-# generate.ts's runTool) -- without a real init, a killed container can leave zombies exactly
-# like the ones seen debugging the fd-3 hang, harmless here (the container exits and the kernel
-# reaps them anyway) but tini is the standard, correct fix and costs nothing.
+# generate.ts's runTool) -- without a real init, a killed container can leave zombies behind,
+# harmless here (the container exits and the kernel reaps them anyway) but tini is the standard,
+# correct fix and costs nothing.
 ENTRYPOINT ["/usr/bin/tini", "--", "node", "/app/dist/cli.js"]
 # No default subcommand -- sync1 is a multi-command CLI (init_remote/attach_remote/sync/
 # thumbnail/...), and guessing one would be wrong for most invocations. `--help` is a safe,
@@ -133,3 +133,17 @@ CMD ["--help"]
 # into `docker inspect`'s recorded command or `ps` output the way `-e SYNC1_PASSWORD=<value>`
 # directly on the command line would; prefer `--env-file` or your orchestrator's secret
 # mechanism over a literal `-e SYNC1_PASSWORD=...` for anything beyond local testing.
+#
+# With `-it` (a real TTY), progress bars take over stderr and plain `--verbose` logging is
+# discarded unless you also pass `--log <path>` -- an ordinary CLI flag, so it needs no shell
+# redirection and works fine through this image's exec-form ENTRYPOINT:
+#
+#   docker run --rm -it \
+#     --user "$(id -u):$(id -g)" \
+#     -v /path/to/your/vault:/data \
+#     -e SYNC1_PASSWORD \
+#     <image> sync --root /data --verbose --log /data/.sync1/sync1.log
+#
+# Without `-it` (e.g. a cron job or an orchestrator that doesn't allocate a TTY), stderr isn't a
+# TTY, there are no bars to begin with, and logging already goes straight to stderr -- `docker
+# logs <container>` -- with no `--log` needed at all.
