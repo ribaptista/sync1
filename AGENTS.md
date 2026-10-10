@@ -70,9 +70,11 @@ LIMIT N`, never `OFFSET`) for SQLite queries that scan a table, not `.iterate()`
 - **Every implemented query gets an index.**
 - **Logging**: use the logger from `src/logger.ts`, always with structured context fields
   (`logger.debug({ path, hash }, "...")`), never bare string interpolation. Logs go to stderr, except
-  while progress bars are actively rendering, when `--verbose` output instead goes to file descriptor 3
-  if the user redirected it there (e.g. `3>/tmp/sync1.log`) — never a file the tool opens itself — so it
-  never corrupts the bars occupying stderr; see `docs/architecture/concurrency-and-progress.md`.
+  while progress bars are actively rendering, when logging instead goes to the file the global `--log
+<path>` flag names — opened once by `src/cli.ts`'s `preAction` hook, before any command-specific work
+  starts, so a bad path fails the run immediately rather than partway through — so it never corrupts the
+  bars occupying stderr. Without `--log`, logging while bars are active is silently discarded instead
+  (a one-time notice under `--verbose` says so); see `docs/architecture/concurrency-and-progress.md`.
   `--json` command output is a completely separate channel (stdout) and must never be mixed with logs.
 - **`--json` on every command**, consistent output/error shape, non-zero exit code on any failure.
   Human-readable output (the non-`--json` default, with progress bars) is not covered by tests.

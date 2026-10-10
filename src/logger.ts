@@ -4,7 +4,8 @@ import pino from "pino";
  * All logging is diagnostic output -- on stderr by default, so it never
  * interferes with --json result parsing on stdout -- or, while progress bars
  * own stderr, on an explicit `destination` (see src/cli/progress.ts, which
- * diverts to fd 3). Default level is "warn"; --verbose raises it to "debug".
+ * diverts to the file --log named, opened once by src/cli.ts's preAction
+ * hook). Default level is "warn"; --verbose raises it to "debug".
  * Call sites should pass structured context fields (never string-interpolate),
  * and derive child loggers bound with run-level context (command name,
  * version_stamp, etc.) via `logger.child({...})`.

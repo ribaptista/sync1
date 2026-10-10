@@ -108,7 +108,7 @@ export class RemoteDivergedError extends Error {
  * `onRetry` for the S3 calls that bracket a run rather than move a file's
  * bytes. Unlike the transfer paths, these have no `FileTracker` and no bar
  * of their own to write into, so the log is the only place a retry can
- * surface -- and `createLoggerForRun` sends it to fd 3, clear of the bars.
+ * surface -- and `createLoggerForRun` sends it to the `--log` file, clear of the bars.
  */
 function retryLogger(logger: Logger, what: string): (notice: RetryNotice) => void {
   return (notice) => {

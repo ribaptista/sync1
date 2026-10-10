@@ -89,10 +89,10 @@ original to something shorter; see
 
 Per-file detail for both `errors` and `unreadable` — which path, and what the tool actually said — goes
 to the **log**, not to stdout, so the summary stays a fixed size no matter how many files are involved.
-While a progress bar owns stderr that log is written to file descriptor 3, so redirect it to see them:
+While a progress bar owns stderr that log is discarded unless you pass `--log`:
 
 ```bash
-sync1 thumbnail ensure 3>/tmp/sync1.log
+sync1 thumbnail ensure --verbose --log /tmp/sync1.log
 ```
 
 `ok` is `false` (nonzero exit) when `errors > 0` **or** `stale_stub_previews` is non-empty — a per-file
