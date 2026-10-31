@@ -212,13 +212,56 @@ Every tagged release publishes a multi-arch (`linux/amd64` + `linux/arm64`) imag
 same `Dockerfile` — no local build needed at all:
 
 ```bash
-docker pull ghcr.io/ribaptista/sync1:latest       # or docker.io/<dockerhub-repo>, public.ecr.aws/<alias>/sync1
+docker pull ghcr.io/ribaptista/sync1:latest       # or docker.io/riribaptista/sync1, public.ecr.aws/<alias>/sync1
 ```
 
 `:latest` always points at the newest non-prerelease version; a specific release is also available as
 `:<version>` (e.g. `:1.2.3`), `:<major>.<minor>`, and (once past `0.x`) `:<major>`. See
 [`docs/architecture/release.md`](architecture/release.md) for exactly how and when these get built and
 tagged.
+
+### Running the published image against real AWS
+
+The container has no `~/.aws` of its own, so AWS credentials have to be passed in as environment
+variables. With AWS CLI v2, sign in on the host and export the resulting short-lived credentials into
+the current shell:
+
+```bash
+aws login
+eval "$(aws configure export-credentials --format env)"
+```
+
+Then run the image, forwarding those variables by name (no values on the command line):
+
+```bash
+docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+  -v "$(pwd):/data" \
+  -v "/run/media/ri/Untitled/riri_data_mirror:/run/media/ri/Untitled/riri_data_mirror" \
+  -v "$HOME:/logs" \
+  riribaptista/sync1:0.5.1 sync --root /data --log /logs/cache.log
+```
+
+What each mount is for:
+
+- **`$(pwd):/data`**: the vault itself (run this from inside the vault directory), passed as
+  `--root /data`.
+- **The mirror, mounted at the same path inside the container**: only needed if `.sync1/remote.json`
+  sets `mirror_path`. That setting must be an absolute path (see
+  [`src/vault/mirror-paths.ts`](../src/vault/mirror-paths.ts)), and it is read inside the container, so
+  the drive has to appear at exactly that path in there too. If you mount it anywhere else, the mirror
+  counts as unreachable. Leave the mount out if you don't use a mirror (or pass `--skip-mirror`).
+- **`$HOME:/logs`**: a writable host directory for `--log`. With `-it`, progress bars take over
+  stderr, so logs are only kept if `--log` points somewhere that outlives the container. Any directory
+  works; a dedicated one (e.g. `-v "$HOME/sync1-logs:/logs"`) exposes less of your home directory to
+  the container.
+
+`AWS_SESSION_TOKEN` is required here because `aws login` gives you temporary credentials. They
+expire, so after they do, run the `eval` line again before the next `docker run`. With long-lived IAM
+user keys, which have no session token, forwarding just the first two variables is enough. Add
+`-e SYNC1_PASSWORD` as in the examples above if you'd rather not type the vault password at the
+interactive prompt.
 
 ## Running without building
 
